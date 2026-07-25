@@ -25,6 +25,12 @@ own durable memory state over time.
 You can also use syke beyond typical memory use cases, like debugging, having syke as a sidekick agent,
 for brainstorming and research while you work with your main coding agents.
 
+The development is deliberately experimental, partial and doesn't support popular features.
+
+PS: The harness trains in multiple memory environments to test and research self learning capabilities. 
+
+Still useful and more capable than popular solutions from day one. So do try it.  
+
 ## Install
 
 ```bash
