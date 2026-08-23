@@ -4,7 +4,7 @@ include pyproject.toml
 include setup.py
 include install_syke.sh
 
-recursive-include syke *.py *.md *.html py.typed
+recursive-include syke *.py *.md *.html *.mjs py.typed
 
 prune tests
 prune docs

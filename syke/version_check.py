@@ -91,11 +91,6 @@ def check_update_available(installed: str) -> tuple[bool, str | None]:
     return _version_gt(latest, installed), latest
 
 
-def get_cached_latest_version() -> str | None:
-    """Return cached latest version without hitting the network. None if no cache."""
-    return _read_cache()
-
-
 def cached_update_available(installed: str) -> tuple[bool, str | None]:
     """Check update status from local cache only — never hits network."""
     latest = _read_cache()

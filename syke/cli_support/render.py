@@ -92,10 +92,6 @@ def render_setup_line(
     console.print(f"{indent}{label}: {value}{suffix}")
 
 
-def render_setup_source_result(source: str, status: str, detail: str | None = None) -> None:
-    render_setup_line(source, status, detail=detail)
-
-
 def _format_elapsed(seconds: int) -> str:
     minutes, sec = divmod(max(seconds, 0), 60)
     hours, minutes = divmod(minutes, 60)
@@ -167,19 +163,6 @@ def render_section(title: str) -> None:
 def print_check(name: str, ok: bool, detail: str) -> None:
     tag = "[green]✓[/green]" if ok else "[red]✗[/red]"
     console.print(f"  {tag}  {name}: {detail}")
-
-
-def render_check(label: str, ok: bool, *, detail: str | None = None, indent: str = "  ") -> None:
-    """Status line: ✓ label  detail  or  ✗ label  detail"""
-    icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
-    suffix = f"  [dim]{detail}[/dim]" if detail else ""
-    console.print(f"{indent}{icon} {label}{suffix}")
-
-
-def render_pending(label: str, *, detail: str | None = None, indent: str = "  ") -> None:
-    """In-progress line: … label  detail"""
-    suffix = f"  [dim]{detail}[/dim]" if detail else ""
-    console.print(f"{indent}[dim]…[/dim] {label}{suffix}")
 
 
 def render_kv_section(title: str, items: dict[str, object]) -> None:

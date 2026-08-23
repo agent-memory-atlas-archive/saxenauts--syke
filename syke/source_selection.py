@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from syke.config import user_data_dir
+from syke import config
 from syke.observe.catalog import get_source
 
 SOURCE_SELECTION_FILE = "source_selection.json"
@@ -15,7 +17,8 @@ logger = logging.getLogger(__name__)
 
 
 def _selection_path(user_id: str) -> Path:
-    return user_data_dir(user_id) / SOURCE_SELECTION_FILE
+    _ = user_id
+    return config.SYKE_HOME / SOURCE_SELECTION_FILE
 
 
 def _normalize_sources(sources: list[str] | tuple[str, ...]) -> list[str]:
@@ -41,9 +44,22 @@ def set_selected_sources(user_id: str, sources: list[str] | tuple[str, ...]) -> 
     }
     path = _selection_path(user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp.rename(path)
+    fd, temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
     return tuple(selected)
 
 
@@ -66,6 +82,8 @@ def get_selected_sources(user_id: str) -> tuple[str, ...] | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return _fail_closed_selection(path, f"unreadable payload ({exc.__class__.__name__})")
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return _fail_closed_selection(path, "unsupported schema")
     raw = payload.get("selected_sources")
     if not isinstance(raw, list):
         return _fail_closed_selection(path, "selected_sources is not a list")

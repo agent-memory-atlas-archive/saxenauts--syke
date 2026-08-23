@@ -1,8 +1,8 @@
 """Local read-only HTTP server for the Syke timeline UI.
 
-Runs inside the daemon, bound strictly to 127.0.0.1. Read-only against
-~/.syke/syke.db: every request opens its own SQLite connection in URI
-read-only mode and closes it before returning.
+Runs inside the daemon, bound strictly to 127.0.0.1. Graph queries open the one
+SQLite database read-only; operation evidence comes from protected receipt and
+native-session files.
 
 Threat floor: personal-machine.
 - Loopback bind only.
@@ -13,7 +13,6 @@ Threat floor: personal-machine.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -29,7 +28,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from syke.config import user_syke_db_path
+from syke.config import user_control_dir, user_syke_db_path
+from syke.control import get_receipt, list_receipts
+from syke.db import DatabaseMaintenanceError
+from syke.db_access import acquire_database_lease, maintenance_marker_path
+from syke.memory.memex_history import load_accepted_memex_versions
+from syke.runtime.pi_sessions import (
+    find_session_by_id,
+    find_session_by_name,
+    list_syke_sessions_between,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,165 +47,28 @@ TIMELINE_MAX = 5000
 LOG_LINES_MAX = 500
 DAEMON_LOG_PATH = Path(os.path.expanduser("~/.config/syke/daemon.log"))
 RESIDENT_SERVICE_MANAGERS = {"launchd", "systemd"}
-MEMEX_MARKER_SQL = '["__memex__"]'
-
-
-def _canonical_memex_filter(alias: str = "") -> str:
-    """SQL predicate for real MEMEX projection rows, excluding recovery artifacts."""
-    prefix = f"{alias}." if alias else ""
-    return (
-        f"{prefix}source_event_ids = '{MEMEX_MARKER_SQL}' "
-        f"AND {prefix}id NOT LIKE 'memex_%' "
-        f"AND {prefix}id NOT LIKE 'memex-%' "
-        f"AND {prefix}id NOT LIKE '%-memex-%'"
-    )
 
 
 @contextmanager
 def _open_ro(db_path: str) -> Iterator[sqlite3.Connection]:
-    """Open the live syke.db in read-only mode, separate from daemon writer."""
-    uri = f"file:{db_path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=2.0)
-    conn.row_factory = sqlite3.Row
+    """Open the free graph read-only."""
+    lease = acquire_database_lease(db_path)
     try:
-        yield conn
+        marker = maintenance_marker_path(db_path)
+        if marker.exists():
+            raise DatabaseMaintenanceError(
+                f"Syke database is unavailable during maintenance: {marker}"
+            )
+
+        uri = f"file:{db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
     finally:
-        conn.close()
-
-
-def _to_text(v: Any) -> str:
-    """Coerce a sqlite cell value to text. Some legacy rows were written as
-    BLOBs into TEXT columns; sqlite returns those as bytes. Decoding here
-    keeps every downstream renderer talking to plain str.
-    """
-    if v is None:
-        return ""
-    if isinstance(v, bytes):
-        return v.decode("utf-8", errors="replace")
-    return str(v)
-
-
-def _row_text(row: sqlite3.Row, key: str) -> str:
-    return _to_text(row[key])
-
-
-def _coerce_dict_text(d: dict[str, Any], *keys: str) -> dict[str, Any]:
-    """Decode named fields to text in-place if they came back as bytes."""
-    for k in keys:
-        if k in d and isinstance(d[k], (bytes, bytearray)):
-            d[k] = bytes(d[k]).decode("utf-8", errors="replace")
-    return d
-
-
-def _parse_json(text: str | None, fallback: Any = None) -> Any:
-    if not text:
-        return fallback
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        return fallback
-
-
-def _full_text(text: str | None) -> str:
-    """Timeline inspection mode: never clip transcript or result payloads."""
-    return text or ""
-
-
-def _memex_body_hash(text: str | None) -> str | None:
-    """Stable hash for movement: compare MEMEX content, not reconstruction row IDs."""
-    if text is None:
-        return None
-    body = _to_text(text).replace("\r\n", "\n").strip()
-    changed = True
-    while changed:
-        changed = False
-        if body.startswith("# MEMEX ["):
-            body = body.split("\n", 1)[1] if "\n" in body else ""
-            body = body.lstrip("\n")
-            changed = True
-        if body.startswith("# MEMEX\n"):
-            body = body[len("# MEMEX\n") :].lstrip("\n")
-            changed = True
-        elif body == "# MEMEX":
-            body = ""
-            changed = True
-    body = body.strip()
-    if not body:
-        return None
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
-
-
-def _trace_writes_memex(
-    tool_calls_text: str | None,
-    *,
-    memex_ids: set[str] | None = None,
-) -> bool:
-    """Detect real MEMEX writes from trace tool calls, not prose summaries."""
-    calls = _parse_json(_to_text(tool_calls_text), [])
-    if not isinstance(calls, list):
-        return False
-
-    db_write_re = re.compile(
-        r"\b(update|insert|replace)\b[\s\S]{0,900}\bmemories\b|"
-        r"\bmemories\b[\s\S]{0,900}\b(update|insert|replace)\b",
-        re.IGNORECASE,
-    )
-    file_write_re = re.compile(
-        r"("
-        r"write_text\s*\(|"
-        r"open\s*\([^)]*MEMEX\.md[^)]*,\s*['\"][^'\"]*w|"
-        r">\s*[^;\n]*MEMEX\.md|"
-        r"tee(?:\s+-a)?\s+[^;\n]*MEMEX\.md|"
-        r"cp\s+[^;\n]*\s+MEMEX\.md|"
-        r"mv\s+[^;\n]*\s+MEMEX\.md|"
-        r"tmp\.rename\s*\(\s*MEMEX_PATH|"
-        r"tmp\.rename\s*\([^)]*MEMEX\.md|"
-        r"MEMEX_PATH\.(?:write_text|open|rename|replace)"
-        r")",
-        re.IGNORECASE,
-    )
-    memex_marker_re = re.compile(
-        r"__memex__|source_event_ids|memex_fullchain|memex-recovered|"
-        r"recovered_memex|recovered-memex",
-        re.IGNORECASE,
-    )
-    uuid_re = re.compile(
-        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
-        re.IGNORECASE,
-    )
-    known_memex_ids = memex_ids or set()
-
-    for call in calls:
-        if not isinstance(call, dict):
-            continue
-        name = str(call.get("name") or "").lower()
-        raw_input = call.get("input")
-        call_input = raw_input if isinstance(raw_input, dict) else {}
-        path = str(call_input.get("path") or "")
-        if name in {"write", "edit"} and path.endswith("MEMEX.md"):
-            return True
-
-        parts: list[str] = []
-        if isinstance(raw_input, dict):
-            parts = [str(value) for value in raw_input.values() if isinstance(value, str)]
-        elif raw_input is not None:
-            parts = [str(raw_input)]
-        text = "\n".join(parts)
-        if ("MEMEX.md" in text or "MEMEX_PATH" in text) and file_write_re.search(text):
-            return True
-        if re.search(r"\bmemories\b", text, re.IGNORECASE) and db_write_re.search(text):
-            if memex_marker_re.search(text):
-                return True
-            if known_memex_ids and known_memex_ids.intersection(uuid_re.findall(text)):
-                return True
-    return False
-
-
-def _iso_second(text: str | None) -> str:
-    """Return YYYY-MM-DDTHH:MM:SS prefix used as timeline second key."""
-    if not text:
-        return ""
-    return text[:19]
+        lease.release()
 
 
 def _iso_to_dt(s: str | None) -> datetime | None:
@@ -224,94 +95,159 @@ def _iso_to_utc_dt(s: str | None) -> datetime | None:
     return dt.astimezone(UTC)
 
 
-def _all_memex_ids(conn: sqlite3.Connection, user_id: str) -> set[str]:
-    rows = conn.execute(
-        "SELECT id FROM memories WHERE user_id = ? AND source_event_ids = ?",
-        (user_id, MEMEX_MARKER_SQL),
-    ).fetchall()
-    return {str(row["id"]) for row in rows}
+def _session_dir(user_id: str) -> Path:
+    return user_control_dir(user_id) / "sessions"
 
 
-def _memory_snapshot_rows(
-    conn: sqlite3.Connection,
-    user_id: str,
-    boundary: str | None,
+def _operation_summary(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Expose operation facts without projecting ordinary graph history."""
+    summary = {
+        key: receipt.get(key)
+        for key in (
+            "id",
+            "started_at",
+            "completed_at",
+            "status",
+            "session_id",
+            "acknowledged_record_ids",
+            "error",
+            "reason",
+        )
+        if key in receipt
+    }
+    memex_version = receipt.get("memex_version")
+    if isinstance(memex_version, dict):
+        summary["memex_version"] = {
+            key: memex_version.get(key) for key in ("path", "sha256") if key in memex_version
+        }
+    summary["memex_updated"] = bool(receipt.get("memex_updated") or memex_version)
+
+    recovery = receipt.get("recovery")
+    if isinstance(recovery, dict):
+        summary["recovery"] = {
+            key: recovery.get(key)
+            for key in ("restored", "recovery_point", "status", "id")
+            if key in recovery
+        }
+    elif recovery is not None:
+        summary["recovery"] = recovery
+    else:
+        # Old receipts remain readable for their final rollback verdict, but
+        # their graph deltas never cross the API boundary.
+        state_change = receipt.get("state_change")
+        if isinstance(state_change, dict) and state_change.get("graph_outcome") == "restored":
+            summary["recovery"] = {"restored": True}
+    return summary
+
+
+def _session_trace(session: dict[str, Any], *, include_content: bool) -> dict[str, Any]:
+    transcript = session.get("transcript") if include_content else []
+    if not isinstance(transcript, list):
+        transcript = []
+    thinking = [
+        block.get("thinking")
+        for turn in transcript
+        if isinstance(turn, dict)
+        for block in turn.get("blocks", [])
+        if isinstance(block, dict) and block.get("type") == "thinking"
+    ]
+    return {
+        "session_id": session.get("id"),
+        "session_path": session.get("path"),
+        "transcript": transcript,
+        "thinking": thinking,
+        "tool_calls": session.get("tool_calls", []) if include_content else [],
+        "tool_name_counts": session.get("tool_name_counts") or {},
+        "tool_calls_count": int(session.get("tool_calls_count") or 0),
+        "num_turns": int(session.get("num_turns") or 0),
+        "output_text": session.get("output_text", "") if include_content else "",
+        "error": session.get("error") or "",
+        "input_tokens": int(session.get("input_tokens") or 0),
+        "output_tokens": int(session.get("output_tokens") or 0),
+        "cache_read_tokens": int(session.get("cache_read_tokens") or 0),
+        "duration_ms": int(session.get("duration_ms") or 0),
+        "cost_usd": float(session.get("cost_usd") or 0),
+        "provider": session.get("provider"),
+        "model": session.get("model"),
+        "status": session.get("status"),
+    }
+
+
+def _accepted_memex_states(
+    control_dir: Path, receipts: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    if not boundary:
-        return []
-    rows = conn.execute(
-        """SELECT m.id, m.content, m.source_event_ids, m.created_at, m.updated_at,
-                  m.active, m.superseded_by
-           FROM memories m
-           LEFT JOIN memories next
-             ON next.user_id = m.user_id AND next.id = m.superseded_by
-           WHERE m.user_id = ?
-             AND datetime(m.created_at) <= datetime(?)
-             AND m.source_event_ids != '["__memex__"]'
-             AND (
-               m.active = 1
-               OR (
-                 m.superseded_by IS NOT NULL
-                 AND next.id IS NOT NULL
-                 AND datetime(next.created_at) > datetime(?)
-               )
-             )
-           ORDER BY datetime(m.created_at) DESC, m.id DESC
-           LIMIT 1000""",
-        (user_id, boundary, boundary),
-    ).fetchall()
-    return [_coerce_dict_text(dict(r), "content", "source_event_ids") for r in rows]
+    """Return validated accepted MEMEX states oldest first."""
+    return load_accepted_memex_versions(control_dir, receipts)
 
 
-def _memory_preview_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    preview_rows: list[dict[str, Any]] = []
-    for row in rows:
-        item = dict(row)
-        content = _to_text(item.get("content"))
-        item["content"] = content[:160]
-        item["content_truncated"] = len(content) > 160
-        preview_rows.append(item)
-    return preview_rows
-
-
-def _timeline_memex_history(
-    conn: sqlite3.Connection,
-    user_id: str,
-    end_dt: datetime,
-) -> list[tuple[sqlite3.Row, datetime]]:
-    """Fetch canonical MEMEX rows once; timeline assigns them per cycle in memory."""
-    rows = conn.execute(
-        f"""SELECT id, content, created_at
-           FROM memories
-           WHERE user_id = ? AND {_canonical_memex_filter()}""",
-        (user_id,),
-    ).fetchall()
-    history: list[tuple[sqlite3.Row, datetime]] = []
-    for row in rows:
-        created_dt = _iso_to_utc_dt(row["created_at"])
-        if created_dt is None or created_dt > end_dt:
-            continue
-        history.append((row, created_dt))
-    history.sort(key=lambda item: (item[1], str(item[0]["id"])))
-    return history
-
-
-def _latest_memex_before(
-    history: list[tuple[sqlite3.Row, datetime]],
-    boundary: str,
-) -> sqlite3.Row | None:
-    boundary_dt = _iso_to_utc_dt(boundary)
+def _latest_memex_state(
+    states: list[dict[str, Any]], boundary: object
+) -> tuple[int, dict[str, Any] | None]:
+    """Select the latest validated MEMEX state at or before a receipt boundary."""
+    boundary_dt = _iso_to_utc_dt(str(boundary or ""))
     if boundary_dt is None:
-        return None
-    latest = None
-    for row, created_dt in history:
-        if created_dt > boundary_dt:
+        return -1, None
+    latest_index = -1
+    for index, state in enumerate(states):
+        state_dt = _iso_to_utc_dt(str(state.get("completed_at") or ""))
+        if state_dt is None or state_dt > boundary_dt:
             break
-        latest = row
-    return latest
+        latest_index = index
+    return latest_index, states[latest_index] if latest_index >= 0 else None
 
 
 # ─── Query layer ─────────────────────────────────────────────────────────────
+
+
+def query_current_graph(db_path: str, user_id: str) -> dict[str, Any]:
+    """Return the current ordinary graph with no timeline boundary."""
+    result: dict[str, Any] = {
+        "kind": "current_graph",
+        "user_id": user_id,
+        "as_of": datetime.now(UTC).isoformat(),
+        "db_present": Path(db_path).exists(),
+        "memory_count": 0,
+        "link_count": 0,
+        "memories": [],
+        "links": [],
+    }
+    if not result["db_present"]:
+        return result
+
+    try:
+        with _open_ro(db_path) as conn:
+            # Keep both reads on one SQLite snapshot. The current graph contains
+            # current ordinary rows only, so no lifecycle or time filter belongs here.
+            conn.execute("BEGIN")
+            memory_rows = conn.execute(
+                """SELECT id, content, created_at, updated_at
+                   FROM memories
+                   WHERE user_id = ?
+                   ORDER BY datetime(created_at) DESC, id DESC""",
+                (user_id,),
+            ).fetchall()
+            link_rows = conn.execute(
+                """SELECT id, source_id, target_id, reason, created_at
+                   FROM links
+                   WHERE user_id = ?
+                   ORDER BY datetime(created_at) DESC, id DESC""",
+                (user_id,),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        result["error"] = str(exc)
+        return result
+
+    memories = [dict(row) for row in memory_rows]
+    links = [dict(row) for row in link_rows]
+    result.update(
+        {
+            "memory_count": len(memories),
+            "link_count": len(links),
+            "memories": memories,
+            "links": links,
+        }
+    )
+    return result
 
 
 def query_timeline(db_path: str, user_id: str, end_iso: str, *, minutes: int) -> dict[str, Any]:
@@ -326,197 +262,103 @@ def query_timeline(db_path: str, user_id: str, end_iso: str, *, minutes: int) ->
     start_dt = end_dt_utc - timedelta(minutes=minutes)
     start_iso = start_dt.isoformat()
     end_iso_norm = end_dt_utc.isoformat()
-    trace_start_iso = (start_dt - timedelta(seconds=5)).astimezone(UTC).isoformat()
-    trace_end_iso = (end_dt_utc + timedelta(seconds=5)).isoformat()
 
+    _ = db_path
     events: list[dict[str, Any]] = []
-    if not Path(db_path).exists():
-        return {
-            "user_id": user_id,
-            "window": {
-                "start": start_iso,
-                "end": end_iso_norm,
-                "minutes": minutes,
-                "days": round(minutes / 1440, 4),
-            },
-            "count": 0,
-            "events": events,
-        }
+    control_dir = user_control_dir(user_id)
+    receipts = list_receipts(control_dir)
+    memex_states = _accepted_memex_states(control_dir, receipts)
+    versions_by_cycle = {
+        str(state["cycle_id"]): state for state in memex_states if state.get("cycle_id") is not None
+    }
+    rows = []
+    for receipt in receipts:
+        display_dt = _iso_to_utc_dt(
+            str(receipt.get("completed_at") or receipt.get("started_at") or "")
+        )
+        if display_dt is None or not (start_dt < display_dt <= end_dt_utc):
+            continue
+        row = dict(receipt)
+        row["display_at"] = receipt.get("completed_at") or receipt.get("started_at")
+        rows.append(row)
+        if len(rows) >= TIMELINE_MAX:
+            break
+    session_start = start_dt
+    for row in rows:
+        cycle_started_at = _iso_to_utc_dt(str(row.get("started_at") or ""))
+        if cycle_started_at is not None and cycle_started_at < session_start:
+            session_start = cycle_started_at
+    native_sessions = list_syke_sessions_between(
+        _session_dir(user_id),
+        start_at=session_start,
+        end_at=end_dt_utc,
+        limit=TIMELINE_MAX,
+    )
+    synthesis_by_cycle: dict[str, dict[str, Any]] = {}
+    synthesis_by_session: dict[str, dict[str, Any]] = {}
+    for session in native_sessions:
+        if session.get("kind") == "synthesis":
+            synthesis_by_cycle.setdefault(str(session.get("operation_id") or ""), session)
+            synthesis_by_session.setdefault(str(session.get("id") or ""), session)
 
-    with _open_ro(db_path) as conn:
-        memex_ids = _all_memex_ids(conn, user_id)
-        memex_history = _timeline_memex_history(conn, user_id, end_dt_utc)
-        initial_memex = _latest_memex_before(memex_history, start_iso)
-        last_memex_id = initial_memex["id"] if initial_memex else None
-        last_memex_hash = _memex_body_hash(initial_memex["content"]) if initial_memex else None
-        rows = conn.execute(
-            """SELECT id, started_at, completed_at,
-                      COALESCE(completed_at, started_at) AS display_at,
-                      status, memex_updated,
-                      memories_created, memories_updated, links_created,
-                      duration_ms, cost_usd, model
-               FROM cycle_records
-               WHERE user_id = ?
-                 AND datetime(COALESCE(completed_at, started_at)) > datetime(?)
-                 AND datetime(COALESCE(completed_at, started_at)) <= datetime(?)
-               ORDER BY datetime(COALESCE(completed_at, started_at)) DESC, id DESC LIMIT ?""",
-            (user_id, start_iso, end_iso_norm, TIMELINE_MAX),
-        ).fetchall()
-        memex_by_cycle_id: dict[str, sqlite3.Row | None] = {}
-        memex_index = -1
-        for r in sorted(
-            rows,
-            key=lambda row: (
-                _iso_to_utc_dt(row["display_at"]) or datetime.min.replace(tzinfo=UTC),
-                str(row["id"]),
-            ),
-        ):
-            display_dt = _iso_to_utc_dt(r["display_at"])
-            if display_dt is not None:
-                while (
-                    memex_index + 1 < len(memex_history)
-                    and memex_history[memex_index + 1][1] <= display_dt
-                ):
-                    memex_index += 1
-            memex_by_cycle_id[str(r["id"])] = (
-                memex_history[memex_index][0] if memex_index >= 0 else None
-            )
-        # Pull synthesis trace rows in the same window so we can attach
-        # num_turns / tool_calls_count to each cycle. cycle_records.model
-        # only stores the runtime label ("pi"); the trace knows the real
-        # model name. Both useful for the timeline tooltip + scrubber.
-        synth_rows = conn.execute(
-            """SELECT id, completed_at, num_turns, tool_calls_count, model,
-                      tool_calls
-               FROM rollout_traces
-               WHERE user_id = ? AND kind = 'synthesis'
-                 AND datetime(completed_at) > datetime(?)
-                 AND datetime(completed_at) <= datetime(?)
-               ORDER BY datetime(completed_at) DESC, id DESC""",
-            (user_id, trace_start_iso, trace_end_iso),
-        ).fetchall()
-        # Index by completed_at second-precision for O(1) cycle→trace lookup.
-        # Keep a queue per second so multiple cycles finishing in the same
-        # second don't all get the same trace row.
-        synth_by_sec: dict[str, deque[sqlite3.Row]] = {}
-        for sr in synth_rows:
-            ca = _iso_second(sr["completed_at"])
-            if ca:
-                synth_by_sec.setdefault(ca, deque()).append(sr)
-        synth_candidates: list[tuple[sqlite3.Row, datetime]] = []
-        for sr in synth_rows:
-            completed_dt = _iso_to_utc_dt(sr["completed_at"])
-            if completed_dt is not None:
-                synth_candidates.append((sr, completed_dt))
-        used_synth_ids: set[str] = set()
-        for r in rows:
-            memex_row = memex_by_cycle_id.get(str(r["id"]))
-            memex_content = _row_text(memex_row, "content") if memex_row else None
-            ca = _iso_second(r["completed_at"])
-            bucket = synth_by_sec.get(ca) if ca else None
-            sr = None
-            while bucket and sr is None:
-                candidate = bucket.popleft()
-                candidate_id = str(candidate["id"])
-                if candidate_id not in used_synth_ids:
-                    sr = candidate
-                    used_synth_ids.add(candidate_id)
-            if sr is None:
-                cycle_dt = _iso_to_utc_dt(r["completed_at"])
-                best: tuple[float, sqlite3.Row] | None = None
-                if cycle_dt is not None:
-                    for candidate, candidate_dt in synth_candidates:
-                        candidate_id = str(candidate["id"])
-                        if candidate_id in used_synth_ids or candidate_dt is None:
-                            continue
-                        delta = abs((candidate_dt - cycle_dt).total_seconds())
-                        if delta < 5 and (best is None or delta < best[0]):
-                            best = (delta, candidate)
-                if best is not None:
-                    sr = best[1]
-                    used_synth_ids.add(str(sr["id"]))
-            trace_memex_written = (
-                _trace_writes_memex(_row_text(sr, "tool_calls"), memex_ids=memex_ids)
-                if sr
-                else False
-            )
-            events.append(
-                {
-                    "kind": "cycle",
-                    "id": r["id"],
-                    "started_at": r["started_at"],
-                    "completed_at": r["completed_at"],
-                    "display_at": r["display_at"],
-                    "status": r["status"],
-                    "memex_id": memex_row["id"] if memex_row else None,
-                    "memex_created_at": memex_row["created_at"] if memex_row else None,
-                    "memex_updated": int(r["memex_updated"] or 0),
-                    "memex_written": False,
-                    "memex_trace_written": trace_memex_written,
-                    "memex_moved": False,
-                    "memex_content_moved": False,
-                    "memex_row_changed": False,
-                    "_memex_hash": _memex_body_hash(memex_content),
-                    "memories_created": int(r["memories_created"] or 0),
-                    "memories_updated": int(r["memories_updated"] or 0),
-                    "links_created": int(r["links_created"] or 0),
-                    "duration_ms": int(r["duration_ms"] or 0),
-                    "cost_usd": float(r["cost_usd"] or 0),
-                    "model": (sr["model"] if sr else None) or r["model"],
-                    "num_turns": int(sr["num_turns"]) if sr and sr["num_turns"] else 0,
-                    "tool_calls_count": int(sr["tool_calls_count"])
-                    if sr and sr["tool_calls_count"]
-                    else 0,
-                }
-            )
-        for event in sorted(
-            (e for e in events if e.get("kind") == "cycle"),
-            key=lambda e: (
-                _iso_to_utc_dt(e.get("display_at")) or datetime.min.replace(tzinfo=UTC),
-                str(e.get("id") or ""),
-            ),
-        ):
-            current_memex_id = event.get("memex_id")
-            current_memex_hash = event.pop("_memex_hash", None)
-            trace_written = bool(event.get("memex_trace_written"))
-            row_changed = bool(current_memex_id and current_memex_id != last_memex_id)
-            content_moved = bool(current_memex_hash and current_memex_hash != last_memex_hash)
-            event["memex_row_changed"] = row_changed
-            event["memex_content_moved"] = content_moved
-            event["memex_moved"] = content_moved
-            event["memex_written"] = trace_written
-            if current_memex_id:
-                last_memex_id = current_memex_id
-            if current_memex_hash:
-                last_memex_hash = current_memex_hash
+    for row in rows:
+        _, memex_state = _latest_memex_state(memex_states, row["display_at"])
+        exact_version = versions_by_cycle.get(str(row.get("id") or ""))
+        session = synthesis_by_session.get(str(row.get("session_id") or ""))
+        if session is None:
+            session = synthesis_by_cycle.get(str(row.get("id") or ""))
+        events.append(
+            {
+                "kind": "cycle",
+                "id": row.get("id"),
+                "started_at": row.get("started_at"),
+                "completed_at": row.get("completed_at"),
+                "display_at": row["display_at"],
+                "status": row.get("status"),
+                "memex_id": memex_state.get("cycle_id") if memex_state else None,
+                "memex_created_at": (
+                    memex_state.get("completed_at") or memex_state.get("captured_at")
+                    if memex_state
+                    else None
+                ),
+                "memex_updated": bool(exact_version),
+                "memex_moved": bool(exact_version),
+                "memex_content_moved": bool(exact_version),
+                "duration_ms": int(session.get("duration_ms") or 0) if session else 0,
+                "cost_usd": float(session.get("cost_usd") or 0) if session else 0,
+                "model": session.get("model") if session else None,
+                "num_turns": int(session.get("num_turns") or 0) if session else 0,
+                "tool_calls_count": int(session.get("tool_calls_count") or 0) if session else 0,
+                "session_id": session.get("id") if session else None,
+                "session_path": session.get("path") if session else None,
+            }
+        )
 
-        ask_rows = conn.execute(
-            """SELECT id, started_at, completed_at, status, duration_ms,
-                      cost_usd, model, num_turns, output_text
-               FROM rollout_traces
-               WHERE user_id = ? AND kind = 'ask'
-                 AND datetime(started_at) > datetime(?)
-                 AND datetime(started_at) <= datetime(?)
-               ORDER BY datetime(started_at) DESC LIMIT ?""",
-            (user_id, start_iso, end_iso_norm, TIMELINE_MAX),
-        ).fetchall()
-        for r in ask_rows:
-            preview = _row_text(r, "output_text").strip().split("\n", 1)[0][:120]
-            events.append(
-                {
-                    "kind": "ask",
-                    "id": r["id"],
-                    "started_at": r["started_at"],
-                    "completed_at": r["completed_at"],
-                    "display_at": r["completed_at"] or r["started_at"],
-                    "status": r["status"],
-                    "duration_ms": int(r["duration_ms"] or 0),
-                    "cost_usd": float(r["cost_usd"] or 0),
-                    "model": r["model"],
-                    "num_turns": int(r["num_turns"] or 0),
-                    "preview": preview,
-                }
-            )
+    for session in native_sessions:
+        if session.get("kind") != "ask":
+            continue
+        started = _iso_to_utc_dt(session.get("started_at"))
+        if started is None or not (start_dt < started <= end_dt_utc):
+            continue
+        preview = str(session.get("output_text") or "").strip().split("\n", 1)[0][:120]
+        events.append(
+            {
+                "kind": "ask",
+                "id": session.get("operation_id"),
+                "session_id": session.get("id"),
+                "session_path": session.get("path"),
+                "started_at": session.get("started_at"),
+                "completed_at": session.get("completed_at"),
+                "display_at": session.get("completed_at") or session.get("started_at"),
+                "status": session.get("status"),
+                "duration_ms": int(session.get("duration_ms") or 0),
+                "cost_usd": float(session.get("cost_usd") or 0),
+                "model": session.get("model"),
+                "num_turns": int(session.get("num_turns") or 0),
+                "tool_calls_count": int(session.get("tool_calls_count") or 0),
+                "preview": preview,
+            }
+        )
 
     def _event_sort_dt(event: dict[str, Any]) -> datetime:
         for key in ("display_at", "completed_at", "started_at"):
@@ -548,207 +390,70 @@ def query_cycle(
     *,
     summary: bool | str = False,
 ) -> dict[str, Any] | None:
-    """Return detail for a single cycle."""
-    summary_mode = "memory" if summary == "memory" else ("memex" if summary else "full")
-    with _open_ro(db_path) as conn:
-        memex_ids = _all_memex_ids(conn, user_id)
-        cycle_row = conn.execute(
-            "SELECT * FROM cycle_records WHERE user_id = ? AND id = ?",
-            (user_id, cycle_id),
-        ).fetchone()
-        if not cycle_row:
-            return None
-        cycle = dict(cycle_row)
-
-        completed_at = cycle.get("completed_at") or cycle["started_at"]
-
-        memex_row = conn.execute(
-            f"""SELECT id, content, created_at FROM memories
-               WHERE user_id = ? AND {_canonical_memex_filter()}
-                 AND datetime(created_at) <= datetime(?)
-               ORDER BY datetime(created_at) DESC, id DESC
-               LIMIT 1""",
-            (user_id, completed_at),
-        ).fetchone()
-        memex_content = _row_text(memex_row, "content") if memex_row else ""
-        memex_created_at = memex_row["created_at"] if memex_row else None
-
-        prev_memex_row = None
-        display_at = completed_at
-        previous_cycle = conn.execute(
-            """SELECT COALESCE(completed_at, started_at) AS display_at
-               FROM cycle_records
-               WHERE user_id = ?
-                 AND id != ?
-                 AND (
-                   datetime(COALESCE(completed_at, started_at)) < datetime(?)
-                   OR (
-                     datetime(COALESCE(completed_at, started_at)) = datetime(?)
-                     AND id < ?
-                   )
-                 )
-               ORDER BY datetime(COALESCE(completed_at, started_at)) DESC, id DESC
-               LIMIT 1""",
-            (user_id, cycle_id, display_at, display_at, cycle_id),
-        ).fetchone()
-        prev_boundary = (
-            previous_cycle["display_at"]
-            if previous_cycle
-            else (cycle.get("started_at") or display_at)
+    """Return one host receipt with accepted MEMEX history and its native session."""
+    _ = db_path
+    summary_mode = "memex" if summary else "full"
+    control_dir = user_control_dir(user_id)
+    cycle = get_receipt(control_dir, cycle_id)
+    if cycle is None:
+        return None
+    completed_at = cycle.get("completed_at") or cycle["started_at"]
+    receipts = list_receipts(control_dir)
+    session_id = cycle.get("session_id")
+    session = (
+        find_session_by_id(
+            _session_dir(user_id),
+            str(session_id),
+            include_transcript=summary_mode == "full",
         )
-        if prev_boundary:
-            prev_memex_row = conn.execute(
-                f"""SELECT id, content, created_at
-                   FROM memories
-                   WHERE user_id = ? AND {_canonical_memex_filter()}
-                     AND datetime(created_at) <= datetime(?)
-                   ORDER BY datetime(created_at) DESC, id DESC
-                   LIMIT 1""",
-                (user_id, prev_boundary),
-            ).fetchone()
-        memex_hash = _memex_body_hash(_row_text(memex_row, "content")) if memex_row else None
-        prev_memex_hash = (
-            _memex_body_hash(_row_text(prev_memex_row, "content")) if prev_memex_row else None
+        if isinstance(session_id, str) and session_id
+        else None
+    )
+    if session is None:
+        session = find_session_by_name(
+            _session_dir(user_id),
+            f"syke:synthesis:{cycle_id}",
+            include_transcript=summary_mode == "full",
         )
-        memex_row_changed = bool(
-            memex_row and (not prev_memex_row or prev_memex_row["id"] != memex_row["id"])
+    cycle_info = _operation_summary(cycle)
+    if session:
+        cycle_info.update(
+            {
+                "duration_ms": int(session.get("duration_ms") or 0),
+                "cost_usd": float(session.get("cost_usd") or 0),
+                "input_tokens": int(session.get("input_tokens") or 0),
+                "output_tokens": int(session.get("output_tokens") or 0),
+                "cache_read_tokens": int(session.get("cache_read_tokens") or 0),
+                "model": session.get("model"),
+            }
         )
-        memex_moved = bool(memex_hash and memex_hash != prev_memex_hash)
-        if memex_row and prev_memex_row is None and memex_moved:
-            prev_memex_row = conn.execute(
-                f"""SELECT id, content, created_at FROM memories
-                   WHERE user_id = ? AND {_canonical_memex_filter()}
-                     AND (
-                       datetime(created_at) < datetime(?)
-                       OR (datetime(created_at) = datetime(?) AND id < ?)
-                     )
-                   ORDER BY datetime(created_at) DESC, id DESC
-                   LIMIT 1""",
-                (user_id, memex_row["created_at"], memex_row["created_at"], memex_row["id"]),
-            ).fetchone()
-        if not memex_moved:
-            prev_memex_row = memex_row
-        prev_memex_content = _row_text(prev_memex_row, "content") if prev_memex_row else ""
-        cycle["memex_id"] = memex_row["id"] if memex_row else None
-        cycle["memex_created_at"] = memex_created_at
-        cycle["memex_moved"] = memex_moved
-        cycle["memex_content_moved"] = memex_moved
-        cycle["memex_row_changed"] = memex_row_changed
-        cycle["memex_trace_written"] = False
-        cycle["memex_written"] = False
-
-        memories: list[dict[str, Any]] = []
-        links: list[dict[str, Any]] = []
-        if summary_mode in {"full", "memory"}:
-            # Memory rows active at the selected boundary. Superseded rows remain
-            # visible for old cycles until their replacement row exists.
-            memories = _memory_snapshot_rows(conn, user_id, completed_at)
-            if summary_mode == "memory":
-                memories = _memory_preview_rows(memories)
-
-            link_rows = conn.execute(
-                """SELECT id, source_id, target_id, reason, created_at
-                   FROM links
-                   WHERE user_id = ? AND datetime(created_at) <= datetime(?)
-                   ORDER BY datetime(created_at) DESC, id DESC LIMIT 2000""",
-                (user_id, completed_at),
-            ).fetchall()
-            links = [_coerce_dict_text(dict(r), "reason") for r in link_rows]
-
-        # Match the synthesis trace by completed_at proximity (microsecond drift)
-        trace = None
-        trace_row = None
-        if cycle.get("completed_at"):
-            # Align cycle detail with timeline mapping:
-            # 1) find the cycle's rank among cycles finishing in this second,
-            # 2) pick trace at the same rank in that second-bucket.
-            cycle_second = _iso_second(cycle["completed_at"])
-            sort_anchor = cycle.get("started_at") or cycle["completed_at"]
-            if cycle_second:
-                rank_row = conn.execute(
-                    """SELECT COUNT(*) AS n
-                       FROM cycle_records
-                       WHERE user_id = ?
-                         AND completed_at IS NOT NULL
-                         AND substr(completed_at, 1, 19) = ?
-                         AND (
-                           COALESCE(started_at, completed_at) > ?
-                           OR (
-                             COALESCE(started_at, completed_at) = ?
-                             AND id > ?
-                           )
-                         )""",
-                    (user_id, cycle_second, sort_anchor, sort_anchor, cycle["id"]),
-                ).fetchone()
-                rank = int(rank_row["n"] or 0) if rank_row else 0
-                trace_row = conn.execute(
-                    """SELECT transcript, thinking, tool_calls, output_text, error,
-                              tool_calls_count, tool_name_counts, num_turns,
-                              input_tokens, output_tokens, cache_read_tokens,
-                              duration_ms, cost_usd, model, status
-                       FROM rollout_traces
-                       WHERE user_id = ? AND kind = 'synthesis'
-                         AND completed_at IS NOT NULL
-                         AND substr(completed_at, 1, 19) = ?
-                       ORDER BY completed_at DESC, id DESC
-                       LIMIT 1 OFFSET ?""",
-                    (user_id, cycle_second, rank),
-                ).fetchone()
-            if trace_row is None:
-                # Legacy fallback when second-bucket matching is unavailable.
-                trace_row = conn.execute(
-                    """SELECT transcript, thinking, tool_calls, output_text, error,
-                              tool_calls_count, tool_name_counts, num_turns,
-                              input_tokens, output_tokens, cache_read_tokens,
-                              duration_ms, cost_usd, model, status
-                       FROM rollout_traces
-                       WHERE user_id = ? AND kind = 'synthesis'
-                         AND ABS(strftime('%s', completed_at) - strftime('%s', ?)) < 5
-                       ORDER BY ABS(strftime('%s', completed_at) - strftime('%s', ?)) ASC
-                       LIMIT 1""",
-                    (user_id, cycle["completed_at"], cycle["completed_at"]),
-                ).fetchone()
-            if trace_row:
-                cycle["memex_trace_written"] = _trace_writes_memex(
-                    _row_text(trace_row, "tool_calls"),
-                    memex_ids=memex_ids,
-                )
-                cycle["memex_written"] = cycle["memex_trace_written"]
-                transcript = []
-                thinking = []
-                tool_calls = []
-                output_text = ""
-                if summary_mode == "full":
-                    transcript_str = _full_text(_row_text(trace_row, "transcript"))
-                    transcript = _parse_json(transcript_str, [])
-                    thinking = _parse_json(_row_text(trace_row, "thinking"), [])
-                    tool_calls = _parse_json(_row_text(trace_row, "tool_calls"), [])
-                    output_text = _row_text(trace_row, "output_text")
-                trace = {
-                    "transcript": transcript,
-                    "thinking": thinking,
-                    "tool_calls": tool_calls,
-                    "tool_name_counts": _parse_json(_row_text(trace_row, "tool_name_counts"), {}),
-                    "tool_calls_count": int(trace_row["tool_calls_count"] or 0),
-                    "num_turns": int(trace_row["num_turns"] or 0),
-                    "output_text": output_text,
-                    "error": _row_text(trace_row, "error"),
-                    "input_tokens": int(trace_row["input_tokens"] or 0),
-                    "output_tokens": int(trace_row["output_tokens"] or 0),
-                    "cache_read_tokens": int(trace_row["cache_read_tokens"] or 0),
-                    "duration_ms": int(trace_row["duration_ms"] or 0),
-                    "cost_usd": float(trace_row["cost_usd"] or 0),
-                    "model": trace_row["model"],
-                    "status": trace_row["status"],
-                }
+    memex_states = _accepted_memex_states(control_dir, receipts)
+    current_index, current_state = _latest_memex_state(memex_states, completed_at)
+    exact_version = next(
+        (state for state in memex_states if state.get("cycle_id") == cycle_id),
+        None,
+    )
+    memex_moved = exact_version is not None
+    if memex_moved:
+        current_state = exact_version
+        current_index = memex_states.index(exact_version)
+        previous_state = memex_states[current_index - 1] if current_index > 0 else None
+    else:
+        previous_state = current_state
+    memex_content = str(current_state.get("content") or "") if current_state else ""
+    memex_created_at = current_state.get("completed_at") if current_state else None
+    previous_memex_content = str(previous_state.get("content") or "") if previous_state else ""
+    cycle_info["memex_id"] = current_state.get("cycle_id") if current_state else None
+    cycle_info["memex_created_at"] = memex_created_at
+    cycle_info["memex_moved"] = memex_moved
+    cycle_info["memex_content_moved"] = memex_moved
+    trace = _session_trace(session, include_content=summary_mode == "full") if session else None
     return {
         "kind": "cycle",
-        "summary": "memory" if summary_mode == "memory" else bool(summary),
-        "cycle": cycle,
+        "summary": bool(summary),
+        "cycle": cycle_info,
         "memex": {"content": memex_content, "created_at": memex_created_at},
-        "prev_memex": {"content": prev_memex_content},
-        "memories": memories,
-        "links": links,
+        "prev_memex": {"content": previous_memex_content},
         "trace": trace,
     }
 
@@ -760,70 +465,55 @@ def query_ask(
     *,
     summary: bool | str = False,
 ) -> dict[str, Any] | None:
-    """Return full detail for a single ask trace.
+    """Return full detail for a single native ask session.
 
-    Includes the memory + link snapshot active at the ask's moment so the
-    Memory tab can show a stable grid across event types — no flicker when
-    the user scrubs from a cycle to an ask.
+    Ordinary graph state is intentionally absent; the graph has its own
+    boundary-free current-state endpoint.
     """
-    summary_mode = "memory" if summary == "memory" else ("memex" if summary else "full")
-    with _open_ro(db_path) as conn:
-        row = conn.execute(
-            """SELECT * FROM rollout_traces
-               WHERE user_id = ? AND kind = 'ask' AND id = ?""",
-            (user_id, ask_id),
-        ).fetchone()
-        if not row:
-            return None
-        ask = dict(row)
-        boundary = ask.get("started_at") or ask.get("completed_at")
-        memories: list[dict[str, Any]] = []
-        links: list[dict[str, Any]] = []
-        if summary_mode in {"full", "memory"}:
-            memories = _memory_snapshot_rows(conn, user_id, boundary)
-            if summary_mode == "memory":
-                memories = _memory_preview_rows(memories)
-            link_rows = conn.execute(
-                """SELECT id, source_id, target_id, reason, created_at
-                   FROM links
-                   WHERE user_id = ? AND datetime(created_at) <= datetime(?)
-                   ORDER BY datetime(created_at) DESC, id DESC LIMIT 2000""",
-                (user_id, boundary),
-            ).fetchall()
-            links = [_coerce_dict_text(dict(r), "reason") for r in link_rows]
-
-        transcript_str = (
-            _full_text(_to_text(ask.get("transcript"))) if summary_mode == "full" else ""
+    _ = db_path
+    summary_mode = "memex" if summary else "full"
+    sessions = _session_dir(user_id)
+    ask = find_session_by_name(
+        sessions,
+        f"syke:ask:{ask_id}",
+        include_transcript=summary_mode == "full",
+    )
+    if ask is None:
+        ask = find_session_by_id(
+            sessions,
+            ask_id,
+            include_transcript=summary_mode == "full",
         )
-        ask_input = _to_text(ask.get("input_text")) if summary_mode != "memory" else ""
-        ask_output = _to_text(ask.get("output_text")) if summary_mode != "memory" else ""
-        return {
-            "kind": "ask",
-            "summary": "memory" if summary_mode == "memory" else bool(summary),
-            "memories": memories,
-            "links": links,
-            "ask": {
-                "id": ask["id"],
-                "started_at": ask["started_at"],
-                "completed_at": ask["completed_at"],
-                "status": ask["status"],
-                "input_text": ask_input,
-                "output_text": ask_output,
-                "model": ask.get("model"),
-                "num_turns": int(ask.get("num_turns") or 0),
-                "duration_ms": int(ask.get("duration_ms") or 0),
-                "cost_usd": float(ask.get("cost_usd") or 0),
-                "input_tokens": int(ask.get("input_tokens") or 0),
-                "output_tokens": int(ask.get("output_tokens") or 0),
-            },
-            "transcript": _parse_json(transcript_str, []),
-            "thinking": _parse_json(_to_text(ask.get("thinking")), [])
-            if summary_mode == "full"
-            else [],
-            "tool_calls": _parse_json(_to_text(ask.get("tool_calls")), [])
-            if summary_mode == "full"
-            else [],
-        }
+    if ask is None or ask.get("kind") != "ask":
+        return None
+
+    transcript = ask.get("transcript") if summary_mode == "full" else []
+    if not isinstance(transcript, list):
+        transcript = []
+    trace = _session_trace(ask, include_content=summary_mode == "full")
+    return {
+        "kind": "ask",
+        "summary": bool(summary),
+        "ask": {
+            "id": ask.get("operation_id"),
+            "session_id": ask.get("id"),
+            "session_path": ask.get("path"),
+            "started_at": ask.get("started_at"),
+            "completed_at": ask.get("completed_at"),
+            "status": ask.get("status"),
+            "input_text": str(ask.get("input_text") or ""),
+            "output_text": str(ask.get("output_text") or "") if summary_mode == "full" else "",
+            "model": ask.get("model"),
+            "num_turns": int(ask.get("num_turns") or 0),
+            "duration_ms": int(ask.get("duration_ms") or 0),
+            "cost_usd": float(ask.get("cost_usd") or 0),
+            "input_tokens": int(ask.get("input_tokens") or 0),
+            "output_tokens": int(ask.get("output_tokens") or 0),
+        },
+        "transcript": trace["transcript"],
+        "thinking": trace["thinking"],
+        "tool_calls": trace["tool_calls"],
+    }
 
 
 def query_log_tail(lines: int) -> dict[str, Any]:
@@ -942,33 +632,26 @@ def query_health(db_path: str, user_id: str) -> dict[str, Any]:
         "onboarding": _onboarding_with_current_persistence(user_id),
         "setup_blocker": _provider_setup_blocker(),
     }
+    receipts = list_receipts(user_control_dir(user_id))
+    if receipts:
+        info["last_cycle"] = _operation_summary(receipts[0])
+    completed = next(
+        (receipt for receipt in receipts if receipt.get("status") == "completed"),
+        None,
+    )
+    if completed:
+        info["last_completed_cycle"] = _operation_summary(completed)
     if not info["db_present"]:
         return info
     try:
         with _open_ro(db_path) as conn:
-            r = conn.execute(
-                "SELECT id, started_at, completed_at, status FROM cycle_records "
-                "WHERE user_id = ? ORDER BY started_at DESC LIMIT 1",
-                (user_id,),
-            ).fetchone()
-            if r:
-                info["last_cycle"] = dict(r)
-            r2 = conn.execute(
-                "SELECT id, started_at, completed_at FROM cycle_records "
-                "WHERE user_id = ? AND status = 'completed' "
-                "ORDER BY completed_at DESC LIMIT 1",
-                (user_id,),
-            ).fetchone()
-            if r2:
-                info["last_completed_cycle"] = dict(r2)
             r3 = conn.execute(
-                "SELECT created_at FROM memories WHERE user_id = ? "
-                "AND source_event_ids = '[\"__memex__\"]' AND active = 1 "
-                "ORDER BY created_at DESC LIMIT 1",
+                "SELECT created_at, updated_at FROM current_memex "
+                "WHERE singleton = 1 AND user_id = ?",
                 (user_id,),
             ).fetchone()
             if r3:
-                info["memex_updated_at"] = r3["created_at"]
+                info["memex_updated_at"] = r3["updated_at"] or r3["created_at"]
     except sqlite3.Error as exc:
         info["error"] = str(exc)
     return info
@@ -1080,6 +763,10 @@ def make_handler(user_id: str, html_path: Path) -> type[BaseHTTPRequestHandler]:
                 self._send_json(200, query_health(db_path_factory(), user_id))
                 return
 
+            if path == "/api/current-graph":
+                self._send_json(200, query_current_graph(db_path_factory(), user_id))
+                return
+
             if path == "/api/timeline":
                 end_iso = (qs.get("end") or [datetime.now(UTC).isoformat()])[0]
                 # `minutes` is the canonical window parameter; `days` stays as a
@@ -1106,9 +793,7 @@ def make_handler(user_id: str, html_path: Path) -> type[BaseHTTPRequestHandler]:
             m = re.match(r"^/api/cycle/([A-Za-z0-9_.:-]+)$", path)
             if m:
                 summary_param = ((qs.get("summary") or ["0"])[0]).lower()
-                summary: bool | str = (
-                    "memory" if summary_param == "memory" else summary_param in {"1", "true", "yes"}
-                )
+                summary = summary_param in {"1", "true", "yes", "memory"}
                 detail = query_cycle(db_path_factory(), user_id, m.group(1), summary=summary)
                 if detail is None:
                     self._send_json(404, {"error": "cycle not found"})
@@ -1119,9 +804,7 @@ def make_handler(user_id: str, html_path: Path) -> type[BaseHTTPRequestHandler]:
             m = re.match(r"^/api/ask/([0-9a-fA-F\-]{8,})$", path)
             if m:
                 summary_param = ((qs.get("summary") or ["0"])[0]).lower()
-                summary = (
-                    "memory" if summary_param == "memory" else summary_param in {"1", "true", "yes"}
-                )
+                summary = summary_param in {"1", "true", "yes", "memory"}
                 detail = query_ask(db_path_factory(), user_id, m.group(1), summary=summary)
                 if detail is None:
                     self._send_json(404, {"error": "ask not found"})
@@ -1177,7 +860,7 @@ class SykeWebServer:
         def _serve() -> None:
             try:
                 assert self._server is not None
-                self._server.serve_forever(poll_interval=0.5)
+                self._server.serve_forever(poll_interval=0.05)
             except Exception as exc:  # pragma: no cover - defensive
                 logger.error("web server crashed: %s", exc, extra={"tag": "WEB"})
 

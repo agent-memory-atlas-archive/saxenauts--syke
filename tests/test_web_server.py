@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sqlite3
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -11,19 +12,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from uuid_extensions import uuid7
 
-from syke.daemon import web as web_mod
+from syke.control import write_receipt
 from syke.daemon.web import (
     SykeWebServer,
-    _extract_host,
-    _iso_to_dt,
     query_ask,
+    query_current_graph,
     query_cycle,
     query_health,
-    query_log_tail,
     query_timeline,
 )
 from syke.db import SykeDB
+from syke.memory.memex_history import write_memex_version
 
 
 def _free_port() -> int:
@@ -32,57 +33,201 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _write_session(
+    db_path: Path,
+    *,
+    operation_id: str,
+    kind: str,
+    started_at: datetime,
+    completed_at: datetime,
+    input_text: str = "",
+    output_text: str = "",
+    tool_calls: list[dict[str, object]] | None = None,
+    model: str = "gpt-5.4",
+    status: str = "completed",
+    error: str | None = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> tuple[str, Path]:
+    session_id = str(uuid7())
+    from syke.runtime import workspace
+
+    sessions = workspace.CONTROL_ROOT / "sessions"
+    path = sessions / f"{started_at.isoformat().replace(':', '-')}_{session_id}.jsonl"
+    assistant_content: list[dict[str, object]] = [
+        {
+            "type": "toolCall",
+            "id": f"call-{index}",
+            "name": str(call.get("name") or "tool"),
+            "arguments": call.get("input") or {},
+        }
+        for index, call in enumerate(tool_calls or [])
+    ]
+    if output_text:
+        assistant_content.append({"type": "text", "text": output_text})
+    entries: list[dict[str, object]] = [
+        {
+            "type": "session",
+            "version": 3,
+            "id": session_id,
+            "timestamp": started_at.isoformat(),
+            "cwd": str(db_path.parent),
+        },
+        {
+            "type": "model_change",
+            "id": f"model-{session_id}",
+            "timestamp": started_at.isoformat(),
+            "provider": "openai-codex",
+            "modelId": model,
+        },
+        {
+            "type": "session_info",
+            "id": f"name-{session_id}",
+            "timestamp": started_at.isoformat(),
+            "name": f"syke:{kind}:{operation_id}",
+        },
+    ]
+    if input_text:
+        entries.append(
+            {
+                "type": "message",
+                "id": f"user-{session_id}",
+                "timestamp": started_at.isoformat(),
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": input_text}],
+                },
+            }
+        )
+    entries.append(
+        {
+            "type": "message",
+            "id": f"assistant-{session_id}",
+            "timestamp": completed_at.isoformat(),
+            "message": {
+                "role": "assistant",
+                "provider": "openai-codex",
+                "model": model,
+                "content": assistant_content,
+                "usage": {
+                    "input": input_tokens,
+                    "output": output_tokens,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "cost": {"total": 0.001},
+                },
+                "stopReason": "error" if status == "failed" else "stop",
+                "errorMessage": error,
+            },
+        }
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(entry) + "\n" for entry in entries),
+        encoding="utf-8",
+    )
+    return session_id, path
+
+
+def _write_cycle_receipt(
+    cycle_id: str,
+    *,
+    started_at: str,
+    completed_at: str | None = None,
+    status: str = "completed",
+    memex_updated: bool = False,
+    memex_content: str | None = None,
+    previous_memex_content: str | None = None,
+    state_change: dict[str, object] | None = None,
+    session_id: str | None = None,
+) -> None:
+    from syke.runtime import workspace
+
+    receipt_session_id = session_id
+    version_ref = None
+    if memex_content is not None:
+        receipt_session_id = receipt_session_id or f"session-{cycle_id}"
+        version_ref = write_memex_version(
+            workspace.CONTROL_ROOT,
+            cycle_id=cycle_id,
+            session_id=receipt_session_id,
+            completed_at=completed_at or started_at,
+            content=memex_content,
+            previous_content=previous_memex_content,
+        )
+    payload: dict[str, object] = {
+        "id": cycle_id,
+        "started_at": started_at,
+        "completed_at": completed_at or started_at,
+        "status": status,
+        "session_id": receipt_session_id,
+        "acknowledged_record_ids": [],
+        "memex_updated": bool(memex_updated or version_ref),
+    }
+    if version_ref is not None:
+        payload["memex_version"] = version_ref
+    if state_change is not None:
+        payload["state_change"] = state_change
+    write_receipt(
+        workspace.CONTROL_ROOT,
+        payload,
+    )
+
+
 def _seed_db(tmp_path: Path) -> tuple[Path, str]:
     db_path = tmp_path / "syke.db"
     user_id = "test_user"
     with SykeDB(db_path) as db:
-        # One memex baseline + one updated memex (memex chain)
+        # One accepted MEMEX version followed by an updated accepted version.
         from syke.memory.memex import update_memex
 
         update_memex(db, user_id, "# MEMEX\n\n## Active Routes\n\n- baseline\n")
         update_memex(db, user_id, "# MEMEX\n\n## Active Routes\n\n- baseline\n- new route\n")
 
-        # One completed cycle
-        cid = db.insert_cycle_record(user_id, model="gpt-5.4")
-        db.complete_cycle_record(
-            cid,
-            status="completed",
-            memex_updated=1,
-            memories_created=2,
-            memories_updated=0,
-            duration_ms=180000,
-            cost_usd=0.02,
+        # One completed host receipt inside the timeline window.
+        cid = str(uuid7())
+        now = datetime.now(UTC)
+        now_iso = now.isoformat()
+        baseline = "# MEMEX\n\n## Active Routes\n\n- baseline\n"
+        current = "# MEMEX\n\n## Active Routes\n\n- baseline\n- new route\n"
+        baseline_at = now - timedelta(seconds=1)
+        _write_cycle_receipt(
+            str(uuid7()),
+            started_at=baseline_at.isoformat(),
+            completed_at=baseline_at.isoformat(),
+            memex_content=baseline,
+        )
+        session_id, _ = _write_session(
+            db_path,
+            operation_id=cid,
+            kind="synthesis",
+            started_at=now,
+            completed_at=now,
+            output_text="cycle complete",
+            model="gpt-5.4",
             input_tokens=1000,
             output_tokens=200,
         )
-
-        # Backdate the cycle record to ensure it falls inside the timeline window
-        now_iso = datetime.now(UTC).isoformat()
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ? WHERE id = ?",
-            (now_iso, now_iso, cid),
+        _write_cycle_receipt(
+            cid,
+            started_at=now_iso,
+            session_id=session_id,
+            memex_content=current,
+            previous_memex_content=baseline,
         )
-        db._conn.commit()
-
-        # One ask trace
-        from uuid_extensions import uuid7
-
-        from syke.trace_store import persist_rollout_trace
 
         ask_id = str(uuid7())
-        persist_rollout_trace(
-            db=db,
-            user_id=user_id,
-            run_id=ask_id,
+        now = datetime.now(UTC)
+        _write_session(
+            db_path,
+            operation_id=ask_id,
             kind="ask",
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
+            started_at=now,
+            completed_at=now,
             status="completed",
             input_text="What is syke?",
             output_text="A memory system.",
-            transcript=[{"role": "user", "blocks": [{"type": "text", "text": "ctx"}]}],
-            metrics={"duration_ms": 1500, "cost_usd": 0.001},
-            runtime={"model": "gpt-5.4", "num_turns": 2},
+            model="gpt-5.4",
         )
     return db_path, user_id
 
@@ -105,36 +250,12 @@ def _running_server(tmp_path: Path, monkeypatch, *, html: str = "<!doctype html>
 # ─── Host validation (DNS rebinding defense) ────────────────────────────────
 
 
-def test_extract_host_strips_port():
-    assert _extract_host("localhost:8765") == "localhost"
-    assert _extract_host("127.0.0.1:9999") == "127.0.0.1"
-    assert _extract_host("[::1]:8765") == "[::1]"
-    assert _extract_host("evil.com") == "evil.com"
-    assert _extract_host("") == ""
-    assert _extract_host(None) == ""
-
-
-def test_server_rejects_non_localhost_host(tmp_path, monkeypatch):
+def test_server_enforces_localhost_and_security_headers(tmp_path, monkeypatch):
     with _running_server(tmp_path, monkeypatch) as (_, _, port):
         req = urllib.request.Request(f"http://127.0.0.1:{port}/", headers={"Host": "evil.com"})
         with pytest.raises(urllib.error.HTTPError) as excinfo:
             urllib.request.urlopen(req, timeout=2)
         assert excinfo.value.code == 403
-
-
-def test_server_accepts_localhost_host(tmp_path, monkeypatch):
-    with _running_server(tmp_path, monkeypatch) as (_, _, port):
-        for host in ("localhost", "127.0.0.1", "[::1]"):
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{port}/", headers={"Host": f"{host}:{port}"}
-            )
-            with urllib.request.urlopen(req, timeout=2) as r:
-                assert r.status == 200
-                assert b"ok" in r.read()
-
-
-def test_server_writes_security_headers(tmp_path, monkeypatch):
-    with _running_server(tmp_path, monkeypatch) as (_, _, port):
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as r:
             headers = {k.lower(): v for k, v in r.headers.items()}
             assert "no-store" in headers["cache-control"]
@@ -142,113 +263,18 @@ def test_server_writes_security_headers(tmp_path, monkeypatch):
             assert "default-src 'self'" in headers["content-security-policy"]
 
 
-def test_server_returns_empty_favicon_without_console_noise(tmp_path, monkeypatch):
-    with _running_server(tmp_path, monkeypatch) as (_, _, port):
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico", timeout=2) as r:
-            assert r.status == 204
-            assert r.read() == b""
-
-
 # ─── Query layer ─────────────────────────────────────────────────────────────
 
 
-def test_query_health_with_seeded_db(tmp_path, monkeypatch):
-    db_path, user_id = _seed_db(tmp_path)
-    from syke.cli_support import daemon_state
-    from syke.onboarding import write_onboarding_state
-
-    monkeypatch.setattr(
-        daemon_state,
-        "daemon_payload",
-        lambda: pytest.fail("resident onboarding receipts should not read live daemon state"),
-    )
-    write_onboarding_state(
-        user_id,
-        selected_sources=("codex",),
-        total_files=42,
-        estimated_minutes=3,
-        estimate_method="test",
-        mode="daemon",
-        monitor="/tmp/onboarding.log",
-        persistence={"manager": "launchd", "keeps_daemon_alive": True},
-    )
-    h = query_health(str(db_path), user_id)
-    assert h["db_present"] is True
-    assert h["last_cycle"] is not None
-    assert h["last_completed_cycle"] is not None
-    assert h["memex_updated_at"] is not None
-    assert h["onboarding"]["selected_sources"] == ["codex"]
-    assert h["onboarding"]["total_files"] == 42
-    assert h["onboarding"]["estimated_minutes"] == 3
-    assert h["onboarding"]["mode"] == "daemon"
-    assert h["onboarding"]["monitor"] == "/tmp/onboarding.log"
-    assert h["onboarding"]["persistence"]["manager"] == "launchd"
-    assert h["onboarding"]["persistence"]["keeps_daemon_alive"] is True
-
-
-def test_query_health_replaces_legacy_onboarding_persistence_with_live_service(
-    tmp_path, monkeypatch
-):
-    db_path, user_id = _seed_db(tmp_path)
-    from syke.cli_support import daemon_state
-    from syke.onboarding import write_onboarding_state
-
-    live_persistence = {
-        "manager": "systemd",
-        "manager_scope": "user",
-        "keeps_syncing": True,
-        "keeps_daemon_alive": True,
-        "serves_timeline_while_idle": True,
-        "restart_policy": "Restart=always",
-    }
-    monkeypatch.setattr(
-        daemon_state,
-        "daemon_payload",
-        lambda: {
-            "running": True,
-            "registered": True,
-            "persistence": live_persistence,
-            "service": {
-                "manager": "systemd",
-                "registered": True,
-                "scheduled_only": False,
-                "running": True,
-            },
-        },
-    )
-    write_onboarding_state(
-        user_id,
-        selected_sources=("codex",),
-        total_files=42,
-        estimated_minutes=3,
-        estimate_method="test",
-        mode="daemon",
-        monitor="/tmp/onboarding.log",
-        persistence={
-            "manager": "cron",
-            "keeps_daemon_alive": False,
-            "serves_timeline_while_idle": False,
-            "restart_policy": "periodic sync only",
-        },
-    )
-
-    h = query_health(str(db_path), user_id)
-
-    assert h["onboarding"]["persistence"]["manager"] == "systemd"
-    assert h["onboarding"]["persistence"]["keeps_daemon_alive"] is True
-    assert h["onboarding"]["persistence"]["serves_timeline_while_idle"] is True
-    assert h["onboarding"]["persistence_source"] == "daemon_status"
-    assert h["onboarding"]["stored_persistence"]["manager"] == "cron"
-
-
-def test_query_health_reports_setup_blocker_before_db_exists(tmp_path, monkeypatch):
+def test_query_health_updates_provider_blocker_without_model_resolution(tmp_path, monkeypatch):
     from syke.llm import pi_client
 
     def _fail_model_resolution(_model_override=None):
         raise AssertionError("/api/health must not invoke Pi model resolution")
 
     monkeypatch.delenv("SYKE_PROVIDER", raising=False)
-    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
+    pi_agent = tmp_path / "pi-agent"
+    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(pi_agent))
     monkeypatch.setattr(pi_client, "resolve_pi_model", _fail_model_resolution)
 
     h = query_health(str(tmp_path / "missing.db"), "fresh")
@@ -263,200 +289,148 @@ def test_query_health_reports_setup_blocker_before_db_exists(tmp_path, monkeypat
         in h["setup_blocker"]["next_steps"]
     )
     assert "syke setup --agent" in h["setup_blocker"]["next_steps"]
-
-
-def test_query_health_uses_default_provider_hint_without_pi_catalog(tmp_path, monkeypatch):
-    from syke.llm import pi_client
-
-    def _fail_model_resolution(_model_override=None):
-        raise AssertionError("/api/health must not invoke Pi model resolution")
-
-    pi_agent = tmp_path / "pi-agent"
     pi_agent.mkdir()
     (pi_agent / "settings.json").write_text('{"defaultProvider": "openai-codex"}\n')
-    monkeypatch.delenv("SYKE_PROVIDER", raising=False)
-    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(pi_agent))
-    monkeypatch.setattr(pi_client, "resolve_pi_model", _fail_model_resolution)
 
-    h = query_health(str(tmp_path / "missing.db"), "fresh")
+    configured = query_health(str(tmp_path / "missing.db"), "fresh")
 
-    assert h["db_present"] is False
-    assert h["setup_blocker"] is None
+    assert configured["db_present"] is False
+    assert configured["setup_blocker"] is None
 
 
-def test_first_run_html_stays_inside_timeline_shell():
-    html_path = Path(web_mod.__file__).resolve().parent.parent / "runtime" / "web" / "index.html"
-    html = html_path.read_text(encoding="utf-8")
+def test_query_health_replaces_legacy_onboarding_persistence_with_live_service(
+    tmp_path, monkeypatch
+):
+    from syke.cli_support import daemon_state
+    from syke.onboarding import write_onboarding_state
 
-    assert "function renderFirstRunMemexState()" in html
-    assert "renderOnboardingPanel" not in html
-    assert 'class="onboard' not in html
-    assert "<h2>Next CLI Step</h2>" in html
+    write_onboarding_state(
+        "test_user",
+        selected_sources=("codex",),
+        total_files=1,
+        estimated_minutes=1,
+        estimate_method="test",
+        mode="daemon",
+        persistence={"manager": "cron", "keeps_daemon_alive": False},
+    )
+    live_persistence = {
+        "manager": "systemd",
+        "keeps_daemon_alive": True,
+        "serves_timeline_while_idle": True,
+    }
+    monkeypatch.setattr(
+        daemon_state,
+        "daemon_payload",
+        lambda: {
+            "running": True,
+            "registered": True,
+            "persistence": live_persistence,
+            "service": {"manager": "systemd", "running": True, "scheduled_only": False},
+        },
+    )
+
+    health = query_health(str(tmp_path / "missing.db"), "test_user")
+
+    assert health["onboarding"]["persistence"] == live_persistence
+    assert health["onboarding"]["stored_persistence"]["manager"] == "cron"
+    assert health["onboarding"]["persistence_source"] == "daemon_status"
 
 
-def test_query_timeline_returns_cycles_and_asks(tmp_path):
+def test_query_current_graph_reads_current_rows_without_a_timeline_boundary(tmp_path):
+    db_path = tmp_path / "syke-current.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE memories (
+                id TEXT PRIMARY KEY NOT NULL,
+                user_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT
+            );
+            CREATE TABLE links (
+                id TEXT PRIMARY KEY NOT NULL,
+                user_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO memories VALUES
+                ('mem-a', 'test_user', 'A', '2026-01-01T00:00:00+00:00', NULL),
+                ('mem-b', 'test_user', 'B', '2026-01-02T00:00:00+00:00',
+                 '2026-01-03T00:00:00+00:00');
+            INSERT INTO links VALUES
+                ('link-a-b', 'test_user', 'mem-a', 'mem-b', 'connected',
+                 '2026-01-03T00:00:00+00:00');
+            """
+        )
+
+    graph = query_current_graph(str(db_path), "test_user")
+
+    assert graph["kind"] == "current_graph"
+    assert graph["memory_count"] == 2
+    assert graph["link_count"] == 1
+    assert [memory["id"] for memory in graph["memories"]] == ["mem-b", "mem-a"]
+    assert graph["links"] == [
+        {
+            "id": "link-a-b",
+            "source_id": "mem-a",
+            "target_id": "mem-b",
+            "reason": "connected",
+            "created_at": "2026-01-03T00:00:00+00:00",
+        }
+    ]
+
+
+def test_cycle_and_ask_details_do_not_return_ordinary_graph_playback(tmp_path):
     db_path, user_id = _seed_db(tmp_path)
     end_iso = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
-    t = query_timeline(str(db_path), user_id, end_iso, minutes=7 * 24 * 60)
-    kinds = {e["kind"] for e in t["events"]}
-    assert "cycle" in kinds
-    assert "ask" in kinds
-    assert t["count"] == len(t["events"]) >= 2
+    timeline = query_timeline(str(db_path), user_id, end_iso, minutes=7 * 24 * 60)
+    cycle_event = next(event for event in timeline["events"] if event["kind"] == "cycle")
+    ask_event = next(event for event in timeline["events"] if event["kind"] == "ask")
+
+    cycle = query_cycle(str(db_path), user_id, cycle_event["id"])
+    ask = query_ask(str(db_path), user_id, ask_event["id"])
+
+    assert cycle is not None
+    assert ask is not None
+    assert "memories" not in cycle
+    assert "links" not in cycle
+    assert "memories" not in ask
+    assert "links" not in ask
 
 
-def test_query_timeline_returns_empty_window_before_db_exists(tmp_path):
-    missing_db = tmp_path / "missing.db"
-    end_iso = datetime.now(UTC).isoformat()
-
-    t = query_timeline(str(missing_db), "fresh", end_iso, minutes=7 * 24 * 60)
-
-    assert t["user_id"] == "fresh"
-    assert t["count"] == 0
-    assert t["events"] == []
-    assert t["window"]["days"] == 7
-
-
-def test_iso_to_dt_restores_unencoded_plus_timezone():
-    assert _iso_to_dt("2026-05-12T22:00:00+00:00") == datetime(2026, 5, 12, 22, 0, 0, tzinfo=UTC)
-    assert _iso_to_dt("2026-05-12T22:00:00 00:00") == datetime(2026, 5, 12, 22, 0, 0, tzinfo=UTC)
-
-
-def test_query_timeline_uses_display_time_and_memex_timestamp(tmp_path):
+def test_query_timeline_ignores_orphan_memex_version_files(tmp_path):
     db_path = tmp_path / "syke.db"
     user_id = "test_user"
-    with SykeDB(db_path) as db:
-        early = datetime(2026, 4, 8, 7, 0, tzinfo=UTC)
-        memex_anchor = datetime(2026, 4, 8, 7, 30, tzinfo=UTC)
-        later = datetime(2026, 4, 8, 8, 0, tzinfo=UTC)
-
-        c0 = db.insert_cycle_record(user_id, model="pi")
-        c1 = db.insert_cycle_record(user_id, model="pi")
-        c2 = db.insert_cycle_record(user_id, model="pi")
-
-        c0_started = early
-        c1_started = memex_anchor - timedelta(minutes=10)
-        c1_completed = memex_anchor
-        c2_started = later
-        c2_completed = later + timedelta(minutes=5)
-
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed', memex_updated = 0 WHERE id = ?",
-            (c0_started.isoformat(), (early + timedelta(minutes=1)).isoformat(), c0),
-        )
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed', memex_updated = 1 WHERE id = ?",
-            (c1_started.isoformat(), c1_completed.isoformat(), c1),
-        )
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed', memex_updated = 1 WHERE id = ?",
-            (c2_started.isoformat(), c2_completed.isoformat(), c2),
-        )
-
-        from uuid_extensions import uuid7
-
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 1)",
-            (str(uuid7()), user_id, "# memex\n", c1_completed.isoformat()),
-        )
-        db._conn.commit()
-
-    t = query_timeline(str(db_path), user_id, (later + timedelta(hours=1)).isoformat(), minutes=180)
-    events = [e for e in t["events"] if e["kind"] == "cycle"]
-    assert len(events) >= 3
-    by_id = {e["id"]: e for e in events}
-
-    assert by_id[c0]["memex_created_at"] is None
-    assert by_id[c0]["memex_moved"] is False
-    assert by_id[c1]["memex_created_at"] == c1_completed.isoformat()
-    assert by_id[c1]["memex_moved"] is True
-    assert by_id[c2]["memex_created_at"] == c1_completed.isoformat()
-    assert by_id[c2]["memex_updated"] == 1
-    assert by_id[c2]["memex_moved"] is False
-    for c in [c0, c1, c2]:
-        row = by_id[c]
-        expected = row["completed_at"] or row["started_at"]
-        assert row["display_at"] == expected
-
-    # Timeline ordering should follow display time descending.
-    assert events[0]["display_at"] >= events[1]["display_at"] >= events[2]["display_at"]
-
-
-def test_query_timeline_compares_memex_content_not_recovered_row_ids(tmp_path):
-    from uuid_extensions import uuid7
-
-    db_path = tmp_path / "syke.db"
-    user_id = "test_user"
-    with SykeDB(db_path) as db:
-        first = datetime(2026, 4, 8, 7, 30, tzinfo=UTC)
-        second = datetime(2026, 4, 8, 7, 45, tzinfo=UTC)
-        c1 = db.insert_cycle_record(user_id, model="pi")
-        c2 = db.insert_cycle_record(user_id, model="pi")
-        for cycle_id, completed_at in [(c1, first), (c2, second)]:
-            db._conn.execute(
-                "UPDATE cycle_records SET started_at = ?, completed_at = ?, "
-                "status = 'completed', memex_updated = 1 WHERE id = ?",
-                (
-                    (completed_at - timedelta(minutes=1)).isoformat(),
-                    completed_at.isoformat(),
-                    cycle_id,
-                ),
-            )
-        for completed_at in [first, second]:
-            db._conn.execute(
-                "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-                "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 0)",
-                (str(uuid7()), user_id, "# MEMEX\n\nsame content\n", completed_at.isoformat()),
-            )
-        db._conn.commit()
-
-    t = query_timeline(
-        str(db_path),
-        user_id,
-        (second + timedelta(minutes=10)).isoformat(),
-        minutes=60,
-    )
-    by_id = {e["id"]: e for e in t["events"] if e["kind"] == "cycle"}
-
-    assert by_id[c1]["memex_moved"] is True
-    assert by_id[c1]["memex_content_moved"] is True
-    assert by_id[c2]["memex_row_changed"] is True
-    assert by_id[c2]["memex_content_moved"] is False
-    assert by_id[c2]["memex_moved"] is False
-    assert by_id[c2]["memex_written"] is False
-
-
-def test_query_timeline_ignores_reconstruction_memex_artifact_ids(tmp_path):
-    from uuid_extensions import uuid7
-
-    db_path = tmp_path / "syke.db"
-    user_id = "test_user"
-    with SykeDB(db_path) as db:
+    with SykeDB(db_path):
         baseline = datetime(2026, 4, 8, 7, 30, tzinfo=UTC)
         artifact_at = datetime(2026, 4, 8, 7, 45, tzinfo=UTC)
         cycle_at = datetime(2026, 4, 8, 8, 0, tzinfo=UTC)
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 0)",
-            (str(uuid7()), user_id, "# MEMEX\n\nreal baseline\n", baseline.isoformat()),
+        accepted_cycle = str(uuid7())
+        _write_cycle_receipt(
+            accepted_cycle,
+            started_at=(baseline - timedelta(minutes=1)).isoformat(),
+            completed_at=baseline.isoformat(),
+            memex_content="# MEMEX\n\nreal baseline\n",
         )
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 0)",
-            (
-                "memex_fullchain_00001",
-                user_id,
-                "# MEMEX\n\nsynthetic artifact\n",
-                artifact_at.isoformat(),
-            ),
+        from syke.runtime import workspace
+
+        write_memex_version(
+            workspace.CONTROL_ROOT,
+            cycle_id="orphan-version",
+            session_id="orphan-session",
+            completed_at=artifact_at.isoformat(),
+            content="# MEMEX\n\nsynthetic artifact\n",
+            previous_content="# MEMEX\n\nreal baseline\n",
         )
-        cycle_id = db.insert_cycle_record(user_id, model="pi")
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, "
-            "status = 'completed' WHERE id = ?",
-            ((cycle_at - timedelta(minutes=1)).isoformat(), cycle_at.isoformat(), cycle_id),
+        cycle_id = str(uuid7())
+        _write_cycle_receipt(
+            cycle_id,
+            started_at=(cycle_at - timedelta(minutes=1)).isoformat(),
+            completed_at=cycle_at.isoformat(),
         )
-        db._conn.commit()
 
     t = query_timeline(
         str(db_path),
@@ -468,284 +442,103 @@ def test_query_timeline_ignores_reconstruction_memex_artifact_ids(tmp_path):
 
     assert cycle["id"] == cycle_id
     assert cycle["memex_created_at"] == baseline.isoformat()
-    assert cycle["memex_id"] != "memex_fullchain_00001"
-    assert cycle["memex_moved"] is True
-
-
-def test_query_timeline_uses_trace_tool_calls_for_memex_write_truth(tmp_path):
-    from uuid_extensions import uuid7
-
-    from syke.trace_store import persist_rollout_trace
-
-    db_path = tmp_path / "syke.db"
-    user_id = "test_user"
-    with SykeDB(db_path) as db:
-        baseline = datetime(2026, 4, 8, 7, 30, tzinfo=UTC)
-        cycle_at = datetime(2026, 4, 8, 7, 45, tzinfo=UTC)
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 1)",
-            (str(uuid7()), user_id, "# MEMEX\n\nsame content\n", baseline.isoformat()),
-        )
-        cycle_id = db.insert_cycle_record(user_id, model="pi")
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, "
-            "status = 'completed' WHERE id = ?",
-            ((cycle_at - timedelta(minutes=1)).isoformat(), cycle_at.isoformat(), cycle_id),
-        )
-        persist_rollout_trace(
-            db=db,
-            user_id=user_id,
-            run_id=str(uuid7()),
-            kind="synthesis",
-            started_at=cycle_at,
-            completed_at=cycle_at,
-            status="completed",
-            output_text="No row changed, but the trace wrote MEMEX.md.",
-            tool_calls=[
-                {
-                    "name": "write",
-                    "input": {"path": "MEMEX.md", "content": "# MEMEX\n\nsame content\n"},
-                }
-            ],
-            runtime={"model": "gpt-5.4"},
-        )
-        db._conn.commit()
-
-    t = query_timeline(
-        str(db_path),
-        user_id,
-        (cycle_at + timedelta(minutes=10)).isoformat(),
-        minutes=20,
-    )
-    cycle = next(e for e in t["events"] if e["kind"] == "cycle")
-
-    assert cycle["id"] == cycle_id
-    assert cycle["memex_trace_written"] is True
-    assert cycle["memex_row_changed"] is False
-    assert cycle["memex_content_moved"] is False
+    assert cycle["memex_id"] == accepted_cycle
     assert cycle["memex_moved"] is False
-    assert cycle["memex_written"] is True
-
-    detail = query_cycle(str(db_path), user_id, cycle_id)
-    assert detail is not None
-    assert detail["cycle"]["memex_trace_written"] is True
-    assert detail["cycle"]["memex_written"] is True
-    assert detail["cycle"]["memex_moved"] is False
 
 
-def test_query_cycle_summary_omits_heavy_payloads(tmp_path):
-    from uuid_extensions import uuid7
-
-    from syke.trace_store import persist_rollout_trace
-
+def test_operation_summaries_bound_heavy_payloads_and_keep_routing_context(tmp_path):
     db_path = tmp_path / "syke.db"
     user_id = "test_user"
-    with SykeDB(db_path) as db:
+    cycle_output = "x" * 50_000
+    ask_output = "y" * 50_000
+    with SykeDB(db_path):
         baseline = datetime(2026, 4, 8, 7, 30, tzinfo=UTC)
         completed = datetime(2026, 4, 8, 7, 45, tzinfo=UTC)
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 1)",
-            (str(uuid7()), user_id, "# MEMEX\n\nbaseline\n", baseline.isoformat()),
+        _write_cycle_receipt(
+            str(uuid7()),
+            started_at=(baseline - timedelta(minutes=1)).isoformat(),
+            completed_at=baseline.isoformat(),
+            memex_content="# MEMEX\n\nbaseline\n",
         )
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 1)",
-            (str(uuid7()), user_id, "# MEMEX\n\ncurrent route\n", completed.isoformat()),
-        )
-        for mem_id, content in (("mem-a", "A"), ("mem-b", "B" * 500)):
-            db._conn.execute(
-                "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-                "VALUES (?, ?, ?, '[\"source\"]', ?, 1)",
-                (mem_id, user_id, content, baseline.isoformat()),
-            )
-        db._conn.execute(
-            "INSERT INTO links (id, user_id, source_id, target_id, reason, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            ("link-a-b", user_id, "mem-a", "mem-b", "connected", baseline.isoformat()),
-        )
-        cycle_id = db.insert_cycle_record(user_id, model="pi")
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, "
-            "status = 'completed' WHERE id = ?",
-            ((completed - timedelta(minutes=1)).isoformat(), completed.isoformat(), cycle_id),
-        )
-        persist_rollout_trace(
-            db=db,
-            user_id=user_id,
-            run_id=str(uuid7()),
+        cycle_id = str(uuid7())
+        session_id, _ = _write_session(
+            db_path,
+            operation_id=cycle_id,
             kind="synthesis",
-            started_at=completed,
+            started_at=completed - timedelta(minutes=1),
             completed_at=completed,
             status="completed",
-            transcript=[{"role": "assistant", "blocks": [{"type": "text", "text": "heavy"}]}],
             tool_calls=[
                 {
                     "name": "write",
                     "input": {"path": "MEMEX.md", "content": "# MEMEX\n\ncurrent route\n"},
                 }
             ],
-            output_text="heavy output",
-            runtime={"model": "gpt-5.4", "num_turns": 3},
-            metrics={"input_tokens": 10, "output_tokens": 5},
+            output_text=cycle_output,
+            model="gpt-5.4",
+            input_tokens=10,
+            output_tokens=5,
         )
-        db._conn.commit()
+        _write_cycle_receipt(
+            cycle_id,
+            started_at=(completed - timedelta(minutes=1)).isoformat(),
+            completed_at=completed.isoformat(),
+            session_id=session_id,
+            memex_content="# MEMEX\n\ncurrent route\n",
+            previous_memex_content="# MEMEX\n\nbaseline\n",
+        )
+        ask_id = str(uuid7())
+        _write_session(
+            db_path,
+            operation_id=ask_id,
+            kind="ask",
+            started_at=completed,
+            completed_at=completed,
+            input_text="What is Syke?",
+            output_text=ask_output,
+        )
 
     summary = query_cycle(str(db_path), user_id, cycle_id, summary=True)
-    memory_summary = query_cycle(str(db_path), user_id, cycle_id, summary="memory")
     full = query_cycle(str(db_path), user_id, cycle_id)
+    ask_summary = query_ask(str(db_path), user_id, ask_id, summary=True)
+    ask_full = query_ask(str(db_path), user_id, ask_id)
 
     assert summary is not None
-    assert memory_summary is not None
     assert full is not None
+    assert ask_summary is not None
+    assert ask_full is not None
     assert summary["summary"] is True
-    assert memory_summary["summary"] == "memory"
     assert full["summary"] is False
-    assert summary["memex"]["content"] == "# MEMEX\n\ncurrent route\n"
-    assert summary["prev_memex"]["content"] == "# MEMEX\n\nbaseline\n"
-    assert summary["memories"] == []
-    assert summary["links"] == []
+    assert summary["memex"]["content"] == "# MEMEX\n\ncurrent route"
+    assert summary["prev_memex"]["content"] == "# MEMEX\n\nbaseline"
     assert summary["trace"]["transcript"] == []
     assert summary["trace"]["tool_calls"] == []
     assert summary["trace"]["output_text"] == ""
     assert summary["trace"]["tool_calls_count"] == full["trace"]["tool_calls_count"]
-    assert len(memory_summary["memories"]) == 2
-    assert len(memory_summary["links"]) == 1
-    assert len(memory_summary["memories"][0]["content"]) <= 160
-    assert any(m["content_truncated"] for m in memory_summary["memories"])
-    assert memory_summary["trace"]["transcript"] == []
-    assert memory_summary["trace"]["output_text"] == ""
-    assert len(full["memories"]) == 2
-    assert len(full["links"]) == 1
     assert full["trace"]["transcript"]
-
-
-def test_query_timeline_detects_shell_and_sql_memex_writes(tmp_path):
-    from uuid_extensions import uuid7
-
-    from syke.trace_store import persist_rollout_trace
-
-    db_path = tmp_path / "syke.db"
-    user_id = "test_user"
-    with SykeDB(db_path) as db:
-        baseline = datetime(2026, 4, 8, 7, 30, tzinfo=UTC)
-        memex_id = str(uuid7())
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 1)",
-            (memex_id, user_id, "# MEMEX\n\nsame content\n", baseline.isoformat()),
-        )
-        scenarios = [
-            (
-                "file-open",
-                datetime(2026, 4, 8, 7, 45, tzinfo=UTC),
-                "python3 - <<'PY'\nopen('MEMEX.md','w').write('# MEMEX\\n\\nsame content\\n')\nPY",
-                0,
-            ),
-            (
-                "sql-known-memex-id",
-                datetime(2026, 4, 8, 8, 0, tzinfo=UTC),
-                "python3 - <<'PY'\n"
-                "import sqlite3\n"
-                "memex = '# MEMEX\\n\\nsame content\\n'\n"
-                "conn = sqlite3.connect('syke.db')\n"
-                f"conn.execute(\"update memories set content=? where id=?\", (memex, '{memex_id}'))\n"
-                "PY",
-                0,
-            ),
-            (
-                "drifted-cp",
-                datetime(2026, 4, 8, 8, 15, tzinfo=UTC),
-                "cp tmp/current_memex.md MEMEX.md",
-                4,
-            ),
-        ]
-        cycle_ids: list[str] = []
-        for label, cycle_at, command, trace_drift_seconds in scenarios:
-            cycle_id = db.insert_cycle_record(user_id, model="pi")
-            cycle_ids.append(cycle_id)
-            db._conn.execute(
-                "UPDATE cycle_records SET started_at = ?, completed_at = ?, "
-                "status = 'completed' WHERE id = ?",
-                ((cycle_at - timedelta(minutes=1)).isoformat(), cycle_at.isoformat(), cycle_id),
-            )
-            persist_rollout_trace(
-                db=db,
-                user_id=user_id,
-                run_id=str(uuid7()),
-                kind="synthesis",
-                started_at=cycle_at,
-                completed_at=cycle_at + timedelta(seconds=trace_drift_seconds),
-                status="completed",
-                output_text=f"Updated MEMEX through {label}.",
-                tool_calls=[{"name": "bash", "input": {"command": command}}],
-                runtime={"model": "gpt-5.4"},
-            )
-        db._conn.commit()
-
-    t = query_timeline(
-        str(db_path),
-        user_id,
-        (datetime(2026, 4, 8, 8, 15, tzinfo=UTC)).isoformat(),
-        minutes=40,
-    )
-    by_id = {e["id"]: e for e in t["events"] if e["kind"] == "cycle"}
-    for cycle_id in cycle_ids:
-        assert by_id[cycle_id]["memex_trace_written"] is True
-        assert by_id[cycle_id]["memex_written"] is True
-        assert by_id[cycle_id]["memex_moved"] is False
-
-    drift_detail = query_cycle(str(db_path), user_id, cycle_ids[-1])
-    assert drift_detail is not None
-    assert drift_detail["cycle"]["memex_trace_written"] is True
-
-
-def test_query_timeline_sorts_by_display_time(tmp_path):
-    db_path = tmp_path / "syke.db"
-    user_id = "test_user"
-    with SykeDB(db_path) as db:
-        c1 = db.insert_cycle_record(user_id, model="pi")
-        c2 = db.insert_cycle_record(user_id, model="pi")
-
-        base = datetime(2026, 4, 10, 10, 0, tzinfo=UTC)
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed' WHERE id = ?",
-            (base.isoformat(), (base + timedelta(minutes=10)).isoformat(), c1),
-        )
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed' WHERE id = ?",
-            (
-                (base + timedelta(minutes=5)).isoformat(),
-                (base + timedelta(minutes=1)).isoformat(),
-                c2,
-            ),
-        )
-        db._conn.commit()
-
-    end_iso = (base + timedelta(minutes=20)).isoformat()
-    t = query_timeline(str(db_path), user_id, end_iso, minutes=60)
-    events = [e for e in t["events"] if e["kind"] == "cycle"]
-    assert len(events) >= 2
-    assert events[0]["id"] == c1
-    assert events[1]["id"] == c2
+    assert full["trace"]["output_text"] == cycle_output
+    assert ask_summary["ask"]["input_text"] == "What is Syke?"
+    assert ask_summary["ask"]["output_text"] == ""
+    assert ask_summary["transcript"] == []
+    assert ask_full["ask"]["output_text"] == ask_output
 
 
 def test_query_timeline_sorts_mixed_offsets_by_instant(tmp_path):
     db_path = tmp_path / "syke.db"
     user_id = "test_user"
     with SykeDB(db_path) as db:
-        earlier = db.insert_cycle_record(user_id, model="pi")
-        later = db.insert_cycle_record(user_id, model="pi")
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed' WHERE id = ?",
-            ("2026-05-12T10:00:00+01:00", "2026-05-12T10:00:00+01:00", earlier),
+        earlier, later = str(uuid7()), str(uuid7())
+        _write_cycle_receipt(
+            earlier,
+            started_at="2026-05-12T10:00:00+01:00",
+            completed_at="2026-05-12T10:00:00+01:00",
         )
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed' WHERE id = ?",
-            ("2026-05-12T09:30:00+00:00", "2026-05-12T09:30:00+00:00", later),
+        _write_cycle_receipt(
+            later,
+            started_at="2026-05-12T09:30:00+00:00",
+            completed_at="2026-05-12T09:30:00+00:00",
         )
-        db._conn.commit()
+        db.conn.commit()
 
     t = query_timeline(str(db_path), user_id, "2026-05-12T11:00:00+00:00", minutes=180)
     events = [e for e in t["events"] if e["kind"] == "cycle"]
@@ -754,77 +547,46 @@ def test_query_timeline_sorts_mixed_offsets_by_instant(tmp_path):
     assert events[1]["id"] == earlier
 
 
-def test_query_timeline_memex_selection_handles_mixed_timestamp_formats(tmp_path):
-    db_path = tmp_path / "syke.db"
-    user_id = "test_user"
-    with SykeDB(db_path) as db:
-        cycle_id = db.insert_cycle_record(user_id, model="pi")
-        boundary = datetime(2026, 4, 10, 12, 0, 0, tzinfo=UTC)
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed' WHERE id = ?",
-            (boundary.isoformat(), boundary.isoformat(), cycle_id),
-        )
-
-        from uuid_extensions import uuid7
-
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 1)",
-            (str(uuid7()), user_id, "# MEMEX\n\nmixed format", "2026-04-10T12:00:00.000000Z"),
-        )
-        db._conn.commit()
-
-    t = query_timeline(
-        str(db_path), user_id, (boundary + timedelta(minutes=10)).isoformat(), minutes=60
-    )
-    cycle_events = [e for e in t["events"] if e["kind"] == "cycle"]
-    assert cycle_events
-    assert cycle_events[0]["memex_created_at"] == "2026-04-10T12:00:00.000000Z"
-
-
-def test_cycle_detail_trace_matches_timeline_for_same_second_cycles(tmp_path):
+def test_cycle_detail_uses_exact_native_session_name_for_same_second_cycles(tmp_path):
     db_path = tmp_path / "syke.db"
     user_id = "test_user"
     now_iso = datetime.now(UTC).replace(microsecond=0).isoformat()
 
-    with SykeDB(db_path) as db:
-        first_cycle = db.insert_cycle_record(user_id, model="pi")
-        second_cycle = db.insert_cycle_record(user_id, model="pi")
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed' WHERE id = ?",
-            (now_iso, now_iso, first_cycle),
-        )
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed' WHERE id = ?",
-            (now_iso, now_iso, second_cycle),
-        )
-
-        from uuid_extensions import uuid7
-
-        from syke.trace_store import persist_rollout_trace
+    with SykeDB(db_path):
+        first_cycle, second_cycle = str(uuid7()), str(uuid7())
 
         now_dt = datetime.fromisoformat(now_iso)
-        persist_rollout_trace(
-            db=db,
-            user_id=user_id,
-            run_id=str(uuid7()),
+        first_session_id, _ = _write_session(
+            db_path,
+            operation_id=first_cycle,
             kind="synthesis",
             started_at=now_dt,
             completed_at=now_dt,
             status="completed",
             output_text="a",
-            runtime={"model": "model-A"},
+            model="model-A",
         )
-        persist_rollout_trace(
-            db=db,
-            user_id=user_id,
-            run_id=str(uuid7()),
+        second_session_id, _ = _write_session(
+            db_path,
+            operation_id=second_cycle,
             kind="synthesis",
             started_at=now_dt,
             completed_at=now_dt,
             status="completed",
             output_text="b",
-            runtime={"model": "model-B"},
+            model="model-B",
+        )
+        _write_cycle_receipt(
+            first_cycle,
+            started_at=now_iso,
+            completed_at=now_iso,
+            session_id=first_session_id,
+        )
+        _write_cycle_receipt(
+            second_cycle,
+            started_at=now_iso,
+            completed_at=now_iso,
+            session_id=second_session_id,
         )
 
     end_iso = (datetime.fromisoformat(now_iso) + timedelta(minutes=1)).isoformat()
@@ -838,383 +600,71 @@ def test_cycle_detail_trace_matches_timeline_for_same_second_cycles(tmp_path):
         assert detail["trace"]["model"] == event["model"]
 
 
-def test_query_cycle_includes_memex_diff_base_and_memories(tmp_path):
-    db_path, user_id = _seed_db(tmp_path)
-    end_iso = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
-    t = query_timeline(str(db_path), user_id, end_iso, minutes=7 * 24 * 60)
-    cycle = next(e for e in t["events"] if e["kind"] == "cycle")
-    detail = query_cycle(str(db_path), user_id, cycle["id"])
-    assert detail is not None
-    assert detail["memex"]["content"].strip().startswith("# MEMEX")
-    assert detail["cycle"]["memex_updated"] == 1
-    assert detail["cycle"]["memex_moved"] is False
-    # The cycle flag was set, but the selected MEMEX row already existed at
-    # cycle start; this cycle's diff base should therefore be unchanged.
-    assert "new route" in detail["memex"]["content"]
-    assert detail["prev_memex"]["content"] == detail["memex"]["content"]
-
-
-def test_query_cycle_diff_base_uses_cycle_start_when_memex_moves(tmp_path):
-    from uuid_extensions import uuid7
-
+def test_cycle_detail_distinguishes_moved_and_held_memex(tmp_path):
     db_path = tmp_path / "syke.db"
     user_id = "test_user"
-    with SykeDB(db_path) as db:
+    with SykeDB(db_path):
         baseline = datetime(2026, 4, 10, 10, 0, tzinfo=UTC)
         cycle_start = datetime(2026, 4, 10, 10, 4, tzinfo=UTC)
-        moved_at = datetime(2026, 4, 10, 10, 5, tzinfo=UTC)
         cycle_end = datetime(2026, 4, 10, 10, 6, tzinfo=UTC)
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 1)",
-            (str(uuid7()), user_id, "# MEMEX\n\n- baseline\n", baseline.isoformat()),
+        _write_cycle_receipt(
+            str(uuid7()),
+            started_at=(baseline - timedelta(minutes=1)).isoformat(),
+            completed_at=baseline.isoformat(),
+            memex_content="# MEMEX\n\n- baseline\n",
         )
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 1)",
-            (str(uuid7()), user_id, "# MEMEX\n\n- baseline\n- new route\n", moved_at.isoformat()),
+        moved_cycle_id = str(uuid7())
+        _write_cycle_receipt(
+            moved_cycle_id,
+            started_at=cycle_start.isoformat(),
+            completed_at=cycle_end.isoformat(),
+            memex_content="# MEMEX\n\n- baseline\n- new route\n",
+            previous_memex_content="# MEMEX\n\n- baseline\n",
         )
-        cycle_id = db.insert_cycle_record(user_id, model="pi")
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed', memex_updated = 1 WHERE id = ?",
-            (cycle_start.isoformat(), cycle_end.isoformat(), cycle_id),
-        )
-        db._conn.commit()
-
-    detail = query_cycle(str(db_path), user_id, cycle_id)
-    assert detail is not None
-    assert detail["cycle"]["memex_moved"] is True
-    assert "new route" in detail["memex"]["content"]
-    assert "new route" not in detail["prev_memex"]["content"]
-
-
-def test_query_cycle_reports_row_change_without_content_movement(tmp_path):
-    from uuid_extensions import uuid7
-
-    db_path = tmp_path / "syke.db"
-    user_id = "test_user"
-    with SykeDB(db_path) as db:
-        first = datetime(2026, 4, 10, 10, 0, tzinfo=UTC)
-        second = datetime(2026, 4, 10, 10, 5, tzinfo=UTC)
-        content = "# MEMEX\n\nsame content\n"
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 0)",
-            (str(uuid7()), user_id, content, first.isoformat()),
-        )
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 0)",
-            (str(uuid7()), user_id, content, second.isoformat()),
-        )
-        cycle_id = db.insert_cycle_record(user_id, model="pi")
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, "
-            "status = 'completed', memex_updated = 1 WHERE id = ?",
-            (
-                (second - timedelta(minutes=1)).isoformat(),
-                (second + timedelta(minutes=1)).isoformat(),
-                cycle_id,
-            ),
-        )
-        db._conn.commit()
-
-    detail = query_cycle(str(db_path), user_id, cycle_id)
-    assert detail is not None
-    assert detail["cycle"]["memex_row_changed"] is True
-    assert detail["cycle"]["memex_content_moved"] is False
-    assert detail["cycle"]["memex_moved"] is False
-    assert detail["cycle"]["memex_written"] is False
-    assert detail["prev_memex"]["content"] == detail["memex"]["content"]
-
-
-def test_query_cycle_memory_snapshot_includes_rows_superseded_after_boundary(tmp_path):
-    db_path = tmp_path / "syke.db"
-    user_id = "test_user"
-    before = datetime(2026, 4, 10, 9, 0, tzinfo=UTC)
-    boundary = datetime(2026, 4, 10, 10, 0, tzinfo=UTC)
-    after = datetime(2026, 4, 10, 11, 0, tzinfo=UTC)
-
-    with SykeDB(db_path) as db:
-        db._conn.execute(
-            """INSERT INTO memories
-               (id, user_id, content, source_event_ids, created_at, superseded_by, active)
-               VALUES (?, ?, ?, '[]', ?, ?, 0)""",
-            ("mem_old", user_id, "old content", before.isoformat(), "mem_new"),
-        )
-        db._conn.execute(
-            """INSERT INTO memories
-               (id, user_id, content, source_event_ids, created_at, active)
-               VALUES (?, ?, ?, '[]', ?, 1)""",
-            ("mem_new", user_id, "new content", after.isoformat()),
-        )
-        cycle_id = db.insert_cycle_record(user_id, model="pi")
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed' WHERE id = ?",
-            ((boundary - timedelta(minutes=1)).isoformat(), boundary.isoformat(), cycle_id),
-        )
-        db._conn.commit()
-
-    detail = query_cycle(str(db_path), user_id, cycle_id)
-    assert detail is not None
-    memory_ids = [m["id"] for m in detail["memories"]]
-    assert "mem_old" in memory_ids
-    assert "mem_new" not in memory_ids
-
-
-def test_query_cycle_returns_full_output_text_without_truncation(tmp_path):
-    db_path, user_id = _seed_db(tmp_path)
-    end_iso = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
-    t = query_timeline(str(db_path), user_id, end_iso, minutes=7 * 24 * 60)
-    cycle = next(e for e in t["events"] if e["kind"] == "cycle")
-    long_output = "x" * 50000
-
-    with SykeDB(db_path) as db:
-        completed_at = db._conn.execute(
-            "SELECT completed_at FROM cycle_records WHERE id = ?",
-            (cycle["id"],),
-        ).fetchone()["completed_at"]
-        completed_dt = datetime.fromisoformat(completed_at)
-
-        from uuid_extensions import uuid7
-
-        from syke.trace_store import persist_rollout_trace
-
-        persist_rollout_trace(
-            db=db,
-            user_id=user_id,
-            run_id=str(uuid7()),
-            kind="synthesis",
-            started_at=completed_dt,
-            completed_at=completed_dt,
-            status="completed",
-            output_text=long_output,
-            runtime={"model": "gpt-5.4"},
+        held_cycle_id = str(uuid7())
+        _write_cycle_receipt(
+            held_cycle_id,
+            started_at=(cycle_end + timedelta(minutes=3)).isoformat(),
+            completed_at=(cycle_end + timedelta(minutes=5)).isoformat(),
         )
 
-    detail = query_cycle(str(db_path), user_id, cycle["id"])
-    assert detail is not None
-    assert detail["trace"] is not None
-    assert detail["trace"]["output_text"] == long_output
+    moved = query_cycle(str(db_path), user_id, moved_cycle_id)
+    held = query_cycle(str(db_path), user_id, held_cycle_id)
+    assert moved is not None
+    assert held is not None
+    assert moved["cycle"]["memex_moved"] is True
+    assert "new route" in moved["memex"]["content"]
+    assert "new route" not in moved["prev_memex"]["content"]
+    assert held["cycle"]["memex_content_moved"] is False
+    assert held["cycle"]["memex_moved"] is False
+    assert held["prev_memex"]["content"] == held["memex"]["content"]
+    assert "new route" in held["memex"]["content"]
 
 
 def test_query_cycle_includes_failed_trace_error(tmp_path):
     db_path, user_id = _seed_db(tmp_path)
-    end_iso = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
-    t = query_timeline(str(db_path), user_id, end_iso, minutes=7 * 24 * 60)
-    cycle = next(e for e in t["events"] if e["kind"] == "cycle")
+    cycle_id = str(uuid7())
+    completed_dt = datetime.now(UTC) + timedelta(seconds=1)
     error = "Pi runtime failed: No Pi model is configured"
+    session_id, _ = _write_session(
+        db_path,
+        operation_id=cycle_id,
+        kind="synthesis",
+        started_at=completed_dt,
+        completed_at=completed_dt,
+        status="failed",
+        error=error,
+        model="pi",
+    )
+    _write_cycle_receipt(
+        cycle_id,
+        started_at=completed_dt.isoformat(),
+        status="failed",
+        session_id=session_id,
+    )
 
-    with SykeDB(db_path) as db:
-        completed_at = db._conn.execute(
-            "SELECT completed_at FROM cycle_records WHERE id = ?",
-            (cycle["id"],),
-        ).fetchone()["completed_at"]
-        completed_dt = datetime.fromisoformat(completed_at)
-
-        from uuid_extensions import uuid7
-
-        from syke.trace_store import persist_rollout_trace
-
-        persist_rollout_trace(
-            db=db,
-            user_id=user_id,
-            run_id=str(uuid7()),
-            kind="synthesis",
-            started_at=completed_dt,
-            completed_at=completed_dt,
-            status="failed",
-            error=error,
-            runtime={"model": "pi"},
-        )
-
-    detail = query_cycle(str(db_path), user_id, cycle["id"])
+    detail = query_cycle(str(db_path), user_id, cycle_id)
     assert detail is not None
     assert detail["trace"] is not None
     assert detail["trace"]["status"] == "failed"
     assert detail["trace"]["error"] == error
-
-
-def test_query_ask_returns_full_output_text_without_truncation(tmp_path):
-    db_path, user_id = _seed_db(tmp_path)
-    long_output = "y" * 50000
-
-    with SykeDB(db_path) as db:
-        db._conn.execute(
-            "UPDATE rollout_traces SET output_text = ? WHERE user_id = ? AND kind = 'ask'",
-            (long_output, user_id),
-        )
-        db._conn.commit()
-
-    end_iso = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
-    t = query_timeline(str(db_path), user_id, end_iso, minutes=7 * 24 * 60)
-    ask = next(e for e in t["events"] if e["kind"] == "ask")
-    detail = query_ask(str(db_path), user_id, ask["id"])
-    assert detail is not None
-    assert detail["ask"]["input_text"] == "What is syke?"
-    assert detail["ask"]["output_text"] == long_output
-
-
-def test_query_cycle_decodes_legacy_bytes_memex(tmp_path):
-    """Some legacy memex rows were written as BLOBs into the TEXT column.
-    sqlite returns them as bytes; the API must coerce to str so they don't
-    leak into JSON as `b'...'` literals.
-    """
-    db_path, user_id = _seed_db(tmp_path)
-    # Replace the most recent memex row's content with a bytes-typed value
-    import sqlite3
-
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "UPDATE memories SET content = ? WHERE source_event_ids = ? "
-        "AND id = (SELECT id FROM memories WHERE source_event_ids = ? "
-        "ORDER BY created_at DESC LIMIT 1)",
-        (
-            b"# MEMEX\n\nbyte-typed content with unicode \xc2\xb7 dot\n",
-            '["__memex__"]',
-            '["__memex__"]',
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    end_iso = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
-    t = query_timeline(str(db_path), user_id, end_iso, minutes=7 * 24 * 60)
-    cycle = next(e for e in t["events"] if e["kind"] == "cycle")
-    detail = query_cycle(str(db_path), user_id, cycle["id"])
-    assert detail is not None
-    content = detail["memex"]["content"]
-    assert isinstance(content, str)
-    # Must not contain the Python bytes-repr escape from str(bytes)
-    assert "b'" not in content[:5]
-    # Must round-trip the unicode middle-dot (U+00B7) correctly
-    assert "·" in content
-
-
-def test_query_log_tail_handles_missing_file(tmp_path, monkeypatch):
-    fake = tmp_path / "nope.log"
-    monkeypatch.setattr(web_mod, "DAEMON_LOG_PATH", fake)
-    out = query_log_tail(50)
-    assert out["exists"] is False
-    assert out["lines"] == []
-
-
-def test_query_log_tail_returns_last_n_lines(tmp_path, monkeypatch):
-    log = tmp_path / "daemon.log"
-    log.write_text("\n".join(f"line {i}" for i in range(500)))
-    monkeypatch.setattr(web_mod, "DAEMON_LOG_PATH", log)
-    out = query_log_tail(20)
-    assert out["exists"] is True
-    assert len(out["lines"]) == 20
-    assert out["lines"][-1] == "line 499"
-
-
-# ─── End-to-end through HTTP ─────────────────────────────────────────────────
-
-
-def test_timeline_endpoint_round_trip(tmp_path, monkeypatch):
-    with _running_server(tmp_path, monkeypatch) as (_, _, port):
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/timeline?days=7", timeout=2) as r:
-            payload = json.loads(r.read())
-            assert payload["window"]["days"] == 7
-            assert payload["count"] >= 1
-            assert all("kind" in e for e in payload["events"])
-
-
-def test_timeline_endpoint_handles_unencoded_plus_in_end_query_param(tmp_path, monkeypatch):
-    db_path = tmp_path / "syke.db"
-    user_id = "test_user"
-    from uuid_extensions import uuid7
-
-    with SykeDB(db_path) as db:
-        cycle_id = db.insert_cycle_record(user_id, model="pi")
-        boundary = datetime(2026, 5, 12, 17, 15, tzinfo=UTC)
-        db._conn.execute(
-            "UPDATE cycle_records SET started_at = ?, completed_at = ?, status = 'completed' "
-            "WHERE id = ?",
-            (boundary.isoformat(), boundary.isoformat(), cycle_id),
-        )
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 1)",
-            (str(uuid7()), user_id, "# memex\n", boundary.isoformat()),
-        )
-        db._conn.execute("DELETE FROM rollout_traces")
-        db._conn.commit()
-
-    html_path = tmp_path / "index.html"
-    html_path.write_text("<!doctype html><html><body>ok</body></html>")
-    port = _free_port()
-    monkeypatch.setenv("SYKE_DB", str(db_path))
-    srv = SykeWebServer(user_id, port, html_path)
-    assert srv.start()
-    try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/timeline?end=2026-05-12T18:00:00+00:00&minutes=180",
-            timeout=2,
-        ) as r:
-            payload = json.loads(r.read())
-            assert payload["count"] == 1
-            assert payload["events"][0]["kind"] == "cycle"
-            assert payload["events"][0]["id"] == cycle_id
-    finally:
-        srv.stop()
-
-
-def test_cycle_endpoint_accepts_legacy_cycle_ids(tmp_path, monkeypatch):
-    db_path = tmp_path / "syke.db"
-    user_id = "test_user"
-    legacy_cycle_id = "cycle_legacy_1"
-
-    with SykeDB(db_path) as db:
-        cycle_id = db.insert_cycle_record(user_id, model="pi")
-        boundary = datetime(2026, 5, 12, 17, 15, tzinfo=UTC)
-        db._conn.execute(
-            "UPDATE cycle_records SET id = ?, started_at = ?, completed_at = ?, "
-            "status = 'completed' WHERE id = ?",
-            (legacy_cycle_id, boundary.isoformat(), boundary.isoformat(), cycle_id),
-        )
-        db._conn.execute(
-            "INSERT INTO memories (id, user_id, content, source_event_ids, created_at, active) "
-            "VALUES (?, ?, ?, '[\"__memex__\"]', ?, 1)",
-            ("memex-legacy-route", user_id, "# memex\n", boundary.isoformat()),
-        )
-        db._conn.commit()
-
-    html_path = tmp_path / "index.html"
-    html_path.write_text("<!doctype html><html><body>ok</body></html>")
-    port = _free_port()
-    monkeypatch.setenv("SYKE_DB", str(db_path))
-    srv = SykeWebServer(user_id, port, html_path)
-    assert srv.start()
-    try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/cycle/{legacy_cycle_id}",
-            timeout=2,
-        ) as r:
-            payload = json.loads(r.read())
-            assert payload["cycle"]["id"] == legacy_cycle_id
-            assert payload["kind"] == "cycle"
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/cycle/{legacy_cycle_id}?summary=1",
-            timeout=2,
-        ) as r:
-            payload = json.loads(r.read())
-            assert payload["cycle"]["id"] == legacy_cycle_id
-            assert payload["summary"] is True
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/cycle/{legacy_cycle_id}?summary=memory",
-            timeout=2,
-        ) as r:
-            payload = json.loads(r.read())
-            assert payload["cycle"]["id"] == legacy_cycle_id
-            assert payload["summary"] == "memory"
-    finally:
-        srv.stop()
-
-
-def test_unknown_route_returns_404(tmp_path, monkeypatch):
-    with _running_server(tmp_path, monkeypatch, html="<!doctype html>") as (_, _, port):
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/nope", timeout=2)
-        assert exc.value.code == 404

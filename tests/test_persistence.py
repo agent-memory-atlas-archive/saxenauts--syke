@@ -1,528 +1,445 @@
-"""Tests for the persistence layer."""
+"""Focused contracts for the v3 current-only SQLite store."""
 
 from __future__ import annotations
 
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
-from syke.db import SykeDB
-from syke.models import Memory
+import pytest
+
+from syke.db import (
+    SCHEMA_VERSION,
+    SykeDB,
+    UnsupportedSchemaError,
+    initialize_current_schema,
+)
 
 
-def _memory_row(db: SykeDB, user_id: str, memory_id: str) -> dict | None:
-    row = db.conn.execute(
-        "SELECT * FROM memories WHERE user_id = ? AND id = ?",
-        (user_id, memory_id),
-    ).fetchone()
+def _insert_memory(
+    db: SykeDB,
+    memory_id: str,
+    user_id: str,
+    content: str = "durable memory",
+    *,
+    created_at: datetime | None = None,
+) -> None:
+    with db.transaction():
+        db.conn.execute(
+            """INSERT INTO memories (id, user_id, content, created_at, updated_at)
+               VALUES (?, ?, ?, ?, NULL)""",
+            (
+                memory_id,
+                user_id,
+                content,
+                (created_at or datetime(2026, 1, 1, tzinfo=UTC)).isoformat(),
+            ),
+        )
+
+
+def _memory_row(db: SykeDB, memory_id: str) -> dict | None:
+    row = db.conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
     return dict(row) if row else None
 
 
 def _search_memory_ids(db: SykeDB, user_id: str, query: str) -> list[str]:
     rows = db.conn.execute(
-        """SELECT m.id
-           FROM memories_fts fts
-           JOIN memories m ON m.id = fts.memory_id
-           WHERE memories_fts MATCH ? AND m.user_id = ? AND m.active = 1
+        """SELECT memory.id
+           FROM memories_fts
+           JOIN memories AS memory ON memory.id = memories_fts.memory_id
+           WHERE memories_fts MATCH ? AND memory.user_id = ?
            ORDER BY bm25(memories_fts)""",
         (query, user_id),
     ).fetchall()
     return [str(row["id"]) for row in rows]
 
 
-def _linked_memory_ids(db: SykeDB, user_id: str, memory_id: str) -> list[str]:
-    rows = db.conn.execute(
-        """SELECT m.id
-           FROM links l
-           JOIN memories m ON (
-               (l.source_id = ? AND m.id = l.target_id) OR
-               (l.target_id = ? AND m.id = l.source_id)
-           )
-           WHERE l.user_id = ? AND m.active = 1
-           ORDER BY l.created_at DESC""",
-        (memory_id, memory_id, user_id),
-    ).fetchall()
-    return [str(row["id"]) for row in rows]
+def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
 
 
-def test_migration_idempotent(tmp_path: Path):
-    db = SykeDB(tmp_path / "idem.db")
-    db.initialize()
-    db.initialize()
-    assert db.count_memories("nobody") == 0
-    db.close()
-
-
-def test_insert_memory_persists_active_row(db, user_id):
-    db.insert_memory(Memory(id="m1", user_id=user_id, content="Utkarsh loves AI agents"))
-    result = _memory_row(db, user_id, "m1")
-    assert result is not None
-    assert result["content"] == "Utkarsh loves AI agents"
-    assert result["active"] == 1
-
-
-def test_direct_memory_content_update(db, user_id):
-    db.insert_memory(Memory(id="m2", user_id=user_id, content="Original"))
-    db.conn.execute(
-        "UPDATE memories SET content = ?, updated_at = ? WHERE user_id = ? AND id = ?",
-        ("Updated", "2026-01-01T00:00:00+00:00", user_id, "m2"),
-    )
-    db.conn.commit()
-    result = _memory_row(db, user_id, "m2")
-    assert result["content"] == "Updated"
-
-
-def test_memory_supersession_fields_mark_old_row_inactive(db, user_id):
-    db.insert_memory(Memory(id="m-old", user_id=user_id, content="Old"))
-    with db.transaction():
-        db.insert_memory(Memory(id="m-new", user_id=user_id, content="New"))
-        db.conn.execute(
-            "UPDATE memories SET superseded_by = ?, active = 0 WHERE user_id = ? AND id = ?",
-            ("m-new", user_id, "m-old"),
+def test_fresh_database_uses_exact_v3_current_only_schema(tmp_path: Path) -> None:
+    with SykeDB(tmp_path / "syke.db") as db:
+        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _table_columns(db.conn, "memories") == [
+            "id",
+            "user_id",
+            "content",
+            "created_at",
+            "updated_at",
+        ]
+        assert _table_columns(db.conn, "current_memex") == [
+            "singleton",
+            "id",
+            "user_id",
+            "content",
+            "created_at",
+            "updated_at",
+        ]
+        assert "active" not in _table_columns(db.conn, "memories")
+        assert "superseded_by" not in _table_columns(db.conn, "memories")
+        assert "source_event_ids" not in _table_columns(db.conn, "memories")
+        assert (
+            db.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_sources'"
+            ).fetchone()
+            is None
         )
-    assert _memory_row(db, user_id, "m-old")["active"] == 0
-    assert _memory_row(db, user_id, "m-old")["superseded_by"] == "m-new"
-    assert _memory_row(db, user_id, "m-new")["active"] == 1
 
 
-def test_active_flag_can_retire_memory_row(db, user_id):
-    db.insert_memory(Memory(id="m-deact", user_id=user_id, content="To deactivate"))
-    db.conn.execute(
-        "UPDATE memories SET active = 0 WHERE user_id = ? AND id = ?",
-        (user_id, "m-deact"),
-    )
-    db.conn.commit()
-    assert _memory_row(db, user_id, "m-deact")["active"] == 0
-
-
-def test_memory_isolation(db):
-    db.insert_memory(Memory(id="iso1", user_id="alice", content="Alice"))
-    db.insert_memory(Memory(id="iso2", user_id="bob", content="Bob"))
-    assert _memory_row(db, "alice", "iso2") is None
-    assert db.count_memories("alice") == 1
-
-
-def test_fts_search_reads_active_memory_rows(db, user_id):
-    db.insert_memory(Memory(id="s1", user_id=user_id, content="Syke is an agentic memory system"))
-    db.insert_memory(Memory(id="s2", user_id=user_id, content="Python programming"))
-    db.insert_memory(Memory(id="s3", user_id=user_id, content="Memory and identity are the same"))
-    ids = set(_search_memory_ids(db, user_id, "memory"))
-    assert "s1" in ids and "s3" in ids
-
-
-def test_fts_search_excludes_inactive_memory_rows(db, user_id):
-    db.insert_memory(Memory(id="act", user_id=user_id, content="Active memory about Syke"))
-    db.insert_memory(Memory(id="inact", user_id=user_id, content="Inactive memory about Syke"))
-    db.conn.execute(
-        "UPDATE memories SET active = 0 WHERE user_id = ? AND id = ?",
-        (user_id, "inact"),
-    )
-    db.conn.commit()
-    ids = set(_search_memory_ids(db, user_id, "Syke"))
-    assert "act" in ids and "inact" not in ids
-
-
-def test_links_bidirectional(db, user_id):
-    db.insert_memory(Memory(id="ba", user_id=user_id, content="A"))
-    db.insert_memory(Memory(id="bb", user_id=user_id, content="B"))
-    db.conn.execute(
-        """INSERT INTO links (id, user_id, source_id, target_id, reason, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        ("bilink", user_id, "ba", "bb", "Connected", "2026-01-01T00:00:00+00:00"),
-    )
-    db.conn.commit()
-    assert _linked_memory_ids(db, user_id, "ba") == ["bb"]
-    assert _linked_memory_ids(db, user_id, "bb") == ["ba"]
-
-
-def test_update_memex(db, user_id):
-    from syke.memory.memex import update_memex
-
-    id1 = update_memex(db, user_id, "Version 1")
-    assert db.get_memex(user_id)["content"] == "Version 1"
-    id2 = update_memex(db, user_id, "Version 2")
-    assert id2 != id1
-    assert db.get_memex(user_id)["content"] == "Version 2"
-    assert _memory_row(db, user_id, id1)["active"] == 0
-
-
-def test_update_memex_collapses_duplicate_active_memex_rows(db, user_id):
-    from syke.memory.memex import update_memex
-
-    db.insert_memory(
-        Memory(
-            id="memex-older",
-            user_id=user_id,
-            content="older",
-            source_event_ids=["__memex__"],
-        )
-    )
-    db.insert_memory(
-        Memory(
-            id="memex-newer",
-            user_id=user_id,
-            content="newer",
-            source_event_ids=["__memex__"],
-        )
-    )
-
-    new_id = update_memex(db, user_id, "canonical")
-
-    rows = db.conn.execute(
-        """SELECT id, active, superseded_by
-           FROM memories
-           WHERE user_id = ? AND source_event_ids = ?
-           ORDER BY id""",
-        (user_id, '["__memex__"]'),
-    ).fetchall()
-    active_ids = [row["id"] for row in rows if row["active"]]
-    assert active_ids == [new_id]
-    assert _memory_row(db, user_id, "memex-older")["superseded_by"] == new_id
-    assert _memory_row(db, user_id, "memex-newer")["superseded_by"] == new_id
-
-
-def test_update_memex_collapses_duplicate_active_without_receipt(db, user_id):
-    from datetime import UTC, datetime
-
-    from syke.memory.memex import update_memex
-
-    db.insert_memory(
-        Memory(
-            id="memex-older",
-            user_id=user_id,
-            content="canonical",
-            source_event_ids=["__memex__"],
-            created_at=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
-        )
-    )
-    db.insert_memory(
-        Memory(
-            id="memex-newer",
-            user_id=user_id,
-            content="canonical",
-            source_event_ids=["__memex__"],
-            created_at=datetime(2026, 5, 9, 13, 0, tzinfo=UTC),
-        )
-    )
-
-    kept_id = update_memex(db, user_id, "canonical")
-
-    assert kept_id == "memex-newer"
-    assert _memory_row(db, user_id, "memex-older")["active"] == 0
-
-
-def test_update_memex_strips_projection_header(db, user_id):
-    from syke.memory.memex import update_memex
-
-    memex_id = update_memex(
-        db,
-        user_id,
-        "# MEMEX [10 / 2,000 tokens · 1%]\n\ncanonical body",
-    )
-
-    assert _memory_row(db, user_id, memex_id)["content"] == "canonical body"
-
-
-def test_get_memex_orders_mixed_timestamp_formats_by_instant(db, user_id):
-    db.conn.execute(
-        """INSERT INTO memories
-           (id, user_id, content, source_event_ids, created_at, active)
-           VALUES (?, ?, ?, ?, ?, 1)""",
-        (
-            "memex-utc-earlier",
-            user_id,
-            "earlier utc row",
-            '["__memex__"]',
-            "2026-05-12T03:58:51+00:00",
-        ),
-    )
-    db.conn.execute(
-        """INSERT INTO memories
-           (id, user_id, content, source_event_ids, created_at, active)
-           VALUES (?, ?, ?, ?, ?, 1)""",
-        (
-            "memex-local-later",
-            user_id,
-            "later offset row",
-            '["__memex__"]',
-            "2026-05-11T21:13:00-07:00",
-        ),
-    )
-    db.conn.commit()
-
-    assert db.get_memex(user_id)["id"] == "memex-local-later"
-
-
-def test_get_memex_for_injection_no_data_fallback(db, user_id):
-    from syke.memory.memex import get_memex_for_injection
-
-    result = get_memex_for_injection(db, user_id)
-    assert "First run" in result
-    assert "~15 minutes" not in result
-    assert "syke status --json" in result
-
-
-def test_insert_memory_standalone_commits(db, user_id):
-    mem = Memory(id="m-standalone", user_id=user_id, content="standalone commit test")
-    mid = db.insert_memory(mem)
-    db2 = SykeDB(db.db_path)
-    row = _memory_row(db2, user_id, mid)
-    db2.close()
-    assert row is not None
-    assert row["content"] == "standalone commit test"
-
-
-def test_insert_memory_in_transaction_defers(db, user_id):
-    import sqlite3 as _sqlite3
-
-    with db.transaction():
-        mem = Memory(id="m-txn-defer", user_id=user_id, content="in-txn memory")
-        mid = db.insert_memory(mem)
-        conn2 = _sqlite3.connect(db.db_path, timeout=1)
-        conn2.row_factory = _sqlite3.Row
-        row = conn2.execute(
-            "SELECT * FROM memories WHERE user_id = ? AND id = ?",
-            (user_id, mid),
-        ).fetchone()
-        conn2.close()
-        assert row is None
-    db3 = SykeDB(db.db_path)
-    row = _memory_row(db3, user_id, mid)
-    db3.close()
-    assert row is not None
-
-
-def test_insert_cycle_record(db, user_id):
-    cid = db.insert_cycle_record(user_id, cursor_start="evt-1", skill_hash="abc123")
-    records = db.get_cycle_records(user_id)
-    assert len(records) == 1
-    assert records[0]["id"] == cid
-    assert records[0]["status"] == "running"
-    assert records[0]["cursor_start"] == "evt-1"
-    assert records[0]["skill_hash"] == "abc123"
-
-
-def test_insert_cycle_record_respects_started_at_override(db, user_id):
-    cid = db.insert_cycle_record(
-        user_id,
-        cursor_start="evt-1",
-        started_at_override="2026-03-07T23:59:00-08:00",
-    )
-    records = db.get_cycle_records(user_id)
-    assert records[0]["id"] == cid
-    assert records[0]["started_at"] == "2026-03-07T23:59:00-08:00"
-
-
-def test_complete_cycle_record(db, user_id):
-    cid = db.insert_cycle_record(user_id)
-    db.complete_cycle_record(
-        cid,
-        status="completed",
-        cursor_end="evt-99",
-        memories_created=3,
-        memex_updated=1,
-    )
-    records = db.get_cycle_records(user_id)
-    assert records[0]["status"] == "completed"
-    assert records[0]["cursor_end"] == "evt-99"
-    assert records[0]["memories_created"] == 3
-    assert records[0]["memex_updated"] == 1
-    assert records[0]["completed_at"] is not None
-
-
-def test_complete_cycle_record_preserves_existing_counters_when_omitted(db, user_id):
-    cid = db.insert_cycle_record(user_id)
-    db._conn.execute(
-        """UPDATE cycle_records
-           SET memories_created = 1, memories_updated = 2, links_created = 3, memex_updated = 1
-           WHERE id = ?""",
-        (cid,),
-    )
-    db._conn.commit()
-
-    db.complete_cycle_record(cid, status="completed")
-
-    records = db.get_cycle_records(user_id)
-    assert records[0]["memories_created"] == 1
-    assert records[0]["memories_updated"] == 2
-    assert records[0]["links_created"] == 3
-    assert records[0]["memex_updated"] == 1
-
-
-def test_mark_stale_running_cycles_marks_only_old_running_rows(db, user_id):
-    old_running = db.insert_cycle_record(
-        user_id,
-        started_at_override="2026-05-29T00:00:00+00:00",
-    )
-    recent_running = db.insert_cycle_record(
-        user_id,
-        started_at_override="2026-05-29T09:30:00+00:00",
-    )
-    completed = db.insert_cycle_record(
-        user_id,
-        started_at_override="2026-05-29T01:00:00+00:00",
-    )
-    db.complete_cycle_record(completed, status="completed")
-
-    count = db.mark_stale_running_cycles(
-        user_id,
-        started_before="2026-05-29T06:00:00+00:00",
-        completed_at_override="2026-05-29T10:00:00+00:00",
-    )
-
-    assert count == 1
-    rows = {
-        row["id"]: row
-        for row in db.conn.execute(
-            "SELECT id, status, completed_at, duration_ms FROM cycle_records"
+def test_initialization_is_idempotent(tmp_path: Path) -> None:
+    with SykeDB(tmp_path / "idem.db") as db:
+        before = db.conn.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
         ).fetchall()
-    }
-    assert rows[old_running]["status"] == "incomplete"
-    assert rows[old_running]["completed_at"] == "2026-05-29T10:00:00+00:00"
-    assert rows[old_running]["duration_ms"] > 0
-    assert rows[recent_running]["status"] == "running"
-    assert rows[completed]["status"] == "completed"
+        db.initialize()
+        db.initialize()
+        after = db.conn.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        assert [tuple(row) for row in after] == [tuple(row) for row in before]
 
 
-def test_initialize_removes_legacy_tables_and_normalizes_cycle_residue(db, user_id):
-    old_running = db.insert_cycle_record(
-        user_id,
-        started_at_override="2000-01-01T00:00:00+00:00",
-    )
-    recent_running = db.insert_cycle_record(
-        user_id,
-        started_at_override=datetime_now_utc_for_test(),
-    )
-    odd_status = db.insert_cycle_record(
-        user_id,
-        started_at_override="2000-01-01T01:00:00+00:00",
-    )
-    db.conn.execute("UPDATE cycle_records SET status = 'superseded' WHERE id = ?", (odd_status,))
-    db.conn.execute(
-        "CREATE TABLE memory_ops (id TEXT, user_id TEXT, operation TEXT, created_at TEXT)"
-    )
-    db.conn.execute("CREATE TABLE cycle_annotations (id TEXT, user_id TEXT, created_at TEXT)")
-    db.conn.commit()
+def test_exported_initializer_builds_an_already_open_empty_connection(tmp_path: Path) -> None:
+    path = tmp_path / "builder.db"
+    with sqlite3.connect(path) as conn:
+        initialize_current_schema(conn)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
 
-    db.initialize()
-
-    tables = {
-        row["name"]
-        for row in db.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    }
-    assert "memory_ops" not in tables
-    assert "cycle_annotations" not in tables
-    rows = {
-        row["id"]: row
-        for row in db.conn.execute("SELECT id, status, completed_at FROM cycle_records").fetchall()
-    }
-    assert rows[old_running]["status"] == "incomplete"
-    assert rows[old_running]["completed_at"] is not None
-    assert rows[recent_running]["status"] == "running"
-    assert rows[odd_status]["status"] == "incomplete"
-    assert rows[odd_status]["completed_at"] is not None
+        with pytest.raises(UnsupportedSchemaError, match="requires an empty"):
+            initialize_current_schema(conn)
 
 
-def datetime_now_utc_for_test() -> str:
-    from datetime import UTC, datetime
+@pytest.mark.parametrize("version", [0, 1, 99])
+def test_legacy_or_unknown_schema_fails_before_wal_and_preserves_data(
+    tmp_path: Path, version: int
+) -> None:
+    path = tmp_path / f"legacy-{version}.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE legacy_rows (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO legacy_rows VALUES ('preserve me')")
+        conn.execute(f"PRAGMA user_version = {version}")
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
 
-    return datetime.now(UTC).isoformat()
+    with pytest.raises(UnsupportedSchemaError, match="Unsupported Syke database schema"):
+        SykeDB(path)
 
-
-def test_pi_skill_file_present() -> None:
-    from syke.runtime.psyche_md import SYNTHESIS_PATH
-
-    assert SYNTHESIS_PATH.exists()
-    assert SYNTHESIS_PATH.read_text(encoding="utf-8").strip()
-
-
-def test_fts5_trigger_on_insert(db, user_id):
-    mem = Memory(id="fts-ins-1", user_id=user_id, content="quantum computing research")
-    db.insert_memory(mem)
-    ids = _search_memory_ids(db, user_id, "quantum computing")
-    assert "fts-ins-1" in ids
-
-
-def test_fts5_trigger_on_direct_content_update(db, user_id):
-    mem = Memory(id="fts-upd-1", user_id=user_id, content="old content about dogs")
-    db.insert_memory(mem)
-    assert _search_memory_ids(db, user_id, "dogs")
-    db.conn.execute(
-        "UPDATE memories SET content = ?, updated_at = ? WHERE user_id = ? AND id = ?",
-        ("new content about cats", "2026-01-01T00:00:00+00:00", user_id, "fts-upd-1"),
-    )
-    db.conn.commit()
-    assert not _search_memory_ids(db, user_id, "dogs")
-    ids = _search_memory_ids(db, user_id, "cats")
-    assert "fts-upd-1" in ids
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert conn.execute("SELECT value FROM legacy_rows").fetchone()[0] == "preserve me"
 
 
-def test_fts5_trigger_on_active_flag_retirement(db, user_id):
-    mem = Memory(id="fts-deact-1", user_id=user_id, content="ephemeral knowledge")
-    db.insert_memory(mem)
-    assert _search_memory_ids(db, user_id, "ephemeral")
-    db.conn.execute(
-        "UPDATE memories SET active = 0 WHERE user_id = ? AND id = ?",
-        (user_id, "fts-deact-1"),
-    )
-    db.conn.commit()
-    assert not _search_memory_ids(db, user_id, "ephemeral")
+def test_extra_table_in_v3_fails_closed_without_cleanup(tmp_path: Path) -> None:
+    path = tmp_path / "extra.db"
+    with sqlite3.connect(path) as conn:
+        initialize_current_schema(conn)
+        conn.execute("CREATE TABLE hidden_history (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO hidden_history VALUES ('must remain')")
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+    with pytest.raises(UnsupportedSchemaError, match="unexpected tables"):
+        SykeDB(path)
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert conn.execute("SELECT value FROM hidden_history").fetchone()[0] == "must remain"
 
 
-def test_fts5_trigger_on_supersession_update(db, user_id):
-    old = Memory(id="fts-sup-old", user_id=user_id, content="original fact about mars")
-    db.insert_memory(old)
-    with db.transaction():
-        db.insert_memory(
-            Memory(id="fts-sup-new", user_id=user_id, content="updated fact about jupiter")
+@pytest.mark.parametrize(
+    "tamper_sql",
+    [
+        """DROP TRIGGER validate_link_endpoints_insert;
+           CREATE TRIGGER validate_link_endpoints_insert
+           AFTER INSERT ON links BEGIN SELECT 1; END;""",
+        """DROP INDEX idx_links_source;
+           CREATE INDEX idx_links_source ON links(user_id);""",
+    ],
+)
+def test_same_name_schema_safety_object_tampering_fails_signature(
+    tmp_path: Path, tamper_sql: str
+) -> None:
+    path = tmp_path / "tampered.db"
+    with sqlite3.connect(path) as conn:
+        initialize_current_schema(conn)
+        conn.executescript(tamper_sql)
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+    with pytest.raises(UnsupportedSchemaError, match="definition signature"):
+        SykeDB(path)
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_fk_off_link_guards_reject_missing_and_cross_identity_endpoints(tmp_path: Path) -> None:
+    path = tmp_path / "links.db"
+    with SykeDB(path) as db:
+        _insert_memory(db, "u1-a", "u1")
+        _insert_memory(db, "u1-b", "u1")
+        _insert_memory(db, "u2-a", "u2")
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        with pytest.raises(sqlite3.IntegrityError, match="same Syke identity"):
+            conn.execute(
+                """INSERT INTO links
+                   (id, user_id, source_id, target_id, reason, created_at)
+                   VALUES ('missing', 'u1', 'u1-a', 'absent', 'bad', '2026-01-01')"""
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="same Syke identity"):
+            conn.execute(
+                """INSERT INTO links
+                   (id, user_id, source_id, target_id, reason, created_at)
+                   VALUES ('cross', 'u1', 'u1-a', 'u2-a', 'bad', '2026-01-01')"""
+            )
+
+        conn.execute(
+            """INSERT INTO links
+               (id, user_id, source_id, target_id, reason, created_at)
+               VALUES ('valid', 'u1', 'u1-a', 'u1-b', 'real', '2026-01-01')"""
         )
+        with pytest.raises(sqlite3.IntegrityError, match="same Syke identity"):
+            conn.execute("UPDATE links SET target_id = 'absent' WHERE id = 'valid'")
+
+
+def test_linked_memory_delete_requires_explicit_edge_removal_with_fk_off(tmp_path: Path) -> None:
+    path = tmp_path / "linked-delete.db"
+    with SykeDB(path) as db:
+        _insert_memory(db, "a", "u1")
+        _insert_memory(db, "b", "u1")
         db.conn.execute(
-            "UPDATE memories SET superseded_by = ?, active = 0 WHERE user_id = ? AND id = ?",
-            ("fts-sup-new", user_id, "fts-sup-old"),
+            """INSERT INTO links
+               (id, user_id, source_id, target_id, reason, created_at)
+               VALUES ('edge', 'u1', 'a', 'b', 'related', '2026-01-01')"""
         )
-    assert not _search_memory_ids(db, user_id, "mars")
-    ids = _search_memory_ids(db, user_id, "jupiter")
-    assert "fts-sup-new" in ids
+        db.conn.commit()
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        with pytest.raises(sqlite3.IntegrityError, match="delete linked edges first"):
+            conn.execute("DELETE FROM memories WHERE id = 'a'")
+        conn.rollback()
+        assert conn.execute("SELECT COUNT(*) FROM memories WHERE id = 'a'").fetchone()[0] == 1
 
 
-def test_link_insert_in_transaction_defers(db, user_id):
-    """Direct link-row inserts must defer commit inside db.transaction()."""
-    import sqlite3 as _sqlite3
+def test_link_schema_uses_restrict_and_rejects_blank_ids(db: SykeDB, user_id: str) -> None:
+    _insert_memory(db, "a", user_id)
+    _insert_memory(db, "b", user_id)
+    foreign_keys = db.conn.execute("PRAGMA foreign_key_list(links)").fetchall()
+    assert {str(row["on_delete"]) for row in foreign_keys} == {"RESTRICT"}
 
-    db.insert_memory(Memory(id="link-a", user_id=user_id, content="A"))
-    db.insert_memory(Memory(id="link-b", user_id=user_id, content="B"))
-
-    with db.transaction():
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
         db.conn.execute(
-            """INSERT INTO links (id, user_id, source_id, target_id, reason, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            ("txn-link", user_id, "link-a", "link-b", "test", "2026-01-01T00:00:00+00:00"),
+            """INSERT INTO links
+               (id, user_id, source_id, target_id, reason, created_at)
+               VALUES (' ', ?, 'a', 'b', 'bad', '2026-01-01')""",
+            (user_id,),
         )
-        conn2 = _sqlite3.connect(db.db_path, timeout=1)
-        row = conn2.execute("SELECT * FROM links WHERE id = ?", ("txn-link",)).fetchone()
-        conn2.close()
-        assert row is None
-
-    conn3 = _sqlite3.connect(db.db_path, timeout=1)
-    row = conn3.execute("SELECT * FROM links WHERE id = ?", ("txn-link",)).fetchone()
-    conn3.close()
-    assert row is not None
+    db.conn.rollback()
 
 
-def test_transaction_reentrant(db, user_id):
-    """Nested transaction() calls pass through — outermost controls commit."""
-    import sqlite3 as _sqlite3
-
+def test_bound_identity_guards_all_user_scoped_tables(tmp_path: Path) -> None:
     from syke.memory.memex import update_memex
 
-    with db.transaction():
-        db.insert_memory(Memory(id="outer", user_id=user_id, content="outer"))
-        memex_id = update_memex(db, user_id, "inner memex")
+    with SykeDB(tmp_path / "identity.db", user_id="canonical") as db:
+        _insert_memory(db, "a", "canonical")
+        _insert_memory(db, "b", "canonical")
+        db.conn.execute(
+            """INSERT INTO links
+               (id, user_id, source_id, target_id, reason, created_at)
+               VALUES ('edge', 'canonical', 'a', 'b', 'related', '2026-01-01')"""
+        )
+        db.conn.commit()
+        update_memex(db, "canonical", "map")
 
-        conn2 = _sqlite3.connect(db.db_path, timeout=1)
-        row = conn2.execute("SELECT * FROM memories WHERE id = ?", ("outer",)).fetchone()
-        memex_row = conn2.execute("SELECT * FROM memories WHERE id = ?", (memex_id,)).fetchone()
-        conn2.close()
-        assert row is None
-        assert memex_row is None
+        with pytest.raises(sqlite3.IntegrityError, match="memories.user_id"):
+            db.conn.execute("UPDATE memories SET user_id = 'other' WHERE id = 'a'")
+        with pytest.raises(sqlite3.IntegrityError, match="links.user_id"):
+            db.conn.execute("UPDATE links SET user_id = 'other' WHERE id = 'edge'")
+        with pytest.raises(sqlite3.IntegrityError, match="current_memex.user_id"):
+            db.conn.execute("UPDATE current_memex SET user_id = 'other'")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.conn.execute("UPDATE syke_identity SET user_id = 'other'")
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be deleted"):
+            db.conn.execute("DELETE FROM syke_identity")
+        db.conn.rollback()
 
-    assert _memory_row(db, user_id, "outer") is not None
-    assert _memory_row(db, user_id, memex_id) is not None
+
+def test_bind_identity_consolidates_an_unbound_fresh_store(tmp_path: Path) -> None:
+    from syke.memory.memex import update_memex
+
+    created = datetime(2026, 2, 3, tzinfo=UTC)
+    with SykeDB(tmp_path / "identity.db") as db:
+        _insert_memory(db, "a", "alias", created_at=created)
+        _insert_memory(db, "b", "alias")
+        db.conn.execute(
+            """INSERT INTO links
+               (id, user_id, source_id, target_id, reason, created_at)
+               VALUES ('edge', 'alias', 'a', 'b', 'related', '2026-02-03')"""
+        )
+        db.conn.commit()
+        memex_id = update_memex(db, "alias", "map")
+
+        db.bind_identity("canonical")
+
+        assert _memory_row(db, "a")["created_at"] == created.isoformat()
+        assert db.get_memex("canonical")["id"] == memex_id
+        for table in ("memories", "links", "current_memex"):
+            assert db.conn.execute(f"SELECT DISTINCT user_id FROM {table}").fetchone()[0] == (
+                "canonical"
+            )
+        with pytest.raises(ValueError, match="bound to 'canonical'"):
+            db.bind_identity("other")
+
+
+def test_ids_and_created_at_are_immutable(db: SykeDB, user_id: str) -> None:
+    from syke.memory.memex import update_memex
+
+    _insert_memory(db, "a", user_id)
+    _insert_memory(db, "b", user_id)
+    db.conn.execute(
+        """INSERT INTO links
+           (id, user_id, source_id, target_id, reason, created_at)
+           VALUES ('edge', ?, 'a', 'b', 'related', '2026-01-01')""",
+        (user_id,),
+    )
+    db.conn.commit()
+    update_memex(db, user_id, "map")
+
+    statements = (
+        "UPDATE memories SET id = 'changed' WHERE id = 'a'",
+        "UPDATE memories SET created_at = 'changed' WHERE id = 'a'",
+        "UPDATE links SET id = 'changed' WHERE id = 'edge'",
+        "UPDATE links SET created_at = 'changed' WHERE id = 'edge'",
+        "UPDATE current_memex SET id = 'changed'",
+        "UPDATE current_memex SET created_at = 'changed'",
+    )
+    for statement in statements:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.conn.execute(statement)
+        db.conn.rollback()
+
+
+def test_update_memex_uses_singleton_and_preserves_identity(db: SykeDB, user_id: str) -> None:
+    from syke.memory.memex import update_memex
+
+    memex_id = update_memex(db, user_id, "Version 1")
+    first = db.get_memex(user_id)
+    assert first["content"] == "Version 1"
+    assert first["updated_at"] is None
+    assert db.count_memories(user_id) == 0
+
+    assert update_memex(db, user_id, "Version 1") == memex_id
+    assert db.get_memex(user_id) == first
+    assert update_memex(db, user_id, "Version 2") == memex_id
+
+    updated = db.get_memex(user_id)
+    assert updated["id"] == memex_id
+    assert updated["created_at"] == first["created_at"]
+    assert updated["content"] == "Version 2"
+    assert updated["updated_at"] is not None
+    assert db.conn.execute("SELECT COUNT(*) FROM current_memex").fetchone()[0] == 1
+    assert db.conn.execute("SELECT COUNT(*) FROM memories_fts").fetchone()[0] == 0
+
+
+def test_update_memex_strips_projection_header(db: SykeDB, user_id: str) -> None:
+    from syke.memory.memex import update_memex
+
+    update_memex(db, user_id, "# MEMEX [10 / 2,000 tokens · 1%]\n\ncanonical body")
+    assert db.get_memex(user_id)["content"] == "canonical body"
+
+
+def test_get_memex_for_injection_fallback_and_current_content(db: SykeDB, user_id: str) -> None:
+    from syke.memory.memex import get_memex_for_injection, update_memex
+
+    fallback = get_memex_for_injection(db, user_id)
+    assert "First run" in fallback
+    assert "syke status --json" in fallback
+    assert get_memex_for_injection(db, user_id, context="synthesis") == ""
+
+    update_memex(db, user_id, "current map")
+    assert get_memex_for_injection(db, user_id) == "current map"
+
+
+def test_count_memories_counts_only_ordinary_current_rows(db: SykeDB, user_id: str) -> None:
+    from syke.memory.memex import update_memex
+
+    _insert_memory(db, "a", user_id)
+    _insert_memory(db, "b", user_id)
+    update_memex(db, user_id, "map")
+
+    assert db.count_memories(user_id) == 2
+    with pytest.raises(TypeError):
+        db.count_memories(user_id, True)  # type: ignore[call-arg]
+
+
+def test_fts_tracks_every_memory_insert_revision_and_delete(db: SykeDB, user_id: str) -> None:
+    _insert_memory(db, "fts", user_id, "old content about dogs")
+    assert _search_memory_ids(db, user_id, "dogs") == ["fts"]
+
+    db.conn.execute(
+        "UPDATE memories SET content = 'new content about cats', updated_at = '2026-02-01' "
+        "WHERE id = 'fts'"
+    )
+    db.conn.commit()
+    assert _search_memory_ids(db, user_id, "dogs") == []
+    assert _search_memory_ids(db, user_id, "cats") == ["fts"]
+
+    db.conn.execute("DELETE FROM memories WHERE id = 'fts'")
+    db.conn.commit()
+    assert _search_memory_ids(db, user_id, "cats") == []
+
+
+def test_graph_stats_describe_only_current_ordinary_graph(db: SykeDB, user_id: str) -> None:
+    from syke.memory.memex import update_memex
+
+    _insert_memory(db, "a", user_id, "alpha")
+    _insert_memory(db, "b", user_id, "beta")
+    _insert_memory(db, "c", user_id, "gamma")
+    db.conn.execute(
+        """INSERT INTO links
+           (id, user_id, source_id, target_id, reason, created_at)
+           VALUES ('edge', ?, 'a', 'b', 'related', '2026-01-01')""",
+        (user_id,),
+    )
+    db.conn.commit()
+    update_memex(db, user_id, "map")
+
+    stats = db.get_graph_stats(user_id)
+    assert stats["memories"] == 3
+    assert stats["links"] == 1
+    assert stats["unlinked"] == 1
+    assert stats["links_outside_graph"] == 0
+
+
+def test_outer_transaction_defers_memories_links_and_memex(tmp_path: Path) -> None:
+    from syke.memory.memex import update_memex
+
+    path = tmp_path / "transaction.db"
+    with SykeDB(path) as db:
+        _insert_memory(db, "a", "u1")
+        with SykeDB(path) as observer:
+            assert _memory_row(observer, "a") is not None
+
+        with db.transaction():
+            _insert_memory(db, "b", "u1")
+            db.conn.execute(
+                """INSERT INTO links
+                   (id, user_id, source_id, target_id, reason, created_at)
+                   VALUES ('edge', 'u1', 'a', 'b', 'related', '2026-01-01')"""
+            )
+            update_memex(db, "u1", "map")
+
+            with sqlite3.connect(path) as observer:
+                assert (
+                    observer.execute("SELECT COUNT(*) FROM memories WHERE id = 'b'").fetchone()[0]
+                    == 0
+                )
+                assert observer.execute("SELECT COUNT(*) FROM links").fetchone()[0] == 0
+                assert observer.execute("SELECT COUNT(*) FROM current_memex").fetchone()[0] == 0
+
+        with SykeDB(path) as observer:
+            assert _memory_row(observer, "b") is not None
+            assert observer.conn.execute("SELECT COUNT(*) FROM links").fetchone()[0] == 1
+            assert observer.get_memex("u1")["content"] == "map"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syke"
-version = "0.5.10"
+version = "0.6.0"
 description = "Local-first agentic memory for AI tools, powered by the Pi runtime."
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -22,12 +22,12 @@ classifiers = [
 dependencies = [
     "click>=8.1",
     "httpx>=0.27",
-    "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "rich>=13.0",
     "python-dotenv>=1.0",
     "uuid7>=0.1.0",
     "simple-term-menu>=1.6",
+    "tiktoken>=0.9",
 ]
 
 [project.optional-dependencies]
@@ -56,12 +56,19 @@ syke = [
     "llm/backends/skills/*.md",
     "observe/seeds/*.md",
     "runtime/web/*.html",
+    "runtime/skills/*/*.md",
+    "runtime/*.mjs",
+    "runtime/*.md",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "--ignore-glob=*.calls.py --ignore-glob=*.deps.py --ignore-glob=*.impact.py"
+addopts = "--strict-markers --ignore-glob=*.calls.py --ignore-glob=*.deps.py --ignore-glob=*.impact.py -m 'not live and not platform'"
+markers = [
+    "live: requires an explicitly configured external provider/runtime",
+    "platform: requires the host platform and prepared native dependencies",
+]
 
 [tool.coverage.run]
 source = ["syke"]
@@ -74,7 +81,7 @@ python-interpreter-path = ".venv/bin/python"
 [tool.tbump]
 
 [tool.tbump.version]
-current = "0.5.10"
+current = "0.6.0"
 regex = '''(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)'''
 
 [tool.tbump.git]
@@ -104,4 +111,4 @@ select = ["E", "F", "I", "UP", "B"]
 "syke/models.py" = ["E501"]
 "syke/sync.py" = ["E501"]
 "syke/daemon/daemon.py" = ["E501"]
-"syke/runtime/psyche_md.py" = ["E501"]
+"syke/runtime/prompt_context.py" = ["E501"]

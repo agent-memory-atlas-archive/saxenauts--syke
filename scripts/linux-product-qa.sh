@@ -244,21 +244,9 @@ with open("/qa-output/sync.json", encoding="utf-8") as fh:
 
 assert payload["ok"] is True, payload
 assert payload["status"] == "completed", payload
-assert payload["trace_id"], payload
+assert payload["session_id"], payload
 PY
 
-  echo "[linux-qa] provider-backed ask"
-  "$SYKE_BIN" --user "$SYKE_QA_USER" ask --json "what am I working on" \
-    >/qa-output/ask.json </dev/null
-  python3 - <<'PY'
-import json
-
-with open("/qa-output/ask.json", encoding="utf-8") as fh:
-    payload = json.load(fh)
-
-assert payload["ok"] is True, payload
-assert payload.get("answer"), payload
-PY
 else
   if [[ "$SYKE_QA_ALLOW_NO_PROVIDER" != true ]]; then
     echo "provider state missing and partial mode not allowed" >&2
@@ -297,6 +285,21 @@ else:
     raise SystemExit(f"web API did not become ready: {last}")
 PY
 
+if [[ -n "${SYKE_QA_PROVIDER_STATE:-}" ]]; then
+  echo "[linux-qa] provider-backed ask through daemon IPC"
+  "$SYKE_BIN" --user "$SYKE_QA_USER" ask --json "what am I working on" \
+    >/qa-output/ask.json </dev/null
+  python3 - <<'PY'
+import json
+
+with open("/qa-output/ask.json", encoding="utf-8") as fh:
+    payload = json.load(fh)
+
+assert payload["ok"] is True, payload
+assert payload.get("answer"), payload
+PY
+fi
+
 echo "[linux-qa] browser visualizer"
 "$TMP_ROOT/venv/bin/python" - <<'PY'
 from pathlib import Path
@@ -314,16 +317,16 @@ with sync_playwright() as p:
     body = page.locator("body").inner_text(timeout=10000)
     assert "timeline" in body.lower(), body[:1000]
     assert "Memex" in body, body[:1000]
-    assert "Memory" in body, body[:1000]
+    assert "Current graph" in body, body[:1000]
     assert "Trace" in body, body[:1000]
     page.screenshot(path=str(out / "timeline-1280.png"), full_page=True)
 
     page.set_viewport_size({"width": 900, "height": 560})
-    page.get_by_text("Memory", exact=True).click()
+    page.get_by_text("Current graph", exact=True).click()
     page.wait_for_timeout(500)
     body_small = page.locator("body").inner_text(timeout=10000)
-    assert "Memory" in body_small, body_small[:1000]
-    page.screenshot(path=str(out / "timeline-900-memory.png"), full_page=True)
+    assert "Current graph" in body_small, body_small[:1000]
+    page.screenshot(path=str(out / "timeline-900-current-graph.png"), full_page=True)
 
     health = page.evaluate("fetch('/api/health').then(r => r.json())")
     timeline = page.evaluate("fetch('/api/timeline?days=30').then(r => r.json())")

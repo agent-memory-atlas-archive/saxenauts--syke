@@ -34,70 +34,52 @@ PY
 )"
 export PYTHON_BIN
 
-echo "[preflight] targeted ruff"
-uv run ruff check \
-  syke/entrypoint.py \
-  syke/cli_support \
-  syke/cli_commands \
-  syke/daemon/daemon.py \
-  syke/daemon/ipc.py \
-  syke/daemon/web.py \
-  syke/runtime/locator.py \
-  syke/runtime/sandbox.py \
-  syke/llm/backends/pi_synthesis.py \
-  syke/llm/pi_client.py \
-  syke/source_selection.py \
-  tests/test_build_prompt.py \
-  tests/test_daemon_metrics.py \
-  tests/test_pi_state.py \
-  tests/test_llm.py \
-  tests/test_config_file.py \
-  tests/test_azure_gpt5_thinking.py \
-  tests/test_cli_contract.py \
-  tests/test_daemon_controls.py \
-  tests/test_daemon.py \
-  tests/test_daemon_ipc.py \
-  tests/test_install_surface.py \
-  tests/test_web_server.py \
-  tests/test_sandbox.py \
-  tests/test_pi_synthesis_contract.py \
-  tests/test_pi_native_cli.py \
-  tests/test_pi_client.py \
-  tests/test_source_selection.py \
-  tests/test_runtime_locator.py \
-  tests/test_runtime_parity.py
+pi_test_home=""
+pytest_base=""
+cleanup() {
+  if [[ -n "$pi_test_home" && -d "$pi_test_home" ]]; then
+    rm -rf "$pi_test_home"
+  fi
+  if [[ -n "$pytest_base" && -d "$pytest_base" ]]; then
+    rm -rf "$pytest_base"
+  fi
+}
+trap cleanup EXIT
 
-echo "[preflight] targeted install/runtime tests"
-install_runtime_tests=(
-  tests/test_pi_state.py
-  tests/test_llm.py
-  tests/test_config_file.py
-  tests/test_azure_gpt5_thinking.py
-  tests/test_install_surface.py
-  tests/test_runtime_locator.py
-  tests/test_pi_client.py
-  tests/test_source_selection.py
-  tests/test_build_prompt.py
-  tests/test_daemon_metrics.py
-  tests/test_daemon.py
-  tests/test_daemon_ipc.py
-  tests/test_web_server.py
-  tests/test_sandbox.py
-  tests/test_pi_synthesis_contract.py
-  tests/test_runtime_parity.py
-)
-uv run pytest "${install_runtime_tests[@]}" -q
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  echo "[preflight] prepare macOS sandbox Pi test runtime"
+  pi_test_home="$(mktemp -d "${TMPDIR:-/tmp}/syke-pi-home.XXXXXX")"
+  HOME="$pi_test_home" "$PYTHON_BIN" - <<'PY'
+from pathlib import Path
 
-echo "[preflight] targeted CLI release-path tests"
-cli_release_tests=(
-  tests/test_cli_contract.py
-  tests/test_daemon_controls.py
-  tests/test_pi_native_cli.py
-)
-uv run pytest "${cli_release_tests[@]}" -q
+from syke.llm.pi_client import ensure_pi_binary
 
-echo "[preflight] build wheel"
+ensure_pi_binary()
+print(Path.home() / ".syke" / "pi" / "node_modules")
+PY
+  export SYKE_TEST_PI_NODE_MODULES="$pi_test_home/.syke/pi/node_modules"
+else
+  unset SYKE_TEST_PI_NODE_MODULES || true
+fi
+
+echo "[preflight] repository quality"
+uv run ruff format --check .
+uv run ruff check .
+pytest_base="$(mktemp -d "${TMPDIR:-/tmp}/syke-pytest.XXXXXX")"
+uv run pytest tests/ -q --basetemp="$pytest_base"
+
+macos_sandbox_pi_bash_proof="UNRUN (requires macOS)"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  echo "[preflight] prepared macOS sandbox and Pi bash tests"
+  uv run pytest -m platform tests/test_sandbox.py tests/test_pi_tools_bash.py -q \
+    --basetemp="$pytest_base"
+  macos_sandbox_pi_bash_proof="PASS"
+fi
+
+echo "[preflight] build release artifacts"
 rm -rf dist
+mkdir -p build/lib/syke
+printf 'CANARY = True\n' > build/lib/syke/_stale_build_canary.py
 uv run python -m build
 
 echo "[preflight] package metadata"
@@ -131,4 +113,15 @@ bash "$SCRIPT_DIR/smoke-tool-install.sh"
 echo "[preflight] fresh agent setup smoke"
 bash "$SCRIPT_DIR/fresh-install-test.sh" --run --allow-needs-runtime
 
-echo "[preflight] passed"
+echo
+echo "[preflight] proof summary"
+echo "[preflight] PASS  deterministic repository checks"
+echo "[preflight] PASS  wheel and sdist installation"
+echo "[preflight] PASS  isolated tool installation"
+echo "[preflight] PASS  fresh agent setup smoke"
+echo "[preflight] $macos_sandbox_pi_bash_proof  macOS sandbox and Pi bash tests"
+echo "[preflight] UNRUN live provider and Pi runtime"
+echo "[preflight] UNRUN Linux managed service"
+echo "[preflight] UNRUN clean-user or revoked macOS TCC"
+echo "[preflight] UNRUN physical sleep and wake"
+echo "[preflight] completed; external proofs remain UNRUN"

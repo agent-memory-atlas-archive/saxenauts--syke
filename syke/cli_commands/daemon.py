@@ -95,7 +95,6 @@ def daemon_stop(ctx: click.Context) -> None:
 
     from syke.cli_support.exit_codes import SykeRuntimeException
     from syke.daemon.daemon import (
-        cron_is_running,
         daemon_process_state,
         launchd_metadata,
         stop_and_unload,
@@ -109,9 +108,7 @@ def daemon_stop(ctx: click.Context) -> None:
     if sys.platform == "darwin":
         registered = bool(launchd_metadata().get("registered"))
     else:
-        systemd = systemd_metadata()
-        cron_registered, _ = cron_is_running()
-        registered = bool(systemd.get("registered") or cron_registered)
+        registered = bool(systemd_metadata().get("registered"))
 
     if not running and not registered:
         console.print("[dim]Daemon not running[/dim]")
@@ -139,15 +136,18 @@ def daemon_stop(ctx: click.Context) -> None:
 @click.option("--json", "use_json", is_flag=True, help="Output as JSON")
 @click.pass_context
 def daemon_status_cmd(ctx: click.Context, use_json: bool) -> None:
+    from syke.config import user_control_dir
+    from syke.control import list_receipts
     from syke.daemon.daemon import LOG_PATH
     from syke.daemon.ipc import daemon_runtime_status
-    from syke.metrics import MetricsTracker
+    from syke.runtime import workspace as workspace_module
     from syke.runtime.locator import (
         SYKE_BIN,
         describe_runtime_target,
         resolve_background_syke_runtime,
         resolve_syke_runtime,
     )
+    from syke.runtime.pi_sessions import list_sessions
     from syke.source_selection import get_selected_sources
 
     user_id = ctx.obj["user"]
@@ -162,13 +162,15 @@ def daemon_status_cmd(ctx: click.Context, use_json: bool) -> None:
 
     last_run_payload: dict[str, object] | None = None
     try:
-        summary = MetricsTracker(user_id).get_summary()
-        last = summary.get("last_cycle") or summary.get("last_run")
+        receipts = list_receipts(user_control_dir(user_id), limit=1)
+        recent_sessions = [] if receipts else list_sessions(workspace_module.SESSIONS_DIR, limit=1)
+        last = receipts[0] if receipts else (recent_sessions[0] if recent_sessions else None)
         if last:
+            status = last.get("status")
             last_run_payload = {
-                "completed_at": last.get("completed_at"),
-                "success": bool(last.get("success")),
-                "status": last.get("status"),
+                "completed_at": last.get("completed_at") or last.get("started_at"),
+                "success": status == "completed",
+                "status": status,
             }
     except Exception:
         last_run_payload = None
@@ -229,8 +231,6 @@ def daemon_status_cmd(ctx: click.Context, use_json: bool) -> None:
                 "  Service:  [yellow]stale[/yellow]"
                 f" ({'; '.join(cast(list[str], service.get('stale_reasons') or []))})"
             )
-        elif service.get("scheduled_only"):
-            console.print("  Service:  legacy scheduled sync only; no background service")
         else:
             exit_status = service.get("last_exit_status")
             if exit_status is None:
@@ -243,17 +243,7 @@ def daemon_status_cmd(ctx: click.Context, use_json: bool) -> None:
         ok = "[green]✓[/green]" if last_run_payload.get("success") else "[red]✗[/red]"
         console.print(f"  Last run: {ts}  {ok}")
     else:
-        try:
-            summary = MetricsTracker(user_id).get_summary()
-            last = summary.get("last_run")
-            if last:
-                ts = _compact_timestamp(last.get("completed_at"))
-                ok = "[green]✓[/green]" if last.get("success") else "[red]✗[/red]"
-                console.print(f"  Last run: {ts}  {ok}")
-            else:
-                console.print("  Last run: [dim]no data yet[/dim]")
-        except Exception:
-            console.print("  Last run: [dim]unavailable[/dim]")
+        console.print("  Last run: [dim]no data yet[/dim]")
     console.print(f"  Log:      {LOG_PATH}  [dim](syke daemon logs to view)[/dim]")
     if selected_sources is None:
         console.print("  Sources:  [dim]all detected sources[/dim]")
@@ -390,6 +380,7 @@ def logs(ctx: click.Context, lines: int, follow: bool, errors: bool, use_json: b
 @click.pass_context
 def self_update(ctx: click.Context, yes: bool) -> None:
     import subprocess
+    import sys
 
     from syke import __version__
     from syke.daemon.daemon import daemon_process_state, install_and_start, stop_and_unload
@@ -403,8 +394,7 @@ def self_update(ctx: click.Context, yes: bool) -> None:
     if latest:
         console.print(f"  Latest:    [cyan]{latest}[/cyan]")
     else:
-        console.print("  [yellow]Could not reach PyPI — check your connection.[/yellow]")
-        return
+        raise click.ClickException("Could not reach PyPI — check your connection.")
     if not update_available:
         console.print("[green]Already up to date.[/green]")
         return
@@ -419,7 +409,7 @@ def self_update(ctx: click.Context, yes: bool) -> None:
         return
     if method == "source":
         console.print("\n[yellow]Source install detected — update manually:[/yellow]")
-        console.print("  git pull && pip install -e .")
+        console.print("  git pull && syke install-current")
         return
 
     if not yes:
@@ -432,49 +422,60 @@ def self_update(ctx: click.Context, yes: bool) -> None:
         stop_and_unload()
         stop_snapshot = daemon_state.wait_for_daemon_shutdown(user_id)
         if stop_snapshot.get("running") or stop_snapshot.get("registered"):
-            console.print("[red]Daemon did not stop cleanly. Aborting update.[/red]")
-            return
+            raise click.ClickException("Daemon did not stop cleanly. Update aborted.")
+
+    def _restore_after_failure() -> str:
+        if not was_running:
+            return ""
+        try:
+            install_and_start(user_id)
+            readiness = daemon_state.wait_for_daemon_startup(user_id)
+        except Exception as exc:
+            return f" Previous daemon could not be restored: {exc}"
+        ipc = cast(dict[str, object], readiness.get("ipc") or {})
+        if readiness.get("running") and ipc.get("ok"):
+            return " Previous daemon restored."
+        return " Previous daemon remains unavailable; run `syke daemon start`."
 
     if method == "pipx":
         cmd = ["pipx", "upgrade", "syke"]
     elif method == "uv_tool":
         cmd = ["uv", "tool", "upgrade", "syke"]
     else:
-        cmd = ["pip", "install", "--upgrade", "syke"]
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "syke"]
 
     console.print(f"  Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, timeout=300, check=False)
+    try:
+        result = subprocess.run(cmd, timeout=300, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise click.ClickException(f"Upgrade timed out.{_restore_after_failure()}") from exc
     if result.returncode != 0:
-        console.print("[red]Upgrade failed.[/red]")
-        return
+        raise click.ClickException(f"Upgrade failed.{_restore_after_failure()}")
 
     if was_running:
         console.print("  Restarting daemon...")
-        install_and_start(user_id)
-        readiness = daemon_state.wait_for_daemon_startup(user_id)
+        try:
+            install_and_start(user_id)
+            readiness = daemon_state.wait_for_daemon_startup(user_id)
+        except Exception as exc:
+            raise click.ClickException(
+                f"syke upgraded to {latest}, but daemon restart failed: {exc}"
+            ) from exc
         ipc = cast(dict[str, object], readiness["ipc"])
         if readiness.get("running") and ipc.get("ok"):
             console.print(f"[green]✓[/green] syke upgraded to {latest}.")
             return
         if readiness.get("running"):
-            console.print(
-                f"[yellow]syke upgraded to {latest}, but warm ask is not ready yet.[/yellow]"
+            raise click.ClickException(
+                f"syke upgraded to {latest}, but warm ask is not ready: {ipc.get('detail')}"
             )
-            console.print(f"  IPC: {ipc.get('detail')}")
-            return
         if readiness.get("registered"):
-            console.print(
-                "[yellow]syke upgraded to "
-                f"{latest}, but the daemon service is only registered; "
-                "no live background process is confirmed.[/yellow]"
+            raise click.ClickException(
+                f"syke upgraded to {latest}, but the daemon service is only registered; "
+                "no live background process is confirmed."
             )
-            console.print("  Check status: syke daemon status")
-            console.print("  View logs:    syke daemon logs")
-            return
-        console.print(
-            f"[yellow]syke upgraded to {latest}, but daemon restart is not confirmed yet.[/yellow]"
+        raise click.ClickException(
+            f"syke upgraded to {latest}, but daemon restart is not confirmed."
         )
-        console.print("  Check status: syke daemon status")
-        return
 
     console.print(f"[green]✓[/green] syke upgraded to {latest}.")

@@ -65,8 +65,7 @@ syke config path
 
 | Key | Type | Default | Meaning | Env override |
 |---|---|---|---|---|
-| `threshold` | `int` | `5` | Legacy config key (synthesis always runs; the agent decides via temporal context whether anything warrants updating) | `SYKE_SYNC_THRESHOLD` |
-| `thinking_level` | `string` | `"medium"` | Pi thinking level written to workspace settings | `SYKE_SYNC_THINKING_LEVEL` |
+| `thinking_level` | `string` | `"medium"` | Pi thinking level for synthesis | `SYKE_SYNC_THINKING_LEVEL` |
 | `timeout` | `int` | `600` | Wall-clock timeout in seconds | `SYKE_SYNC_TIMEOUT` |
 | `first_run_timeout` | `int` | `1500` | Wall-clock timeout for the first synthesis run | `SYKE_SYNC_FIRST_RUN_TIMEOUT` |
 
@@ -84,49 +83,36 @@ syke config path
 
 | Key | Type | Default | Meaning | Env override |
 |---|---|---|---|---|
-| `timeout` | `int` | `600` | Ask timeout in seconds | `SYKE_ASK_TIMEOUT` |
+| `timeout` | `int` | `600` | Ask timeout in seconds; durable config only, not caller env | none |
 | `max_parallel` | `int` | `8` | Max concurrent daemon-owned temporary ask workers when the warm runtime is busy | `SYKE_MAX_PARALLEL_ASKS` |
 
 ---
 
-## `[paths]`
-
-| Key | Type | Default | Meaning | Env override |
-|---|---|---|---|---|
-| `data_dir` | `string` | `"~/.syke/data"` | Legacy config key (flat workspace model means `user_data_dir()` returns `~/.syke/` directly; this key is not used for path resolution) | `SYKE_DATA_DIR` |
-
-### `[paths.sources]`
+## `[paths.distribution]`
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `claude_code` | `string` | `"~/.claude"` | Claude Code source root |
-| `codex` | `string` | `"~/.codex"` | Codex source root |
+| `skills_dirs` | `array[string]` | `.agents`, Pi, Claude, Antigravity CLI, Hermes, Codex, Cursor, OpenCode skill dirs | Capability installation targets |
 
-### `[paths.distribution]`
+There is no `data/{user}/` nesting. The current physical boundary is:
 
-| Key | Type | Default | Meaning |
-|---|---|---|---|
-| `claude_md` | `string` | `"~/.claude/CLAUDE.md"` | Retained only for deferred harness-specific memex injection work |
-| `skills_dirs` | `array[string]` | `.agents`, Claude, Gemini, Hermes, Codex, Cursor, OpenCode skill dirs | Capability installation targets |
-
-Note: In the flat workspace model, everything lives at `~/.syke/` directly. There is no `data/{user}/` nesting. `data_dir` is a legacy key in the config schema.
+```text
+~/.syke/
+  workspace/   controller-writable graph, projections, and artifacts
+  control/     writable runtime plus protected history and recovery
+  bin/, pi/    installed runtime
+  config.toml  installation configuration
+```
 
 Example:
 
 ```toml
-[paths]
-data_dir = "~/.syke/data"  # legacy, not used for path resolution
-
-[paths.sources]
-claude_code = "~/.claude"
-codex = "~/.codex"
-
 [paths.distribution]
-claude_md = "~/.claude/CLAUDE.md"
 skills_dirs = [
     "~/.agents/skills",
+    "~/.pi/agent/skills",
     "~/.claude/skills",
-    "~/.gemini/skills",
+    "~/.gemini/antigravity-cli/skills",
     "~/.hermes/skills",
     "~/.codex/skills",
     "~/.cursor/skills",
@@ -162,7 +148,7 @@ syke auth set localproxy --base-url URL --model MODEL --use
 ## Minimal Example
 
 ```toml
-user = "saxenauts"
+user = "your-name"
 timezone = "auto"
 
 [synthesis]
@@ -186,14 +172,9 @@ These env vars are not config-file keys but are read by the runtime:
 | Env Var | Default | Meaning |
 |---|---|---|
 | `SYKE_PROVIDER` | — | Per-process provider override |
-| `SYKE_DB` | — | Override per-user DB path (testing/custom setups) |
-| `SYKE_WORKSPACE_ROOT` | `~/.syke` | Override Pi workspace directory |
-| `SYKE_PI_AGENT_DIR` | `~/.syke/pi-agent` | Override Pi agent state directory |
-| `SYKE_PI_STATE_AUDIT_PATH` | `~/.config/syke/pi-state-audit.log` | Override Pi state audit log path |
-| `SYKE_ALLOW_EMPTY_MEMEX` | — | Replay/test escape hatch: allow synthesis to complete with an empty MEMEX |
-| `SYKE_REPLAY_PAUSE_DB_CONNECTION_DURING_PI` | — | Replay/test escape hatch: close Syke's DB connection while Pi runs |
-| `SYKE_DISABLE_SANDBOX` | — | Disable the Pi sandbox when set |
-| `SYKE_SANDBOX_HARNESS_PATHS` | — | Extra sandbox-readable harness paths |
+| `SYKE_WORKSPACE_ROOT` | `~/.syke/workspace` | Override the controller-writable workspace |
+| `SYKE_CONTROL_ROOT` | `~/.syke/control` | Override the host-owned control directory |
+| `SYKE_PI_AGENT_DIR` | `~/.syke/pi-agent` | Override host-managed Pi agent state |
 
 ---
 
@@ -201,8 +182,11 @@ These env vars are not config-file keys but are read by the runtime:
 
 - Unknown keys in typed sections are ignored with warnings.
 - Provider/model/auth state does not live in `config.toml`. Use `syke auth` or `syke setup` for persisted Pi-native state, override per-process with `SYKE_PROVIDER`, or override per-command with `--provider`.
-- Rollout traces are always written to `syke.db`; there is no self-observation disable gate.
-- The synthesis recovery point/gate is not configurable. If Syke cannot create a cheap recovery point for a large DB, synthesis fails before handing control to Pi.
+- Pi writes native ask and synthesis sessions directly to `control/sessions/`;
+  Syke does not copy them. The host writes synthesis verdicts under
+  `control/receipts/`; raw records live under `control/records/`.
+- The synthesis recovery point/gate protects only the mutable graph. If Syke
+  cannot create a cheap recovery point for a large graph DB, synthesis fails
+  before handing control to Pi.
 - `skills_dirs` is written as a normal TOML array.
-- The memex is the product artifact. `claude_md` is one current additive attachment target, not a runtime source of truth.
-- Removed `[rebuild]`, `[models]`, and `[providers]` sections from older configs are ignored.
+- Removed path keys and `[rebuild]`, `[models]`, and `[providers]` sections from older configs are ignored.

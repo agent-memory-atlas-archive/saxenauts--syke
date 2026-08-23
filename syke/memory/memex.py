@@ -1,79 +1,45 @@
-"""Memex — the agent's map of the user.
-
-A special memory that acts as the first thing any agent reads.
-It's a navigable map: stable things anchor it, active things show movement,
-context grounds it. Over time it gets smarter as retrieval paths emerge.
-Convention: memex memories have source_event_ids = ["__memex__"].
-"""
+"""Current MEMEX access for the agent's map of the user."""
 
 from __future__ import annotations
 
-import logging
+from datetime import UTC, datetime
 
 from uuid_extensions import uuid7
 
 from syke.db import SykeDB
-from syke.models import Memory
-
-log = logging.getLogger(__name__)
-
-MEMEX_MARKER = ["__memex__"]
-
-
-def _strip_projection_header(content: str) -> str:
-    lines = content.split("\n")
-    if lines and lines[0].startswith("# MEMEX ["):
-        return "\n".join(lines[1:]).lstrip("\n")
-    return content
+from syke.memory.memex_budget import strip_memex_header
 
 
 def update_memex(db: SykeDB, user_id: str, new_content: str) -> str:
-    """Update the memex with new content via supersede.
-
-    Old active memex rows are deactivated, new one created. Returns new memex ID.
-    """
-    canonical_content = _strip_projection_header(new_content)
-    marker = '["__memex__"]'
-    active_rows = db.conn.execute(
-        """SELECT id, content FROM memories
-           WHERE user_id = ? AND active = 1 AND source_event_ids = ?
-           ORDER BY datetime(created_at) DESC, id DESC""",
-        (user_id, marker),
-    ).fetchall()
-    existing = dict(active_rows[0]) if active_rows else None
-    if existing and existing["content"] == canonical_content:
-        stale_ids = [row["id"] for row in active_rows[1:]]
-        if stale_ids:
-            placeholders = ",".join("?" for _ in stale_ids)
-            with db.transaction():
-                db.conn.execute(
-                    f"""UPDATE memories
-                        SET superseded_by = ?, active = 0
-                        WHERE user_id = ? AND id IN ({placeholders})""",
-                    (existing["id"], user_id, *stale_ids),
-                )
-        return str(existing["id"])
-
-    new_memory = Memory(
-        id=str(uuid7()),
-        user_id=user_id,
-        content=canonical_content,
-        source_event_ids=MEMEX_MARKER,
-    )
+    """Update the canonical memex while preserving its identity."""
+    canonical_content = strip_memex_header(new_content)
+    now = datetime.now(UTC).isoformat()
 
     with db.transaction():
-        new_id = db.insert_memory(new_memory)
-        if active_rows:
-            old_ids = [row["id"] for row in active_rows]
-            placeholders = ",".join("?" for _ in old_ids)
-            db.conn.execute(
-                f"""UPDATE memories
-                    SET superseded_by = ?, active = 0
-                    WHERE user_id = ? AND id IN ({placeholders})""",
-                (new_id, user_id, *old_ids),
-            )
+        existing = db.conn.execute(
+            """SELECT id, content
+               FROM current_memex
+               WHERE singleton = 1 AND user_id = ?""",
+            (user_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["content"] != canonical_content:
+                db.conn.execute(
+                    """UPDATE current_memex
+                       SET content = ?, updated_at = ?
+                       WHERE singleton = 1 AND user_id = ? AND id = ?""",
+                    (canonical_content, now, user_id, existing["id"]),
+                )
+            return str(existing["id"])
 
-    return new_id
+        memex_id = str(uuid7())
+        db.conn.execute(
+            """INSERT INTO current_memex
+               (singleton, id, user_id, content, created_at, updated_at)
+               VALUES (1, ?, ?, ?, ?, NULL)""",
+            (memex_id, user_id, canonical_content, now),
+        )
+        return memex_id
 
 
 def get_memex_for_injection(
@@ -115,7 +81,8 @@ def get_memex_for_injection(
             "- Read adapter markdowns in `adapters/` to discover what harness data exists.\n"
             "- Explore harness directories directly — the data is there, "
             "the memex just hasn't mapped it yet.\n"
-            "- If the user records something (`syke record`), answer from that.\n"
+            "- `syke record` sends new evidence to the next synthesis; it is not "
+            "memory yet.\n"
             "- Do not guess a wait time. Tell the user setup is complete but "
             "MEMEX is not ready yet; they can run `syke sync`, check "
             "`syke status --json`, or keep working while the daemon builds it."

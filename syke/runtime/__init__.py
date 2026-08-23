@@ -24,27 +24,20 @@ _runtime_lock = threading.RLock()
 
 def _normalize_runtime_key(
     workspace_dir: str | Path,
-    session_dir: str | Path | None,
+    session_dir: str | Path,
     model: str | None,
-    runtime_profile: str | None,
-    selected_sources: tuple[str, ...] | None,
 ) -> tuple[str, str, str]:
     from syke.llm.pi_client import resolve_pi_launch_binding
+    from syke.runtime.sandbox import sandbox_runtime_identity
 
     workspace_path = Path(workspace_dir).expanduser().resolve()
-    session_path = (
-        Path(session_dir).expanduser().resolve()
-        if session_dir is not None
-        else (workspace_path / "sessions").resolve()
-    )
+    session_path = Path(session_dir).expanduser().resolve()
     binding = resolve_pi_launch_binding(model)
     provider = binding.provider or ""
-    profile = runtime_profile or "default"
-    sources_key = ",".join(selected_sources or ())
     return (
         str(workspace_path),
         str(session_path),
-        f"{provider}:{binding.model}:{profile}:{sources_key}",
+        f"{provider}:{binding.model}:{sandbox_runtime_identity()}",
     )
 
 
@@ -61,10 +54,8 @@ def get_pi_runtime() -> PiRuntime:
 
 def start_pi_runtime(
     workspace_dir: str | Path,
-    session_dir: str | Path | None = None,
+    session_dir: str | Path,
     model: str | None = None,
-    runtime_profile: str | None = None,
-    selected_sources: tuple[str, ...] | None = None,
 ) -> PiRuntime:
     """Initialize and start the singleton Pi runtime."""
     global _runtime, _runtime_key
@@ -75,8 +66,6 @@ def start_pi_runtime(
             workspace_dir,
             session_dir,
             model,
-            runtime_profile,
-            selected_sources,
         )
 
         if _runtime and _runtime.is_alive:
@@ -97,16 +86,12 @@ def start_pi_runtime(
             workspace_dir=workspace_dir,
             session_dir=session_dir,
             model=model,
-            runtime_profile=runtime_profile,
-            selected_sources=selected_sources,
         )
         _runtime.start()
         _runtime_key = _normalize_runtime_key(
             workspace_dir,
             session_dir,
             model,
-            runtime_profile,
-            selected_sources,
         )
         return _runtime
 

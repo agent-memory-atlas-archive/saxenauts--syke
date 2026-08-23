@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from syke.config import user_data_dir, user_syke_db_path
+from syke.config import user_control_dir, user_data_dir
+from syke.control import receipt_rollup
 from syke.metrics import MetricsTracker, setup_logging
+from syke.runtime import workspace as workspace_module
+from syke.runtime.pi_sessions import session_history_status
 
 __all__ = ["MetricsTracker", "run_health_check", "setup_logging"]
 
@@ -19,28 +22,16 @@ def run_health_check(user_id: str) -> dict:
         "detail": f"Python {sys.version.split()[0]}",
     }
 
-    db_path = user_syke_db_path(user_id)
     db = None
     try:
-        from syke.db import SykeDB
+        from syke.cli_support.context import get_db
 
-        db = SykeDB(db_path)
-        db.initialize()
-        memory_count = db.count_memories(user_id, active_only=True)
-        cycle_count = db.conn.execute(
-            "SELECT COUNT(*) FROM cycle_records WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()[0]
-        trace_count = db.conn.execute(
-            "SELECT COUNT(*) FROM rollout_traces WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()[0]
+        db = get_db(user_id)
+        memory_count = int(db.get_graph_stats(user_id)["memories"])
+        cycle_count = receipt_rollup(user_control_dir(user_id))["total"]
         checks["database"] = {
             "ok": True,
-            "detail": (
-                f"{memory_count} active memories, {cycle_count} cycles, "
-                f"{trace_count} rollout traces"
-            ),
+            "detail": f"{memory_count} current memories, {cycle_count} cycles",
         }
     except Exception as e:
         checks["database"] = {"ok": False, "detail": str(e)}
@@ -64,10 +55,7 @@ def run_health_check(user_id: str) -> dict:
     else:
         checks["memex"] = {"ok": False, "detail": "Database unavailable"}
 
-    checks["trace_store"] = {
-        "ok": db_path.exists(),
-        "detail": str(db_path) if db_path.exists() else "No trace store yet",
-    }
+    checks["session_history"] = session_history_status(workspace_module.SESSIONS_DIR)
 
     # Synthesis freshness — reuse health.py
     if db is not None:
@@ -83,7 +71,7 @@ def run_health_check(user_id: str) -> dict:
         except Exception as e:
             checks["synthesis"] = {"ok": False, "detail": str(e)}
 
-    # Signals — surface degradation (stale sources, orphan memories, etc.)
+    # Signals surface concrete runtime and freshness degradation.
     if db is not None:
         try:
             from syke.health import signals

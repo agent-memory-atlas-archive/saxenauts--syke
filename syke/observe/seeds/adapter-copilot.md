@@ -115,15 +115,21 @@ Per turn: `source_event_type`, `model` (CLI), `requestId`, `responseId`, `modelI
 
 CLI sessions record terminal-based conversations: user prompts, assistant responses, tool calls (shell commands, file operations), tool results, and workspace context. VS Code sessions record editor-based chat: user questions, assistant responses with code suggestions, tool invocations for code editing, and notebook operations.
 
+## Project instructions
+
+Resolve the project from CLI `workspace.yaml` or the VS Code workspace association. Copilot project context can include:
+
+- `AGENTS.md` in supported configurations
+- `.github/copilot-instructions.md`
+- `.github/agents/*.agent.md` custom agent definitions
+- `.github/skills/*/SKILL.md` agent skills
+- user-level instructions configured through VS Code or GitHub settings
+
+Current instruction files do not establish what an older chat received. Prefer context recorded in its event log or chat data when available.
+
 ## Harness memory
 
-GitHub Copilot reads context from these sources:
-
-- `.github/copilot-instructions.md` in the project root (project-level instructions)
-- `.github/agents/` directory for custom agent definitions (`.agent.md` files)
-- `.github/skills/` directory for agent skills (each with a SKILL.md)
-- `AGENTS.md` in the project root (read in some configurations)
-- User-level settings configured through the VS Code settings UI or GitHub settings
+No separate local durable memory surface is confirmed. `workspace.yaml` is workspace metadata, custom instructions are persistent context, and chat files are session history.
 
 ## Distribution
 

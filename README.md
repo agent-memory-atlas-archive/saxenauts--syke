@@ -18,18 +18,14 @@ intent, and progress in prose. It serves a projection as `MEMEX.md` plus a CLI
 interface.
 
 Your agents use `syke ask`, `syke record`, and `syke memex` in their workflow.
+As a self-maintaining memory agent, Syke adapts by revising its own durable
+memory state over time. It can also act as a sidekick for debugging,
+brainstorming, and research alongside your primary coding agents.
 
-As a self-maintaining memory agent, it adapts to your workflow by revising its
-own durable memory state over time.
-
-You can also use syke beyond typical memory use cases, like debugging, having syke as a sidekick agent,
-for brainstorming and research while you work with your main coding agents.
-
-The development is deliberately experimental, partial and doesn't support popular features.
-
-PS: The harness trains in multiple memory environments to test and research self learning capabilities. 
-
-Still useful and more capable than popular solutions from day one. So do try it.  
+Syke is deliberately experimental and incomplete. It does not try to reproduce
+every feature in established memory products, and pre-1.0 releases may make
+intentional compatibility breaks. The runtime is exercised across multiple
+memory environments as ongoing research into self-learning systems.
 
 ## Install
 
@@ -45,7 +41,8 @@ uv tool install syke
 syke setup
 ```
 
-`syke setup` is interactive. It inspects your machine for your active harnesses. Uses Pi agent core for auth and runtime. 
+`syke setup` is interactive. It inspects your machine for active harnesses and
+uses Pi agent core for auth and runtime.
 
 ## First Run
 
@@ -62,7 +59,13 @@ Setup walks through:
 - source selection
 - workspace initialization at `~/.syke/`
 - background service setup
+- macOS access checks for Desktop, Documents, and Downloads
 - first memory synthesis
+
+On macOS, setup performs those three checks through the installed background
+Syke process. macOS may ask for access one folder at a time. Choose Allow for
+the folders you want Syke to observe. Other normal folders under your home
+directory do not need this step.
 
 After setup, keep working. The first synthesis can take a few minutes depending
 on how much local history Syke finds. The timeline explains what is happening
@@ -85,11 +88,18 @@ syke status
 syke doctor
 ```
 
+For long notes, pasted transcripts, or shell-sensitive content, prefer stdin so
+the shell does not reinterpret or retain the content:
+
+```bash
+printf '%s\n' 'Decision: keep $(literal) and `quoted` chars.' | syke record
+```
+
 The important split:
 
 - `syke memex` shows the current memory projection.
 - `syke ask` searches and reasons over the underlying timeline.
-- `syke record` saves an explicit note or decision.
+- `syke record` admits an external record; the next synthesis decides whether it changes memory.
 - `syke web --open` shows the local visual timeline.
 
 ## Local Timeline
@@ -116,12 +126,12 @@ currently include:
 
 - Claude Code
 - Codex
+- Pi coding agent
 - OpenCode
 - Cursor
 - GitHub Copilot
-- Antigravity
+- Google Antigravity (2.0, CLI, and IDE surfaces)
 - Hermes
-- Gemini CLI
 
 See [PLATFORMS.md](PLATFORMS.md) for exact artifact paths and current status.
 
@@ -145,16 +155,27 @@ More detail: [Setup Guide](docs/SETUP.md).
 
 Syke is local-machine first.
 
-- Workspace: `~/.syke/`
-- Database: `~/.syke/syke.db`
-- Current projection: `~/.syke/MEMEX.md`
-- Identity/runtime context: `~/.syke/PSYCHE.md`
-- Adapter guides: `~/.syke/adapters/{source}.md`
-- Pi provider/runtime state: `~/.syke/pi-agent/`
+- Installation root: `~/.syke/`
+- Controller-writable workspace: `~/.syke/workspace/`
+- Mutable graph: `~/.syke/workspace/syke.db`
+- Current projection: `~/.syke/workspace/MEMEX.md`
+- Installed self-model: packaged `syke/runtime/syke_self.md` (read-only)
+- Adapter guides: `~/.syke/workspace/adapters/{source}.md`
+- Durable operational runtime: `~/.syke/control/runtime/`
+- Host-managed Pi auth/provider state: `~/.syke/pi-agent/`
+- Protected native Pi sessions: `~/.syke/control/sessions/`
+- Protected final synthesis receipts: `~/.syke/control/receipts/`
+- Protected raw records: `~/.syke/control/records/`
 
-On macOS, ask and synthesis run Pi under a filesystem sandbox when available.
-The sandbox grants scoped local reads, Syke workspace writes, temp writes, and
-network access for provider calls.
+On macOS, Pi writes its native sessions as trusted runtime state. The model's
+`read`, `bash`, `edit`, and `write` tools run behind a filesystem sandbox:
+the current user's `$HOME` is readable while ordinary computer files remain
+read-only. Only the Syke workspace and durable runtime are writable. Sessions,
+receipts, records, and recovery state remain explicitly non-writable.
+`workspace/syke.db` is Syke's only active semantic/control database; native
+tools may keep their own source stores. Linux does not yet provide the same
+OS-enforced model-tool boundary. Content returned by model tools can be
+processed by the configured provider and retained in protected native sessions.
 
 ## Docs
 

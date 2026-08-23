@@ -1,29 +1,50 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
-from syke.cli_support.daemon_state import daemon_persistence_payload, wait_for_daemon_startup
+import syke.config as config
+import syke.onboarding as onboarding
+from syke.cli_support import daemon_state
 from syke.daemon.daemon import SykeDaemon
 from syke.entrypoint import cli
 
 
-def test_daemon_persistence_payload_distinguishes_platform_service_managers() -> None:
-    darwin = daemon_persistence_payload("Darwin")
-    assert darwin["manager"] == "launchd"
-    assert darwin["keeps_syncing"] is True
-    assert darwin["keeps_daemon_alive"] is True
-    assert darwin["serves_timeline_while_idle"] is True
-    assert "KeepAlive" in darwin["restart_policy"]
+@pytest.mark.parametrize(
+    ("waiter", "snapshot"),
+    [
+        (
+            daemon_state.wait_for_daemon_startup,
+            {"running": False, "registered": True, "ipc": {"ok": False}},
+        ),
+        (
+            daemon_state.wait_for_daemon_shutdown,
+            {"running": True, "registered": False, "ipc": {"ok": True}},
+        ),
+    ],
+)
+def test_daemon_lifecycle_wait_deadlines_use_wall_clock(monkeypatch, waiter, snapshot) -> None:
+    wall_times = iter([100.0, 121.0])
+    snapshots: list[dict[str, object]] = []
 
-    linux = daemon_persistence_payload("Linux")
-    assert linux["manager"] == "systemd"
-    assert linux["keeps_syncing"] is True
-    assert linux["keeps_daemon_alive"] is True
-    assert linux["serves_timeline_while_idle"] is True
-    assert linux["requires_linger_for_boot"] is True
+    def readiness(_user_id: str) -> dict[str, object]:
+        snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(daemon_state, "daemon_readiness_snapshot", readiness)
+    monkeypatch.setattr(daemon_state.time, "time", lambda: next(wall_times))
+    monkeypatch.setattr(
+        daemon_state.time,
+        "monotonic",
+        lambda: (_ for _ in ()).throw(AssertionError("monotonic deadline used")),
+    )
+    monkeypatch.setattr(daemon_state.time, "sleep", lambda _delay: None)
+
+    assert waiter("test", timeout_seconds=20.0) is snapshot
+    assert snapshots == [snapshot]
 
 
 def test_daemon_start_reports_registered_service_without_live_process(cli_runner) -> None:
@@ -41,32 +62,6 @@ def test_daemon_start_reports_registered_service_without_live_process(cli_runner
                 "platform": "Darwin",
                 "pid": None,
                 "ipc": {"ok": False, "detail": "daemon IPC socket missing"},
-            },
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "daemon", "start"])
-
-    assert result.exit_code == 4
-    assert (
-        "Daemon service is registered, but no live background process is running." in result.output
-    )
-
-
-def test_daemon_start_uses_same_registered_service_warning_on_linux(cli_runner) -> None:
-    with (
-        patch(
-            "syke.daemon.daemon.daemon_process_state",
-            return_value={"running": False, "pid": None, "source": "none"},
-        ),
-        patch("syke.daemon.daemon.install_and_start"),
-        patch(
-            "syke.cli_commands.daemon.daemon_state.wait_for_daemon_startup",
-            return_value={
-                "running": False,
-                "registered": True,
-                "platform": "Linux",
-                "pid": None,
-                "ipc": {"ok": False, "detail": "not-applicable"},
             },
         ),
     ):
@@ -97,225 +92,6 @@ def test_daemon_stop_reports_incomplete_when_process_survives(cli_runner) -> Non
     assert "Daemon stop is incomplete." in result.output
 
 
-def test_self_update_uses_uv_tool_upgrade_for_uv_tool_installs(cli_runner) -> None:
-    with (
-        patch("syke.__version__", "0.1.0"),
-        patch("syke.cli_commands.daemon.__version__", "0.1.0"),
-        patch("syke.version_check.check_update_available", return_value=(True, "99.0.0")),
-        patch("syke.cli_commands.daemon.detect_install_method", return_value="uv_tool"),
-        patch(
-            "syke.daemon.daemon.daemon_process_state",
-            return_value={"running": False, "pid": None, "source": "none"},
-        ),
-        patch("subprocess.run") as run_mock,
-    ):
-        run_mock.return_value.returncode = 0
-        result = cli_runner.invoke(cli, ["--user", "test", "self-update", "--yes"])
-
-    assert result.exit_code == 0
-    assert any(
-        call.args[0] == ["uv", "tool", "upgrade", "syke"] for call in run_mock.call_args_list
-    )
-
-
-def test_self_update_aborts_when_daemon_does_not_stop_cleanly(cli_runner) -> None:
-    with (
-        patch("syke.__version__", "0.1.0"),
-        patch("syke.cli_commands.daemon.__version__", "0.1.0"),
-        patch("syke.version_check.check_update_available", return_value=(True, "99.0.0")),
-        patch("syke.cli_commands.daemon.detect_install_method", return_value="uv_tool"),
-        patch(
-            "syke.daemon.daemon.daemon_process_state",
-            return_value={"running": True, "pid": 123, "source": "pidfile"},
-        ),
-        patch("syke.daemon.daemon.stop_and_unload"),
-        patch(
-            "syke.cli_commands.daemon.daemon_state.wait_for_daemon_shutdown",
-            return_value={"running": True, "registered": False},
-        ),
-        patch("subprocess.run") as run_mock,
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "self-update", "--yes"])
-
-    assert result.exit_code == 0
-    assert "Daemon did not stop cleanly" in result.output
-    assert all(
-        call.args[0] != ["uv", "tool", "upgrade", "syke"] for call in run_mock.call_args_list
-    )
-
-
-def test_self_update_reports_degraded_restart_truthfully(cli_runner) -> None:
-    with (
-        patch("syke.__version__", "0.1.0"),
-        patch("syke.cli_commands.daemon.__version__", "0.1.0"),
-        patch("syke.version_check.check_update_available", return_value=(True, "99.0.0")),
-        patch("syke.cli_commands.daemon.detect_install_method", return_value="uv_tool"),
-        patch(
-            "syke.daemon.daemon.daemon_process_state",
-            return_value={"running": True, "pid": 123, "source": "pidfile"},
-        ),
-        patch("syke.daemon.daemon.stop_and_unload"),
-        patch(
-            "syke.cli_commands.daemon.daemon_state.wait_for_daemon_shutdown",
-            return_value={"running": False, "registered": False},
-        ),
-        patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")),
-        patch("syke.daemon.daemon.install_and_start"),
-        patch(
-            "syke.cli_commands.daemon.daemon_state.wait_for_daemon_startup",
-            return_value={
-                "platform": "Darwin",
-                "running": True,
-                "registered": True,
-                "pid": 999,
-                "ipc": {"ok": False, "detail": "daemon IPC socket missing"},
-            },
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "self-update", "--yes"])
-
-    assert result.exit_code == 0
-    assert "warm ask is not ready yet" in result.output
-
-
-def test_self_update_reports_registered_only_restart_truthfully_on_linux(cli_runner) -> None:
-    with (
-        patch("syke.__version__", "0.1.0"),
-        patch("syke.cli_commands.daemon.__version__", "0.1.0"),
-        patch("syke.version_check.check_update_available", return_value=(True, "99.0.0")),
-        patch("syke.cli_commands.daemon.detect_install_method", return_value="uv_tool"),
-        patch(
-            "syke.daemon.daemon.daemon_process_state",
-            return_value={"running": True, "pid": 123, "source": "pidfile"},
-        ),
-        patch("syke.daemon.daemon.stop_and_unload"),
-        patch(
-            "syke.cli_commands.daemon.daemon_state.wait_for_daemon_shutdown",
-            return_value={"running": False, "registered": False},
-        ),
-        patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")),
-        patch("syke.daemon.daemon.install_and_start"),
-        patch(
-            "syke.cli_commands.daemon.daemon_state.wait_for_daemon_startup",
-            return_value={
-                "platform": "Linux",
-                "running": False,
-                "registered": True,
-                "pid": None,
-                "ipc": {"ok": False, "detail": "daemon IPC socket missing"},
-            },
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "self-update", "--yes"])
-
-    assert result.exit_code == 0
-    assert "service is only registered" in result.output
-    assert "background process is confirmed" in result.output
-
-
-def test_wait_for_daemon_startup_requires_ipc_when_platform_is_darwin(monkeypatch) -> None:
-    snapshots = iter(
-        [
-            {
-                "platform": "Darwin",
-                "running": True,
-                "registered": True,
-                "pid": 1,
-                "ipc": {"ok": False, "detail": "missing"},
-            },
-            {
-                "platform": "Darwin",
-                "running": True,
-                "registered": True,
-                "pid": 1,
-                "ipc": {"ok": False, "detail": "missing"},
-            },
-            {
-                "platform": "Darwin",
-                "running": True,
-                "registered": True,
-                "pid": 1,
-                "ipc": {"ok": True, "detail": "present"},
-            },
-        ]
-    )
-
-    monkeypatch.setattr(
-        "syke.cli_support.daemon_state.daemon_readiness_snapshot", lambda _user: next(snapshots)
-    )
-    monotonic_values = iter([0.0, 0.1, 0.2])
-    monkeypatch.setattr("time.monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr("time.sleep", lambda _delay: None)
-
-    snapshot = wait_for_daemon_startup("test", timeout_seconds=1.0)
-
-    assert snapshot["ipc"]["ok"] is True
-
-
-def test_wait_for_daemon_startup_requires_ipc_when_platform_is_linux(monkeypatch) -> None:
-    snapshots = iter(
-        [
-            {
-                "platform": "Linux",
-                "running": False,
-                "registered": True,
-                "pid": None,
-                "ipc": {"ok": False, "detail": "missing"},
-            },
-            {
-                "platform": "Linux",
-                "running": True,
-                "registered": True,
-                "pid": 1,
-                "ipc": {"ok": False, "detail": "missing"},
-            },
-            {
-                "platform": "Linux",
-                "running": True,
-                "registered": True,
-                "pid": 1,
-                "ipc": {"ok": True, "detail": "present"},
-            },
-        ]
-    )
-
-    monkeypatch.setattr(
-        "syke.cli_support.daemon_state.daemon_readiness_snapshot", lambda _user: next(snapshots)
-    )
-    monotonic_values = iter([0.0, 0.1, 0.2])
-    monkeypatch.setattr("time.monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr("time.sleep", lambda _delay: None)
-
-    snapshot = wait_for_daemon_startup("test", timeout_seconds=1.0)
-
-    assert snapshot["ipc"]["ok"] is True
-
-
-def test_daemon_runtime_status_does_not_block_on_runtime_lock() -> None:
-    daemon = SykeDaemon("test")
-    daemon._pi_runtime = SimpleNamespace(
-        status=lambda: {
-            "alive": True,
-            "provider": "kimi-coding",
-            "model": "k2p5",
-            "pid": 4242,
-            "uptime_s": 12.0,
-            "binding_error": None,
-        }
-    )
-
-    daemon._runtime_lock.acquire()
-    try:
-        snapshot = daemon._handle_ipc_runtime_status()
-    finally:
-        daemon._runtime_lock.release()
-
-    assert snapshot["alive"] is True
-    assert snapshot["provider"] == "kimi-coding"
-    assert snapshot["model"] == "k2p5"
-    assert snapshot["busy"] is True
-
-
 def test_daemon_ipc_ask_rejects_noncanonical_db_path(monkeypatch) -> None:
     daemon = SykeDaemon("test")
     monkeypatch.setattr("syke.config.user_syke_db_path", lambda _user: "/tmp/expected.db")
@@ -325,50 +101,7 @@ def test_daemon_ipc_ask_rejects_noncanonical_db_path(monkeypatch) -> None:
             syke_db_path="/tmp/unexpected.db",
             question="what changed",
             on_event=None,
-            timeout=10.0,
         )
-
-
-def test_daemon_ipc_ask_uses_worker_when_runtime_lock_is_busy(monkeypatch, tmp_path) -> None:
-    syke_db_path = tmp_path / "syke.db"
-    syke_db_path.write_text("", encoding="utf-8")
-    daemon = SykeDaemon("test")
-    captured: dict[str, object] = {}
-
-    class FakeWorkers:
-        def ask(self, **kwargs):
-            captured.update(kwargs)
-            return "worker answer", {
-                "backend": "pi",
-                "transport": "daemon_worker",
-                "worker_pid": 4242,
-            }
-
-    monkeypatch.setattr("syke.config.user_syke_db_path", lambda _user: syke_db_path)
-    daemon._ask_workers = FakeWorkers()
-
-    daemon._runtime_lock.acquire()
-    try:
-        answer, metadata = daemon._handle_ipc_ask(
-            syke_db_path=str(syke_db_path),
-            question="what changed",
-            on_event=None,
-            timeout=10.0,
-        )
-    finally:
-        daemon._runtime_lock.release()
-
-    assert answer == "worker answer"
-    assert metadata["transport"] == "daemon_worker"
-    assert captured["user_id"] == "test"
-    assert captured["syke_db_path"] == str(syke_db_path)
-    assert captured["question"] == "what changed"
-    assert captured["timeout"] == 10.0
-    transport_details = captured["transport_details"]
-    assert isinstance(transport_details, dict)
-    assert transport_details["routing_reason"] == "warm_runtime_busy"
-    assert "daemon_pid" in transport_details
-    assert "ipc_socket_path" in transport_details
 
 
 def test_daemon_ipc_ask_warm_path_marks_routing_reason(monkeypatch, tmp_path) -> None:
@@ -385,13 +118,16 @@ def test_daemon_ipc_ask_warm_path_marks_routing_reason(monkeypatch, tmp_path) ->
         return "warm answer", {"backend": "pi", "transport": kwargs["transport"]}
 
     monkeypatch.setattr("syke.config.user_syke_db_path", lambda _user: syke_db_path)
+    monkeypatch.setattr(
+        "syke.cli_support.context.get_db",
+        lambda _user: SimpleNamespace(db_path=str(syke_db_path), close=lambda: None),
+    )
     monkeypatch.setattr("syke.llm.backends.pi_ask.pi_ask", fake_pi_ask)
 
     answer, metadata = daemon._handle_ipc_ask(
         syke_db_path=str(syke_db_path),
         question="what changed",
         on_event=None,
-        timeout=10.0,
     )
 
     assert answer == "warm answer"
@@ -403,92 +139,91 @@ def test_daemon_ipc_ask_warm_path_marks_routing_reason(monkeypatch, tmp_path) ->
     assert "ipc_socket_path" in transport_details
 
 
-def test_daemon_cycle_skips_distribution_after_failed_synthesis() -> None:
-    daemon = SykeDaemon("test")
-
-    with (
-        patch.object(daemon, "_health_check", return_value={"healthy": True}),
-        patch.object(daemon, "_heal"),
-        patch.object(daemon, "_synthesize", return_value={"status": "failed", "error": "429"}),
-        patch.object(daemon, "_distribute") as distribute,
-    ):
-        daemon._daemon_cycle(SimpleNamespace())
-
-    distribute.assert_not_called()
-
-
-def test_daemon_distribution_skips_setup_blocked_synthesis() -> None:
-    daemon = SykeDaemon("test")
-
-    with patch("syke.distribution.refresh_distribution") as refresh:
-        daemon._distribute(SimpleNamespace(), {"status": "blocked", "error": "No Pi model"})
-
-    refresh.assert_not_called()
-
-
-def test_daemon_cycle_records_setup_blocked_trace_status() -> None:
-    daemon = SykeDaemon("test")
-    captured: dict[str, object] = {}
-
-    def _capture_trace(**kwargs) -> str:
-        captured.update(kwargs)
-        return "trace-blocked"
-
-    with (
-        patch.object(daemon, "_health_check", return_value={"healthy": True}),
-        patch.object(daemon, "_heal"),
-        patch.object(
-            daemon,
-            "_synthesize",
-            return_value={"status": "blocked", "error": "No Pi model"},
-        ),
-        patch.object(daemon, "_distribute") as distribute,
-        patch("syke.trace_store.persist_rollout_trace", side_effect=_capture_trace),
-    ):
-        daemon._daemon_cycle(SimpleNamespace())
-
-    distribute.assert_called_once()
-    assert captured["status"] == "blocked"
-    assert captured["error"] == "No Pi model"
-    assert captured["extras"]["synthesis_status"] == "blocked"
-
-
-def test_daemon_distribute_passes_memex_updated_to_distribution() -> None:
+def test_daemon_distributes_only_completed_synthesis_with_actual_memex_state() -> None:
     daemon = SykeDaemon("test")
     db = SimpleNamespace()
 
     with patch("syke.distribution.refresh_distribution") as refresh:
+        daemon._distribute(SimpleNamespace(), {"status": "blocked", "error": "No Pi model"})
+        refresh.assert_not_called()
         refresh.return_value = SimpleNamespace(memex_path=None, skill_paths=[], warnings=[])
 
-        # memex_updated=True → forwarded as True
         daemon._distribute(db, {"status": "completed", "memex_updated": True})
         assert refresh.call_args.kwargs["memex_updated"] is True
 
-        # memex_updated=False → forwarded as False
         refresh.reset_mock()
         daemon._distribute(db, {"status": "completed", "memex_updated": False})
         assert refresh.call_args.kwargs["memex_updated"] is False
 
-        # key missing → defaults to False (not True)
         refresh.reset_mock()
         daemon._distribute(db, {"status": "completed"})
         assert refresh.call_args.kwargs["memex_updated"] is False
+
+
+@pytest.mark.parametrize(
+    ("synthesis_status", "expected_onboarding_status"),
+    [
+        ("completed", "first_synthesis_completed"),
+        ("blocked", "waiting_first_synthesis"),
+    ],
+)
+def test_daemon_cycle_completes_onboarding_only_after_accepted_synthesis(
+    synthesis_status: str,
+    expected_onboarding_status: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "SYKE_HOME", tmp_path)
+    _ = onboarding.write_onboarding_state(
+        "test",
+        selected_sources=("codex",),
+        total_files=1,
+        estimated_minutes=1,
+        estimate_method="test",
+        mode="daemon",
+    )
+    daemon = SykeDaemon("test")
+    distributed: list[str] = []
+
+    def synthesize(_db: object) -> dict[str, object]:
+        return {"status": synthesis_status}
+
+    def distribute(_db: object, result: dict[str, object]) -> None:
+        distributed.append(str(result["status"]))
+
+    monkeypatch.setattr(daemon, "_health_check", lambda: {"healthy": True})
+    monkeypatch.setattr(daemon, "_synthesize", synthesize)
+    monkeypatch.setattr(daemon, "_distribute", distribute)
+
+    daemon._daemon_cycle(SimpleNamespace())
+
+    state = onboarding.read_onboarding_state("test")
+    assert state is not None
+    assert state["status"] == expected_onboarding_status
+    assert distributed == [synthesis_status]
 
 
 def test_daemon_ensure_process_markers_rewrites_pid_and_rebinds_ipc(tmp_path, monkeypatch) -> None:
     daemon = SykeDaemon("test")
     pid_path = tmp_path / "daemon.pid"
     socket_path = tmp_path / "daemon.sock"
+    socket_path.write_text("stale", encoding="utf-8")
     stop_ipc = Mock()
 
     monkeypatch.setattr("syke.daemon.daemon.PIDFILE", pid_path)
-
+    daemon._pi_runtime = SimpleNamespace(status=lambda: {"alive": True})
     daemon._ipc_server = SimpleNamespace(
         socket_path=socket_path,
         stop=stop_ipc,
     )
 
-    with patch.object(daemon, "_start_ipc_server") as start_ipc:
+    with (
+        patch(
+            "syke.daemon.ipc.daemon_ipc_status",
+            return_value={"reachable": False},
+        ),
+        patch.object(daemon, "_start_ipc_server") as start_ipc,
+    ):
         daemon._ensure_process_markers()
 
     assert pid_path.exists()
@@ -498,28 +233,15 @@ def test_daemon_ensure_process_markers_rewrites_pid_and_rebinds_ipc(tmp_path, mo
 
 
 def test_synthesis_timeout_returns_failure() -> None:
-    """If _runtime_lock can't be acquired within timeout, synthesis fails cleanly."""
-    import threading
-
     daemon = SykeDaemon("test")
+    daemon._runtime_lock = SimpleNamespace(
+        acquire=lambda timeout=None: False,
+        release=lambda: None,
+    )
 
-    # Replace with a lock that's already held and times out immediately
-    real_lock = threading.Lock()
-    real_lock.acquire()
-    daemon._runtime_lock = real_lock
+    with patch("syke.llm.backends.pi_synthesis.pi_synthesize") as synthesize:
+        result = daemon._synthesize(SimpleNamespace())
 
-    try:
-        with patch("syke.llm.backends.pi_synthesis.pi_synthesize") as mock_synth:
-            # _synthesize will try acquire(timeout=600) but we mock time:
-            # Instead, just replace the lock's acquire to return False
-            daemon._runtime_lock = SimpleNamespace(
-                acquire=lambda timeout=None: False,
-                release=lambda: None,
-            )
-            result = daemon._synthesize(SimpleNamespace(), 0)
-    finally:
-        real_lock.release()
-
-    mock_synth.assert_not_called()
+    synthesize.assert_not_called()
     assert result["status"] == "failed"
     assert "timeout" in result["error"]

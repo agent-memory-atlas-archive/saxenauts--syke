@@ -1,17 +1,16 @@
-"""OS-level sandbox for the Pi agent runtime.
+"""OS-level sandbox for model-invoked tools.
 
-Generates a macOS seatbelt profile with deny-default reads. The profile
-is personalized per user — harness read paths come from the catalog at
-launch time. Only catalog-known harness directories + system paths are
-readable. Everything else (~/Documents, ~/.ssh, ~/.gnupg) is denied.
+Generates a macOS Seatbelt profile with deny-default access. The current
+user's home directory is readable so Syke can inspect computer evidence at
+its authoritative path. Ordinary home files remain non-writable.
 
-Write access is restricted to ~/.syke/ + workspace + temp dirs.
+Persistent write access is restricted to the supplied workspace and durable
+runtime subtree. Sessions, receipts, records, and recovery state remain
+read-only.
 Network is wide-open outbound (port filtering was tested but parked).
 
-For replay / benchmark: workspaces are placed under ~/.syke-lab/ so
-they fall outside ~/Documents (denied) and inside the workspace allow
-rule. Per-eval containment uses SYKE_SANDBOX_HARNESS_PATHS to replace
-the catalog's live harness paths with only the frozen slice directory.
+An internal environment override can replace the normal home read root for
+isolated external callers.
 """
 
 from __future__ import annotations
@@ -22,23 +21,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-from syke.observe.catalog import active_sources
-from syke.pi_state import get_pi_agent_dir
+from syke.config import user_control_dir
 from syke.runtime.child_env import child_temp_paths
 
 logger = logging.getLogger(__name__)
-
-# Directories that must never be readable, even if a broad allow
-# is accidentally added. Placed as explicit denies after all allows.
-_SENSITIVE_DIRS = [
-    ".ssh",
-    ".gnupg",
-    ".aws",
-    ".azure",
-    ".docker",
-    ".kube",
-    ".config/gcloud",
-]
 
 # System paths Node.js needs to start and run.
 _SYSTEM_READ_PATHS = [
@@ -56,13 +42,8 @@ _SYSTEM_READ_PATHS = [
 ]
 
 
-def _harness_read_paths(selected_sources: tuple[str, ...] | None = None) -> list[str]:
-    """Resolve read paths for the sandbox.
-
-    Default behavior is catalog-driven and reads the user's live harness roots.
-    For replay / benchmark isolation, `SYKE_SANDBOX_HARNESS_PATHS` can replace
-    the catalog entirely with an explicit os.pathsep-delimited allow-list.
-    """
+def sandbox_read_paths() -> tuple[str, ...]:
+    """Return the computer read roots configured for model-invoked tools."""
     override = os.environ.get("SYKE_SANDBOX_HARNESS_PATHS")
     if override is not None:
         paths: list[str] = []
@@ -78,24 +59,9 @@ def _harness_read_paths(selected_sources: tuple[str, ...] | None = None) -> list
             if expanded not in seen:
                 seen.add(expanded)
                 paths.append(expanded)
-        return paths
+        return tuple(paths)
 
-    selected_set = set(selected_sources) if selected_sources is not None else None
-
-    paths: list[str] = []
-    seen: set[str] = set()
-    for spec in active_sources():
-        if selected_set is not None and spec.source not in selected_set:
-            continue
-        for root in spec.discover.roots:
-            try:
-                expanded = str(Path(root.path).expanduser().resolve())
-            except OSError:
-                continue
-            if expanded not in seen:
-                seen.add(expanded)
-                paths.append(expanded)
-    return paths
+    return (str(Path.home().expanduser().resolve()),)
 
 
 def _parent_listing_paths(paths: list[str]) -> list[str]:
@@ -129,36 +95,31 @@ def _path_aliases(path: str) -> list[str]:
     return list(dict.fromkeys(aliases))
 
 
-def _pi_runtime_paths() -> list[str]:
-    """Paths Pi needs outside the workspace itself.
-
-    Pi binaries live under ~/.syke/bin and ~/.syke/pi, while auth/settings live
-    under the active Pi agent dir, which may be redirected via
-    SYKE_PI_AGENT_DIR for replay / benchmark isolation.
-    """
-    paths = [
-        str((Path.home() / ".syke" / "bin").resolve()),
-        str((Path.home() / ".syke" / "pi").resolve()),
-        str(get_pi_agent_dir()),
-    ]
+def _node_runtime_paths() -> list[str]:
+    """Runtime files needed by the sandboxed one-shot tool worker."""
+    node_link = Path.home() / ".syke" / "bin" / "node"
+    paths = [str(node_link.parent.resolve())]
+    if node_link.exists():
+        paths.append(str(node_link.resolve().parent.parent))
     return list(dict.fromkeys(paths))
 
 
-def _write_paths(
-    workspace_root: Path,
-    *,
-    temp_paths: list[str] | None = None,
-) -> list[str]:
-    """Paths the agent can write to."""
+def _protected_read_paths() -> list[str]:
+    """Syke control state available for inspection."""
+    return [str(user_control_dir("").resolve())]
+
+
+def _core_read_paths() -> list[str]:
+    """Installed Syke code available for self-inspection but never mutation."""
+    return [str(Path(__file__).resolve().parents[1])]
+
+
+def _write_paths(workspace_root: Path, runtime_root: Path) -> list[str]:
+    """Persistent paths the controller can write to."""
     workspace = str(workspace_root.expanduser().resolve())
-    paths = [
-        workspace,
-        *(temp_paths or child_temp_paths()),
-        "/dev",
-        *_pi_runtime_paths(),
-    ]
+    runtime = str(runtime_root.expanduser().resolve())
     aliased: list[str] = []
-    for p in paths:
+    for p in (workspace, runtime, "/dev"):
         aliased.extend(_path_aliases(p))
     return list(dict.fromkeys(aliased))
 
@@ -166,21 +127,52 @@ def _write_paths(
 def generate_seatbelt_profile(
     workspace_root: Path,
     *,
-    selected_sources: tuple[str, ...] | None = None,
+    control_root: Path | None = None,
+    runtime_root: Path | None = None,
     extra_temp_dirs: tuple[str, ...] | None = None,
 ) -> str:
-    """Generate a macOS seatbelt profile scoped to this user's harnesses.
+    """Generate a macOS Seatbelt profile for Syke's model tools.
 
     deny-default: everything is blocked unless explicitly allowed.
-    The workspace (which for replay lives under ~/.syke/replay/) is
-    readable and writable. Harness catalog paths are readable.
-    ~/.syke/ is readable and writable (Pi runtime + settings locks).
+    The user's home and protected Syke history are readable. Only the workspace
+    and control/runtime are writable.
     """
-    workspace = str(workspace_root.expanduser().resolve())
+    workspace_path = workspace_root.expanduser().resolve()
+    control_path = (
+        control_root.expanduser().resolve()
+        if control_root is not None
+        else Path(_protected_read_paths()[0])
+    )
+    runtime_path = (
+        runtime_root.expanduser().resolve()
+        if runtime_root is not None
+        else control_path / "runtime"
+    )
+    if runtime_path == control_path or not runtime_path.is_relative_to(control_path):
+        raise ValueError("Syke runtime must be inside the control boundary")
+    if (
+        workspace_path == control_path
+        or workspace_path.is_relative_to(control_path)
+        or control_path.is_relative_to(workspace_path)
+    ):
+        raise ValueError("Syke workspace and control boundaries must not overlap")
+
+    workspace = str(workspace_path)
     temp_paths = child_temp_paths(extra_temp_dirs=extra_temp_dirs)
 
-    harness_paths = _harness_read_paths(selected_sources=selected_sources)
-    all_scoped_paths = [workspace, *temp_paths] + harness_paths + _pi_runtime_paths()
+    model_read_paths = list(sandbox_read_paths())
+    protected_paths = [str(control_path)]
+    protected_write_paths = [
+        str(control_path / name) for name in ("sessions", "receipts", "records", "recovery")
+    ]
+    core_paths = _core_read_paths()
+    all_scoped_paths = (
+        [workspace, *temp_paths]
+        + model_read_paths
+        + _node_runtime_paths()
+        + core_paths
+        + protected_paths
+    )
     parent_paths = _parent_listing_paths(all_scoped_paths)
 
     lines: list[str] = []
@@ -219,7 +211,8 @@ def generate_seatbelt_profile(
         lines.append(f'(allow file-map-executable (subpath "{p}"))')
     lines.append("")
 
-    # Temp dirs (read + write)
+    # Temp dirs are readable. Durable Pi spill output is redirected into the
+    # separately writable runtime subtree below.
     lines.append("; Temp directories")
     for temp_path in temp_paths:
         for p in _path_aliases(temp_path):
@@ -233,30 +226,31 @@ def generate_seatbelt_profile(
         lines.append(f'(allow file-map-executable (subpath "{p}"))')
     lines.append("")
 
-    # Pi runtime — allow only the launcher/runtime dirs plus the active Pi
-    # agent dir, not the full ~/.syke tree.
-    lines.append("; Pi runtime (launcher + active Pi agent dir)")
-    for p in _pi_runtime_paths():
+    lines.append("; Node runtime for sandboxed tool workers")
+    for p in _node_runtime_paths():
         lines.append(f'(allow file-read* (subpath "{p}"))')
         lines.append(f'(allow file-map-executable (subpath "{p}"))')
-
-    # Resolve the node binary symlink to allow its real location.
-    node_bin = Path.home() / ".syke" / "bin" / "node"
-    if node_bin.is_symlink():
-        real_node_dir = str(node_bin.resolve().parent.parent)
-        lines.append(f"; Resolved node runtime ({real_node_dir})")
-        for p in _path_aliases(real_node_dir):
-            lines.append(f'(allow file-read* (subpath "{p}"))')
-            lines.append(f'(allow file-map-executable (subpath "{p}"))')
     lines.append("")
 
-    # Harness data — catalog-scoped, read only
-    if harness_paths:
-        lines.append("; Harness data — catalog-scoped, read only")
-        for p in harness_paths:
+    lines.append("; Installed Syke core — inspectable, never writable")
+    for p in core_paths:
+        for alias in _path_aliases(p):
+            lines.append(f'(allow file-read* (subpath "{alias}"))')
+    lines.append("")
+
+    # Computer evidence stays authoritative at its original path.
+    if model_read_paths:
+        lines.append("; Current user home — read only")
+        for p in model_read_paths:
             for alias in _path_aliases(p):
                 lines.append(f'(allow file-read* (subpath "{alias}"))')
         lines.append("")
+
+    lines.append("; Syke control state — inspectable; writes scoped below")
+    for p in protected_paths:
+        for alias in _path_aliases(p):
+            lines.append(f'(allow file-read* (subpath "{alias}"))')
+    lines.append("")
 
     # Parent directory traversal — literal (listing only, not content)
     lines.append("; Parent directory traversal (listing only)")
@@ -264,24 +258,21 @@ def generate_seatbelt_profile(
         lines.append(f'(allow file-read* (literal "{p}"))')
     lines.append("")
 
-    # Write access — workspace + active Pi agent dir + temp only
-    lines.append("; Write access — workspace + active Pi agent dir + temp only")
-    for p in _write_paths(workspace_root, temp_paths=temp_paths):
+    # Write access — controller-owned learned state plus operational runtime.
+    lines.append("; Write access — workspace and durable runtime")
+    for p in _write_paths(workspace_path, runtime_path):
         lines.append(f'(allow file-write* (subpath "{p}"))')
     lines.append("")
 
-    # Sensitive path denies — defense-in-depth.
-    home = str(Path.home())
-    lines.append("; Sensitive paths — explicit deny (defense-in-depth)")
-    for sensitive in _SENSITIVE_DIRS:
-        full = f"{home}/{sensitive}"
-        for alias in _path_aliases(full):
-            lines.append(f'(deny file-read* (subpath "{alias}"))')
+    lines.append("; Protected Syke evidence — explicit write deny")
+    for p in protected_write_paths:
+        for alias in _path_aliases(p):
+            lines.append(f'(deny file-write* (subpath "{alias}"))')
     lines.append("")
 
     logger.info(
-        "Sandbox profile: %d harness read paths, %d parent listing paths",
-        len(harness_paths),
+        "Sandbox profile: %d computer read roots, %d parent listing paths",
+        len(model_read_paths),
         len(parent_paths),
     )
     return "\n".join(lines)
@@ -294,10 +285,23 @@ def sandbox_available() -> bool:
     return Path("/usr/bin/sandbox-exec").exists()
 
 
+def sandbox_enabled() -> bool:
+    """Return whether Syke will apply its model-tool sandbox."""
+    return sandbox_available() and not os.environ.get("SYKE_DISABLE_SANDBOX")
+
+
+def sandbox_runtime_identity() -> str:
+    """Return the stable sandbox binding used for Pi runtime reuse."""
+    if not sandbox_enabled():
+        return "disabled"
+    return f"enabled:{os.pathsep.join(sandbox_read_paths())}"
+
+
 def write_sandbox_profile(
     workspace_root: Path,
     *,
-    selected_sources: tuple[str, ...] | None = None,
+    control_root: Path | None = None,
+    runtime_root: Path | None = None,
     extra_temp_dirs: tuple[str, ...] | None = None,
 ) -> Path | None:
     """Write the seatbelt profile to a unique temp file. Returns the path."""
@@ -305,7 +309,8 @@ def write_sandbox_profile(
         return None
     profile = generate_seatbelt_profile(
         workspace_root,
-        selected_sources=selected_sources,
+        control_root=control_root,
+        runtime_root=runtime_root,
         extra_temp_dirs=extra_temp_dirs,
     )
     fd, path_str = tempfile.mkstemp(suffix=".sb", prefix="syke-sandbox-")
@@ -314,8 +319,3 @@ def write_sandbox_profile(
     profile_path = Path(path_str)
     logger.info("Sandbox profile written to %s", profile_path)
     return profile_path
-
-
-def wrap_command(cmd: list[str], profile_path: Path) -> list[str]:
-    """Prepend sandbox-exec to a command."""
-    return ["/usr/bin/sandbox-exec", "-f", str(profile_path)] + cmd

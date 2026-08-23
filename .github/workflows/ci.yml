@@ -45,6 +45,10 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --extra dev --locked
+      - name: Seed stale-build canary
+        run: |
+          mkdir -p build/lib/syke
+          printf 'CANARY = True\n' > build/lib/syke/_stale_build_canary.py
       - run: uv run python -m build
       - run: uv run --with twine python -m twine check --strict dist/*
       - uses: actions/upload-artifact@v7

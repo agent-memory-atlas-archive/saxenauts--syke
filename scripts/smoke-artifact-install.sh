@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 /path/to/syke.whl-or-sdist" >&2
   exit 1
@@ -14,6 +16,8 @@ if [[ ! -f "$ARTIFACT_PATH" ]]; then
   echo "artifact not found: $ARTIFACT_PATH" >&2
   exit 1
 fi
+
+"$PYTHON_BIN" "$SCRIPT_DIR/check_artifact_contents.py" "$ARTIFACT_PATH"
 
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
@@ -118,12 +122,11 @@ assert skill_file.is_file(), "missing packaged synthesis skill"
 
 distribution_skill = files("syke.distribution").joinpath("SKILL.md")
 assert distribution_skill.is_file(), "missing packaged Syke distribution skill"
-assert "Node.js 20+ (22 LTS recommended)" in distribution_skill.read_text(encoding="utf-8")
+assert "Node.js 22.19 or newer" in distribution_skill.read_text(encoding="utf-8")
 
-from syke.observe.registry import HarnessRegistry
+from syke.observe.catalog import active_sources
 
-registry = HarnessRegistry()
-assert registry.active_harnesses(), "no active harnesses discovered from packaged Observe catalog"
+assert active_sources(), "no active harnesses discovered from packaged Observe catalog"
 PY
 
 echo "[smoke] artifact install passed"

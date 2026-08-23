@@ -149,10 +149,8 @@
   .mem-grid { padding: 18px 20px; display: grid; grid-template-columns: repeat(auto-fill, 28px); gap: 7px; overflow: auto; flex: 1 1 auto; min-height: 0; align-content: flex-start; }
   .mem-block { width: 28px; height: 28px; border-radius: 4px; cursor: pointer; transition: transform 0.12s, box-shadow 0.12s; }
   .mem-block:hover { transform: scale(1.18); z-index: 2; box-shadow: 0 4px 12px rgba(0,0,0,0.25); }
-  .mem-block.b-active { background: var(--mist); border: 1px solid var(--threshold); }
+  .mem-block.b-current { background: var(--mist); border: 1px solid var(--threshold); }
   .mem-block.b-linked { background: color-mix(in srgb, var(--link-tone) 30%, var(--mist)); border: 1px solid color-mix(in srgb, var(--link-tone) 60%, var(--threshold)); }
-  .mem-block.b-updated { background: color-mix(in srgb, var(--emergence) 42%, var(--mist)); border: 1px solid color-mix(in srgb, var(--emergence) 70%, var(--threshold)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--emergence) 18%, transparent); }
-  .mem-block.b-new { background: var(--anima); border: 1px solid var(--anima); box-shadow: 0 0 0 2px var(--shimmer); }
   /* "Related" — a cell linked to the currently-clicked one. Lights the
      edges of the local graph when the user inspects a memory. */
   .mem-block.b-related { outline: 2px solid var(--anima); outline-offset: 1px; box-shadow: 0 0 0 4px var(--shimmer); }
@@ -273,7 +271,7 @@
 
 <div class="tabs">
   <button class="tab active" data-tab="memex">Memex</button>
-  <button class="tab" data-tab="memory">Memory</button>
+  <button class="tab" data-tab="graph">Current graph</button>
   <button class="tab" data-tab="trace">Trace</button>
 </div>
 
@@ -286,7 +284,7 @@
   <div class="memex-doc" id="memex-doc"><div class="empty">Select an event from the timeline.</div></div>
 </div>
 
-<div id="tab-memory" class="tab-body mem-tab">
+<div id="tab-graph" class="tab-body mem-tab">
   <div class="memory-shell">
     <div class="mem-header">
       <div class="mem-stats" id="mem-stats"></div>
@@ -332,6 +330,8 @@ const S = {
   selected: null,     // event the slider window is parked on
   selectedIdx: -1,    // index into S.events for that event
   detail: null,       // /api/cycle/{id} or /api/ask/{id} payload
+  currentGraph: null, // /api/current-graph payload; independent of timeline selection
+  currentGraphError: null,
   tab: "memex",
   view: "content",
   theme: "dark",      // "dark" | "light"
@@ -346,7 +346,6 @@ const S = {
   detailCache: new Map(),
   detailPrefetching: new Set(),
   queuedDetail: null,
-  pendingMemoryInspectId: null,
   detailTimer: null,
   lastDetailStartAt: 0,
   lastArrowKeyAt: 0,
@@ -354,12 +353,10 @@ const S = {
   detailSeq: 0,
 };
 
-// With the filter on, show real MEMEX activity only. The backend separates
-// content movement from write/flag evidence so reconstructed row IDs do not
-// create fake movement.
+// With the filter on, show only cycles backed by an accepted MEMEX version.
 function eligible(ev) {
   return S.memexOnly
-    ? (ev && ev.kind === "cycle" && (ev.memex_moved || ev.memex_written))
+    ? (ev && ev.kind === "cycle" && ev.memex_moved)
     : true;
 }
 
@@ -458,7 +455,6 @@ const TIMELINE_CACHE_LIMIT = 5;
 const CURRENT_WINDOW_SNAP_MS = 5 * 60 * 1000;
 const SUMMARY_DETAIL_CACHE_LIMIT = 32;
 const SUMMARY_PREFETCH_RADIUS = 6;
-const MEMORY_PREFETCH_RADIUS = 3;
 const SCRUB_DETAIL_INTERVAL_MS = 120;
 const RAPID_KEY_MS = 140;
 
@@ -496,12 +492,10 @@ function rememberDetail(key, payload) {
 }
 
 function detailMode(summary) {
-  if (summary === "memory") return "memory";
   return summary ? "memex" : "full";
 }
 
 function detailSummaryForTab() {
-  if (S.tab === "memory") return "memory";
   if (S.tab === "trace") return false;
   return true;
 }
@@ -581,6 +575,16 @@ async function loadHealth() {
   }
 }
 
+async function loadCurrentGraph() {
+  try {
+    S.currentGraphError = null;
+    S.currentGraph = await api("/api/current-graph");
+  } catch (e) {
+    S.currentGraphError = e.message;
+  }
+  if (S.tab === "graph") renderCurrentGraph();
+}
+
 function applyTimelinePayload(d, opts = {}) {
   const previousId = opts.previousId || null;
   const previousKind = opts.previousKind || null;
@@ -653,10 +657,6 @@ function renderDetailError(message) {
   const html = `<div class="empty">Failed to load: ${esc(message)}</div>`;
   $("#memex-doc").innerHTML = html;
   $("#memex-info").innerHTML = "";
-  $("#mem-grid").innerHTML = html;
-  $("#mem-stats").innerHTML = "";
-  $("#mem-inspect").classList.remove("open");
-  $("#mem-inspect").innerHTML = "";
   $("#trace-doc").innerHTML = html;
   $("#trace-panel").innerHTML = `<div class="empty">No transcript loaded.</div>`;
 }
@@ -670,7 +670,6 @@ function detailMatchesEvent(detail, ev) {
 
 function detailPath(ev, summary) {
   const base = ev.kind === "cycle" ? `/api/cycle/${ev.id}` : `/api/ask/${ev.id}`;
-  if (summary === "memory") return `${base}?summary=memory`;
   return summary ? `${base}?summary=1` : base;
 }
 
@@ -707,8 +706,7 @@ function prefetchSummaryDetail(ev, summary) {
 
 function prefetchNearbySummaries(index, direction, summary) {
   if (!summary || !direction || index < 0) return;
-  const radius = summary === "memory" ? MEMORY_PREFETCH_RADIUS : SUMMARY_PREFETCH_RADIUS;
-  for (let offset = 1; offset <= radius; offset++) {
+  for (let offset = 1; offset <= SUMMARY_PREFETCH_RADIUS; offset++) {
     const idx = index + offset * direction;
     if (idx < 0 || idx >= S.events.length) break;
     if (!eligible(S.events[idx])) continue;
@@ -725,9 +723,7 @@ async function loadDetail(ev, opts = {}) {
   const controller = new AbortController();
   const seq = ++S.detailSeq;
   S.detailAbort = controller;
-  // Don't clear S.detail. Memex + Trace will repaint with the new payload
-  // when it arrives; Memory keeps the previous grid visible meanwhile so
-  // scrubbing through events doesn't flicker the constellation.
+  // Don't clear S.detail. Memex + Trace repaint when the new payload arrives.
   try {
     S.lastDetailStartAt = performance.now();
     const d = await api(detailPath(ev, summary), { signal: controller.signal });
@@ -780,16 +776,14 @@ function requestDetail(ev, opts = {}) {
 }
 
 function ensureFullDetailForActiveTab() {
-  if (!S.selected) return;
-  if (S.tab === "memex") {
-    if (!S.detail || S.detail.summary === "memory" || !detailMatchesEvent(S.detail, S.selected)) {
-      loadDetail(S.selected, { summary: true });
-    }
+  if (S.tab === "graph") {
+    if (!S.currentGraph && !S.currentGraphError) loadCurrentGraph();
     return;
   }
-  if (S.tab === "memory") {
-    if (!S.detail || S.detail.summary === true || !detailMatchesEvent(S.detail, S.selected)) {
-      loadDetail(S.selected, { summary: "memory" });
+  if (!S.selected) return;
+  if (S.tab === "memex") {
+    if (!S.detail || !detailMatchesEvent(S.detail, S.selected)) {
+      loadDetail(S.selected, { summary: true });
     }
     return;
   }
@@ -852,7 +846,6 @@ function colorForEvent(e) {
   if (e.status === "failed") return getCss("--fail");
   if (e.kind === "ask") return getCss("--ask");
   if (e.memex_moved) return getCss("--accent");
-  if (e.memex_written) return getCss("--ok");
   return getCss("--accent-dim");
 }
 
@@ -924,9 +917,8 @@ function drawTimeline() {
 
   // ─── Slider window ────────────────────────────────────────────────────
   // The rectangle outline around the currently-selected tick. This is what
-  // moves when the user presses ←/→ or clicks a different event. Everything
-  // else on the page (Memex / Memory / Trace tabs) reflects whatever event
-  // the slider window is parked on.
+  // moves when the user presses ←/→ or clicks a different event. MEMEX and
+  // Trace reflect the selected event; Current graph remains independent.
   if (S.selected) {
     const sel = positions.find(p => p.ev === S.selected);
     if (sel) {
@@ -962,17 +954,10 @@ tlCanvas.addEventListener("mousemove", (e) => {
     if (ev.kind === "cycle") {
       const memexState = ev.memex_moved
         ? "memex content moved"
-        : (ev.memex_written ? "memex written, content held" : "memex held");
+        : "memex held";
       label += `\n${memexState} · ${fmtDuration(ev.duration_ms)} · $${(ev.cost_usd || 0).toFixed(4)}`;
       if (ev.num_turns || ev.tool_calls_count) {
         label += `\n${ev.num_turns || 0} turns · ${ev.tool_calls_count || 0} tool calls`;
-      }
-      if (ev.memories_created || ev.memories_updated || ev.links_created) {
-        const parts = [];
-        if (ev.memories_created) parts.push(`+${ev.memories_created} mem`);
-        if (ev.memories_updated) parts.push(`~${ev.memories_updated} mem updated`);
-        if (ev.links_created) parts.push(`+${ev.links_created} link`);
-        label += `\n${parts.join(" · ")}`;
       }
       if (ev.model) label += `\n${ev.model}`;
     } else {
@@ -1008,7 +993,7 @@ window.addEventListener("resize", () => { drawTimeline(); });
 
 // ─── Tabs ──────────────────────────────────────────────────────────────────
 function setTab(name) {
-  if (!["memex", "memory", "trace"].includes(name)) return;
+  if (!["memex", "graph", "trace"].includes(name)) return;
   document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x.dataset.tab === name));
   document.querySelectorAll(".tab-body").forEach(x => x.classList.remove("active"));
   S.tab = name;
@@ -1071,7 +1056,7 @@ window.addEventListener("keydown", (e) => {
       }
       break;
     case "m": case "M": setTab("memex"); break;
-    case "y": case "Y": setTab("memory"); break;
+    case "g": case "G": setTab("graph"); break;
     case "t": case "T": setTab("trace"); break;
     case "l": case "L":
       S.log.open ? closeLog() : openLog();
@@ -1084,8 +1069,8 @@ window.addEventListener("keydown", (e) => {
 window.addEventListener("keyup", (e) => {
   if (e.key === "ArrowLeft" || e.key === "ArrowRight") flushQueuedDetail();
 });
-function prevTab(name) { return { memex: "trace", memory: "memex", trace: "memory" }[name] || "memex"; }
-function nextTab(name) { return { memex: "memory", memory: "trace", trace: "memex" }[name] || "memex"; }
+function prevTab(name) { return { memex: "trace", graph: "memex", trace: "graph" }[name] || "memex"; }
+function nextTab(name) { return { memex: "graph", graph: "trace", trace: "memex" }[name] || "memex"; }
 
 // ─── Memex tab ─────────────────────────────────────────────────────────────
 document.querySelectorAll(".toggle[data-view]").forEach(b => {
@@ -1182,7 +1167,7 @@ function renderFirstRunMemexState() {
     : (!hasSetupReceipt
     ? "This is the normal timeline view. It has no setup receipt, cycle, or MEMEX yet, so there is nothing real to draw."
     : (!hasSourceHistory
-    ? `Syke did not find local trace files from ${esc(sourcesLabel)}. New memories can still start from syke record and future harness activity.`
+    ? `Syke did not find local trace files from ${esc(sourcesLabel)}. Future synthesis can still learn from syke records and harness activity.`
     : (synthesisActive
       ? `Syke is stitching ${esc(totalFiles)} local trace files from ${esc(sourcesLabel)} into one durable memory chain. First bootstrap does a deeper survey; later cycles are cheaper.`
       : `Syke is ready to stitch ${esc(totalFiles)} local trace files from ${esc(sourcesLabel)} into one durable memory chain, but no synthesis worker is running from this page.`)));
@@ -1252,13 +1237,9 @@ function fmtCycleInfo(detail) {
   const tokOut = c.output_tokens || 0;
   const cacheR = c.cache_read_tokens || 0;
   const tokenBit = `${fmtTokens(tokIn)} in · ${fmtTokens(tokOut)} out${cacheR ? " · " + fmtTokens(cacheR) + " cache" : ""}`;
-  // Honesty: backend compares normalized MEMEX content. Row IDs can change
-  // during recovery without the visible MEMEX state moving.
   let memexNote = "";
   if (c.memex_moved) {
     memexNote = " · memex content moved";
-  } else if (c.memex_written) {
-    memexNote = ` · <span style="color:var(--ok)">memex written, content held</span>`;
   } else {
     memexNote = " · memex held";
   }
@@ -1317,72 +1298,48 @@ function renderMemex() {
   }
 }
 
-// ─── Memory tab — stable across event navigation ──────────────────────────
-// Always shows the memory grid as of the selected event's moment. For asks
-// we still show what was active when the question came in. Empty only on
-// genuine first-load (no event selected at all).
-function renderMemory() {
+// ─── Current graph tab — independent of event navigation ──────────────────
+function renderCurrentGraph() {
   const grid = $("#mem-grid");
   const stats = $("#mem-stats");
   const inspect = $("#mem-inspect");
   inspect.classList.remove("open");
-  if (!S.detail) {
-    if (!S.selected) {
-      stats.innerHTML = "";
-      grid.innerHTML = `<div class="empty">Select an event from the timeline.</div>`;
-    }
-    // Otherwise: keep the previous grid visible while the next detail loads.
-    // No flicker.
+  if (S.currentGraphError) {
+    stats.innerHTML = "";
+    grid.innerHTML = `<div class="empty">Failed to load current graph: ${esc(S.currentGraphError)}</div>`;
     return;
   }
-  if (S.detail.summary === true) {
-    stats.innerHTML = "loading full memory snapshot…";
-    grid.innerHTML = `<div class="empty">Loading full memory snapshot for this event.</div>`;
+  if (!S.currentGraph) {
+    stats.innerHTML = "loading current graph…";
+    grid.innerHTML = `<div class="empty">Loading current graph.</div>`;
     return;
   }
-  const memorySummary = S.detail.summary === "memory";
-  const mems = S.detail.memories || [];
-  const links = S.detail.links || [];
+  if (!S.currentGraph.db_present) {
+    stats.innerHTML = "";
+    grid.innerHTML = `<div class="empty">Current graph is not available yet.</div>`;
+    return;
+  }
+  const mems = S.currentGraph.memories || [];
+  const links = S.currentGraph.links || [];
   const linkedIds = new Set();
   for (const l of links) { linkedIds.add(l.source_id); linkedIds.add(l.target_id); }
 
-  // "New/updated this cycle" is timestamp-derived from durable memory rows.
-  let isNew = () => false;
-  let isUpdated = () => false;
-  if (S.detail.kind === "cycle" && S.detail.cycle) {
-    const cycleEnd = S.detail.cycle.completed_at || S.detail.cycle.started_at;
-    const cycleStart = S.detail.cycle.started_at;
-    isNew = m => m.created_at && m.created_at >= cycleStart && m.created_at <= cycleEnd;
-    isUpdated = m => m.updated_at && m.updated_at >= cycleStart && m.updated_at <= cycleEnd;
-  }
-
   const blocks = mems.map(m => ({
     ...m,
-    isNew: isNew(m),
-    isUpdated: isUpdated(m),
     hasLinks: linkedIds.has(m.id),
   }));
 
-  const newCount = blocks.filter(b => b.isNew).length;
-  const updatedCount = blocks.filter(b => b.isUpdated).length;
   const linkedCount = blocks.filter(b => b.hasLinks).length;
   stats.innerHTML = `
-    <span><strong>${blocks.length}</strong> active at boundary</span>
-    <span><strong>${linkedCount}</strong> linked</span>
-    ${newCount ? `<span><strong>${newCount}</strong> new this cycle</span>` : ""}
-    ${updatedCount ? `<span><strong>${updatedCount}</strong> updated this cycle</span>` : ""}
-    <span><strong>${links.length}</strong> total links</span>
+    <span><strong>${blocks.length}</strong> current memories</span>
+    <span><strong>${linkedCount}</strong> linked memories</span>
+    <span><strong>${links.length}</strong> current links</span>
+    <span>loaded ${esc(fmtTime(S.currentGraph.as_of))}</span>
   `;
 
   grid.innerHTML = blocks.map(b => {
-    let cls = "b-active";
-    if (b.isNew) cls = "b-new";
-    else if (b.isUpdated) cls = "b-updated";
-    else if (b.hasLinks) cls = "b-linked";
-    const markers = [];
-    if (b.isNew) markers.push("new this cycle");
-    if (b.isUpdated) markers.push("updated this cycle");
-    return `<div class="mem-block ${cls}" data-id="${esc(b.id)}" title="${esc([...markers, (b.content||'').slice(0,140)].filter(Boolean).join(" · "))}"></div>`;
+    const cls = b.hasLinks ? "b-linked" : "b-current";
+    return `<div class="mem-block ${cls}" data-id="${esc(b.id)}" title="${esc((b.content||'').slice(0,140))}"></div>`;
   }).join("");
 
   const memById = new Map(mems.map(m => [m.id, m]));
@@ -1390,22 +1347,13 @@ function renderMemory() {
   function openMemoryInspect(id, block) {
     const m = memById.get(id);
     if (!m) return;
-    if (memorySummary && S.selected) {
-      S.pendingMemoryInspectId = id;
-      inspect.innerHTML = `<div class="empty">Loading full memory content…</div>`;
-      inspect.classList.add("open");
-      loadDetail(S.selected, { summary: false });
-      return;
-    }
     // Reset selection + related-link highlights from any previous click.
     grid.querySelectorAll(".mem-block.selected, .mem-block.b-related").forEach(b => {
       b.classList.remove("selected");
       b.classList.remove("b-related");
     });
     block.classList.add("selected");
-    // Walk links → find every memory that touches this one. Then light
-    // their cells. This surfaces the local graph: the "neighborhood" of
-    // the clicked memory at this moment.
+    // Walk links and light this memory's neighborhood in the current graph.
     const memLinks = links.filter(l => l.source_id === id || l.target_id === id);
     const relatedIds = new Set();
     for (const l of memLinks) {
@@ -1437,14 +1385,6 @@ function renderMemory() {
     openMemoryInspect(block.dataset.id, block);
   };
 
-  if (!memorySummary && S.pendingMemoryInspectId) {
-    const pendingId = S.pendingMemoryInspectId;
-    S.pendingMemoryInspectId = null;
-    requestAnimationFrame(() => {
-      const block = grid.querySelector(`.mem-block[data-id="${CSS.escape(pendingId)}"]`);
-      if (block) openMemoryInspect(pendingId, block);
-    });
-  }
 }
 
 // ─── Trace tab ─────────────────────────────────────────────────────────────
@@ -1604,7 +1544,7 @@ function renderDiff(diff) {
 function renderAll() {
   drawTimeline();
   if (S.tab === "memex") renderMemex();
-  else if (S.tab === "memory") renderMemory();
+  else if (S.tab === "graph") renderCurrentGraph();
   else if (S.tab === "trace") renderTrace();
 }
 
@@ -1701,8 +1641,9 @@ $("#btn-memex-only").addEventListener("click", () => {
 // ─── Boot ──────────────────────────────────────────────────────────────────
 async function boot() {
   await loadHealth();
-  await loadTimeline({ hydrateFirst: true });
+  await Promise.all([loadCurrentGraph(), loadTimeline({ hydrateFirst: true })]);
   setInterval(loadHealth, 15000);
+  setInterval(loadCurrentGraph, 30000);
   setInterval(() => { if (S.isToday) refreshTimelinePreservingSelection(); }, 30000);
 }
 

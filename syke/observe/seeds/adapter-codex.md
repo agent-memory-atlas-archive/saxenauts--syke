@@ -1,6 +1,6 @@
 # codex
 
-Codex is OpenAI's CLI agent for code. It runs in a terminal, accepts natural-language prompts, and executes tool calls including shell commands, file operations, web searches, and computer-use actions. Sessions are stored as JSONL rollout files. A SQLite state database tracks session metadata and thread state. Sessions can fork from other sessions and spawn subagent threads.
+Codex stores conversations as JSONL rollouts and thread metadata in SQLite. Sessions can fork or spawn subagent threads.
 
 ## Where
 
@@ -8,6 +8,7 @@ Codex is OpenAI's CLI agent for code. It runs in a terminal, accepts natural-lan
 ~/.codex/**/*.jsonl
 ~/.codex/**/*.db
 ~/.codex/**/*.sqlite
+~/.codex/memories/**/*.md
 ~/.codex/config.toml
 ```
 
@@ -23,27 +24,11 @@ Additional data sources:
 - `config.toml` -- may contain a `sqlite_home` key pointing to an alternate SQLite directory
 - The `CODEX_SQLITE_HOME` environment variable can override the SQLite location
 
-The adapter also checks `~/.codex/sqlite/` as a default SQLite home.
-
-### Oh-My-Codex (OMX) paths
-
-When codex runs through oh-my-codex (OMX), session data is stored in **project-local** directories instead of `~/.codex/`:
-
-```
-{project}/.omx/logs/turns-YYYY-MM-DD.jsonl    -- per-day turn logs
-{project}/.omx/logs/tmux-hook-YYYY-MM-DD.jsonl -- tmux integration logs
-{project}/.omx/state/sessions/omx-{ts}-{id}/   -- per-session state (AGENTS.md, plan-state.json, etc.)
-```
-
-Also check:
-- `~/.codex-omx/sessions/` -- OMX-managed rollout JSONL files (same format as `~/.codex/sessions/`)
-- `~/.codex-omx/state/` -- OMX global state
-
-OMX sessions may not appear in `~/.codex/state_5.sqlite` threads table. Check the `.omx/logs/` turn files for the most recent activity when `~/.codex/` looks stale.
+Also check `~/.codex/sqlite/` as a default SQLite home.
 
 ## Sessions
 
-One JSONL file equals one session (called a "rollout"). The session ID is extracted from the filename: the adapter looks for a UUID-like pattern (`[0-9a-f]{8,}` with hyphen-separated groups) at the end of the stem.
+One JSONL file equals one session (a "rollout"). Its filename stem ends with the session UUID.
 
 Sessions can have parent-child relationships:
 
@@ -131,8 +116,11 @@ Query example:
 ```sql
 SELECT id, rollout_path, cwd, model, title, created_at, updated_at
 FROM threads
-ORDER BY updated_at DESC;
+ORDER BY updated_at DESC
+LIMIT 20;
 ```
+
+For current work, prefer `updated_at` over `created_at`; both are epoch seconds in the observed schema. After selecting a thread, open its `rollout_path`: the thread row identifies the session but does not contain the conversation.
 
 ### Metadata
 
@@ -144,18 +132,21 @@ Per-session metadata from the session meta record and state DB:
 - All `threads` table columns listed above from state DB
 - `source` object containing subagent spawn information
 
-## What sessions contain
+## Project instructions
 
-Each session records a multi-turn conversation between the user and Codex. This includes: user prompts, assistant text responses and reasoning traces, function calls (shell commands, file operations), web searches, computer-use actions, tool outputs and errors, and session forking/subagent relationships. Archived sessions retain the same format.
+Codex loads `~/.codex/AGENTS.md` and applicable `AGENTS.md` files from the project hierarchy. `AGENTS.override.md` at the project or user level takes priority.
+
+Rollouts may serialize injected `<INSTRUCTIONS>` and `<environment_context>` blocks as `role: "user"` messages. They are harness context, not the person's request. Embedded blocks describe that session; current files describe the project now.
 
 ## Harness memory
 
-Codex reads context from these sources:
+When the Codex `memories` feature is enabled, retained context lives under `~/.codex/memories/`:
 
-- `AGENTS.md` in the project root (project-level instructions, injected into system prompt)
-- `AGENTS.override.md` in the project root or `~/.codex/` (takes priority over AGENTS.md)
-- `~/.codex/config.toml` (global configuration)
-- `.codex/config.toml` (project-level config override)
+- `MEMORY.md` groups durable task and project understanding.
+- `memory_summary.md` is a shorter index over retained topics.
+- `rollout_summaries/*.md` contains source-session summaries referenced by the indexes.
+
+These files are Codex-generated memory, not native session evidence. Follow their rollout paths or thread IDs when the underlying conversation matters.
 
 ## Distribution
 

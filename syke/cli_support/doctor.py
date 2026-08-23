@@ -22,7 +22,6 @@ from syke.runtime.locator import (
     resolve_background_syke_runtime,
     resolve_syke_runtime,
 )
-from syke.trace_store import trace_store_status
 
 
 def network_probe_payload(ctx) -> dict[str, object]:
@@ -82,7 +81,12 @@ def network_probe_payload(ctx) -> dict[str, object]:
     }
 
 
-def build_doctor_payload(ctx, *, network: bool) -> dict[str, object]:
+def build_doctor_payload(
+    ctx,
+    *,
+    network: bool,
+    verify_filesystem: bool = False,
+) -> dict[str, object]:
     from syke.config import user_syke_db_path
 
     user_id = ctx.obj["user"]
@@ -176,6 +180,27 @@ def build_doctor_payload(ctx, *, network: bool) -> dict[str, object]:
     except Exception as exc:
         _add_check("launcher", "Launcher", False, f"{SYKE_BIN}: {exc}", launcher=str(SYKE_BIN))
 
+    from syke.runtime.macos_filesystem_access import (
+        macos_filesystem_access_status,
+        run_macos_filesystem_access_check,
+    )
+
+    filesystem_access = (
+        run_macos_filesystem_access_check(user_id)
+        if verify_filesystem
+        else macos_filesystem_access_status()
+    )
+    if filesystem_access.get("applicable"):
+        _add_check(
+            "protected_folders",
+            "Protected folders",
+            bool(filesystem_access.get("ok")),
+            cast(str, filesystem_access.get("detail") or "not checked"),
+            status=filesystem_access.get("status"),
+            folders=filesystem_access.get("folders"),
+            checked_at=filesystem_access.get("checked_at"),
+        )
+
     syke_db_path = user_syke_db_path(user_id)
     has_syke_db = syke_db_path.exists()
     has_db = has_syke_db
@@ -214,14 +239,6 @@ def build_doctor_payload(ctx, *, network: bool) -> dict[str, object]:
         **{k: v for k, v in ipc.items() if k not in {"ok", "detail"}},
     )
 
-    trace_status = trace_store_status(user_id)
-    _add_check(
-        "trace_store",
-        "Rollout traces",
-        bool(trace_status["ok"]),
-        cast(str, trace_status["detail"]),
-    )
-
     metrics_status = runtime_metrics_status(user_id)
     file_logging = metrics_status["file_logging"]
     _add_check(
@@ -231,13 +248,13 @@ def build_doctor_payload(ctx, *, network: bool) -> dict[str, object]:
         cast(str, file_logging["detail"]),
         **{k: v for k, v in file_logging.items() if k not in {"ok", "detail"}},
     )
-    trace_store = metrics_status["trace_store"]
+    session_history = metrics_status["session_history"]
     _add_check(
-        "trace_store_runtime",
-        "Trace store runtime",
-        bool(trace_store["ok"]),
-        cast(str, trace_store["detail"]),
-        **{k: v for k, v in trace_store.items() if k not in {"ok", "detail"}},
+        "session_history",
+        "Native Pi session history",
+        bool(session_history["ok"]),
+        cast(str, session_history["detail"]),
+        **{k: v for k, v in session_history.items() if k not in {"ok", "detail"}},
     )
 
     # Harness accessibility — detect TCC or permission blocks
@@ -265,16 +282,15 @@ def build_doctor_payload(ctx, *, network: bool) -> dict[str, object]:
     if has_db:
         db = get_db(user_id)
         try:
-            memory_count = db.count_memories(user_id, active_only=True)
-            payload["memories"] = memory_count
             mh = _mem_h(db, user_id)
+            payload["memories"] = mh["memories"]
             _add_check(
                 "graph",
                 "Graph",
-                mh["assessment"] in ("healthy", "dense"),
+                True,
                 (
-                    f"{mh['active']} active, {mh['links']} links, "
-                    f"{mh['orphan_pct']}% orphaned ({mh['assessment']})"
+                    f"{mh['memories']} current memories, {mh['links']} current links, "
+                    f"{mh['unlinked_pct']}% unlinked"
                 ),
                 assessment=mh["assessment"],
             )
@@ -298,21 +314,12 @@ def build_doctor_payload(ctx, *, network: bool) -> dict[str, object]:
             )
 
             ev = _evo_trends(db, user_id)
-            evolution_label = f"Evolution ({ev['days']}d)"
-            _add_check(
-                "evolution",
-                evolution_label,
-                ev["assessment"] != "dormant",
-                f"+{ev['created']} created, -{ev['superseded']} superseded ({ev['assessment']})",
-                assessment=ev["assessment"],
-                days=ev["days"],
-            )
 
             payload["memory_health"] = {
                 "graph": mh,
                 "synthesis": sh,
                 "memex": mx,
-                "evolution": ev,
+                "accepted_changes": ev,
             }
         finally:
             db.close()
@@ -354,11 +361,11 @@ def render_doctor_payload(payload: dict[str, object], *, network: bool) -> None:
         "pi_cold_start",
         "cli_runtime",
         "launcher",
+        "protected_folders",
         "syke_db",
         "daemon",
         "daemon_ipc",
-        "trace_store",
-        "trace_store_runtime",
+        "session_history",
         "file_logging",
         "harness_access",
     ):

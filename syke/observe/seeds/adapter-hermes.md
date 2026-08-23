@@ -1,25 +1,17 @@
 # hermes
 
-Hermes is a terminal-based AI coding agent. It runs as a CLI tool, accepts natural-language prompts, and executes tool calls for code editing, shell commands, and file operations. Session data is stored in a SQLite database and optionally as JSON session files and request dump files. Sessions can have parent-child relationships.
+Hermes stores session history in SQLite, with JSON session exports and request dumps as secondary sources. Sessions can have parent-child relationships.
 
 ## Where
 
 ```
 ~/.hermes/state.db
 ~/.hermes/sessions/*.json
+~/.hermes/SOUL.md
+~/.hermes/memories/*.md
 ```
 
-The adapter discovers three file types:
-
-- `state.db` -- SQLite database (primary, preferred over JSON files)
-- `session_YYYYMMDD_HHMMSS_<hex>.json` -- session JSON export files
-- `request_dump_YYYYMMDD_HHMMSS_<hex>_*.json` -- raw API request dumps
-
-Session filename patterns (regex):
-- Session files: `^session_(?P<session_id>\d{8}_\d{6}_[0-9a-f]+)\.json$`
-- Request dumps: `^request_dump_(?P<session_id>\d{8}_\d{6}_[0-9a-f]+)_.+\.json$`
-
-When both `state.db` and JSON files exist, the database is preferred. JSON files serve as fallback or supplementary data.
+Use `state.db` as the primary source. Files named `session_*.json` are exports; `request_dump_*.json` files are supplementary error/request snapshots.
 
 ## Sessions
 
@@ -30,8 +22,6 @@ When both `state.db` and JSON files exist, the database is preferred. JSON files
 **From request dump files**: One file equals one session snapshot. Contains the raw API request body including the message history at that point in time. The `session_id` field or filename pattern provides the ID.
 
 Parent-child relationships are tracked via `parent_session_id` in the sessions table.
-
-Deduplication: if the same session ID is encountered from multiple sources, only the first occurrence is kept (database results are processed first).
 
 ## Format
 
@@ -182,27 +172,31 @@ Per turn: `source_message_id`, `finish_reason`, `token_count`.
 
 Query example to list recent sessions:
 ```sql
-SELECT id, title, model, started_at, ended_at, message_count,
-       input_tokens, output_tokens, estimated_cost_usd
-FROM sessions
-ORDER BY started_at DESC
+SELECT s.id, s.title, s.model, s.started_at, s.ended_at,
+       s.message_count, MAX(m.timestamp) AS latest_message_at
+FROM sessions s
+LEFT JOIN messages m ON m.session_id = s.id
+GROUP BY s.id
+ORDER BY COALESCE(MAX(m.timestamp), s.ended_at, s.started_at) DESC
 LIMIT 20;
 ```
 
-## What sessions contain
+Titles, user IDs, and accounting fields may be null or zero. Select current work by latest message time when possible, then read the session's `messages`; the session row is metadata.
 
-Each session records a multi-turn conversation between the user and the Hermes agent. This includes: user prompts, assistant text responses and reasoning traces (including detailed reasoning and Codex-format reasoning), tool calls with function names and arguments, tool results with output and error states, and session-level cost and token accounting.
+## Project instructions
+
+Hermes uses `AGENTS.md` in the project root for project instructions. Resolve the project from the session and its tool activity before opening the current file. The session row's `system_prompt` is historical evidence of the composed instructions that session received; the current `AGENTS.md` may have changed.
 
 ## Harness memory
 
-Hermes reads context and configuration from these sources:
+For the active `HERMES_HOME` profile, Hermes represents retained context through:
 
-- `~/.hermes/config.yaml` (main configuration)
-- `~/.hermes/memories/` (persistent memory directory)
-- `~/.hermes/skills/` (skills directory)
-- `~/.hermes/hooks/` (hooks for automated behaviors)
-- `AGENTS.md` in the project root (project instructions)
-- Profile support with isolated `HERMES_HOME` directories for separate configurations
+- `SOUL.md` for agent identity and behavior
+- `memories/USER.md` for retained user profile and directives
+- `memories/MEMORY.md` for durable facts, decisions, and context
+- the configured external memory provider, when one is enabled in `config.yaml`
+
+`config.yaml`, skills, and hooks configure behavior but are not memory. Profile-specific paths must be resolved against the session's `HERMES_HOME` rather than assumed to be `~/.hermes`.
 
 ## Distribution
 

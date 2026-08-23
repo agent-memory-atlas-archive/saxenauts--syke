@@ -13,7 +13,9 @@ syke auth set openai --api-key <key> --model gpt-5.4 --use
 syke auth status
 ```
 
-`syke auth set` stores Pi-native credentials and config under `~/.syke/pi-agent/`. Add `--use` when you want that provider to become active immediately.
+`syke auth set` stores Pi-native credentials and config under
+`~/.syke/pi-agent/`. Add `--use` when you want that provider
+to become active immediately.
 
 ---
 
@@ -21,7 +23,9 @@ syke auth status
 
 Syke runs on Pi.
 
-Pi is the only runtime. Syke reads Pi's provider/model reality from the live Pi catalog and launches the Pi runtime with Syke-owned Pi state under `~/.syke/pi-agent/`.
+Pi is the only runtime. Syke reads Pi's provider/model reality from the live Pi
+catalog and launches Pi with host-managed provider state under
+`~/.syke/pi-agent/`.
 
 ---
 
@@ -38,7 +42,8 @@ Source: `syke/llm/env.py::resolve_provider()`.
 Important:
 
 - `--provider` and `SYKE_PROVIDER` are per-process routing overrides.
-- The daemon-safe active provider path is persisted Pi-owned state under `~/.syke/pi-agent/`.
+- The daemon-safe active provider path is persisted Pi-owned state under
+  `~/.syke/pi-agent/`.
 - `syke auth set ... --use`, `syke auth login ... --use`, `syke auth use`, and `syke setup` are the supported ways to set that active state.
 
 ---
@@ -73,8 +78,6 @@ Storage details:
 - All credential and provider mutations are audit-logged to `~/.config/syke/pi-state-audit.log` (override with `SYKE_PI_STATE_AUDIT_PATH`).
 - The Pi agent state directory can be overridden with `SYKE_PI_AGENT_DIR`.
 - `syke status` and `syke auth status` show the resolved selection source, auth source, model source, and endpoint source so users can see exactly what will run.
-
-Legacy migration: If you previously used Pi with credentials stored in `~/.pi/agent/`, Syke automatically migrates `auth.json`, `settings.json`, and `models.json` to `~/.syke/pi-agent/` on first access. This is a one-time migration logged in the audit trail.
 
 Source: `syke/pi_state.py`, `syke/cli_support/providers.py`, `syke/llm/env.py`.
 

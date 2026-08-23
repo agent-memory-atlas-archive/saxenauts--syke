@@ -2,7 +2,96 @@
 
 All notable changes to Syke are documented here.
 
-## [Unreleased]
+## [0.6.0] - 2026-08-23
+
+This release makes Syke's current authority model explicit: one mutable graph,
+protected operational evidence, native Pi sessions, and host-controlled
+acceptance and recovery. It deliberately drops historical compatibility rather
+than carrying ambiguous state into the pre-1.0 runtime.
+
+### Breaking
+
+- Syke now accepts only the exact schema-v3 current graph. Databases from older
+  public releases and retired workspace layouts are rejected rather than
+  migrated automatically. Existing users must preserve or export old state and
+  start with the current layout.
+- Removed legacy flat-workspace, Pi-state, history-database, signal, cron, and
+  nested-adapter compatibility paths. Linux background service support
+  is now the user `systemd` service; other non-macOS platforms use the foreground
+  daemon path.
+- Removed the retired consumer Gemini CLI harness, its seed adapter, and its
+  legacy capability target. Persisted source selections containing `gemini-cli`
+  now fail closed and must be replaced with a current harness selection.
+
+### Memory And Authority
+
+- Changed `syke record` from a direct graph-memory write into an append-only
+  protected record. Synthesis receives a bounded chronological batch, and only
+  an accepted synthesis acknowledges exact record IDs.
+- Made `workspace/syke.db` the only active semantic/control database. Current
+  memories retain stable identities, MEMEX history remains immutable, and graph
+  replacement or rollback is checked before atomic acceptance.
+- Added one bounded self-editable language surface, the `syke-learned` memory
+  row. Valid learned language survives accepted turns and interrupted-cycle
+  recovery without creating a second policy or history store.
+- Added host-composed self-observation so each fresh operation sees current
+  graph condition, resource pressure, recent protected evidence, and the
+  authoritative wall-clock context.
+
+### Runtime And Safety
+
+- Put native Pi ask and synthesis sessions directly under protected
+  `control/sessions/`; removed the duplicate `rollout_traces` table,
+  persistence module, transcript reconstruction, and fuzzy timestamp joins.
+- Made synthesis a fail-closed transition around recovery points, semantic
+  validation, record acknowledgement, MEMEX projection, and one immutable final
+  receipt. Foreground Ask remains a direct-answer operation and does not enter
+  the synthesis acceptance gate.
+- Restricted model-invoked tools on macOS to a trusted sandbox broker. Ordinary
+  files under the user's home are readable but read-only; writes are limited to
+  `workspace/` and `control/runtime/`, while sessions, receipts, records, and
+  recovery state remain protected.
+- Added setup-time macOS protected-folder checks through the installed
+  background runtime, including stale-runtime detection after Python or Node
+  replacement.
+- Hardened daemon IPC ownership, bounded concurrent handlers, busy rejection,
+  child cleanup, and wall-clock deadlines that remain correct across system
+  sleep.
+
+### Setup And Operations
+
+- Added Pi coding-agent history as an active source through its default JSONL
+  session tree. The source guide preserves branch/compaction ancestry, treats
+  child-agent output as a proposal until accepted, excludes Syke's own
+  protected Pi runtime sessions from external observation, and registers the
+  Syke capability in Pi's native `~/.pi/agent/skills` directory.
+- Expanded the existing Antigravity source across Google Antigravity 2.0, CLI,
+  and IDE roots. Current compact transcripts preserve forks, asynchronous
+  subagents, partial appends, and parent/user authority; capability registration
+  now includes Antigravity CLI's native skill directory.
+- Made `syke setup --json` inspection non-mutating and aligned declared write
+  targets with the actual capability installer.
+- Made source selection, onboarding state, and provider/model activation atomic;
+  onboarding intent is persisted before background synthesis can start.
+- Added strict config type/range validation and made install, self-update, and
+  daemon restoration failures return truthful nonzero outcomes.
+- Reduced managed daemon implementations to launchd and user systemd and made
+  process-plus-IPC readiness the success condition.
+- Kept history-backed diagnostics responsive as native session history grows:
+  daemon status now reads the latest synthesis receipt directly, and
+  `syke cost --days N` opens only sessions in the requested time window.
+
+### Removed And Simplified
+
+- Removed shipped replay-judge/benchmark machinery, dead config fields, stale
+  migration helpers, and old graph/receipt narratives. Replay and evaluation
+  remain in the separate replay-lab repository.
+- Replaced repeated artifact builds and historical release-test lists with one
+  deterministic suite, strict live/platform layers, and checks against the
+  exact wheel and sdist built for release.
+- Deleted redundant mock, wording, permutation, web, RPC, sandbox, graph, MEMEX,
+  installer, and daemon tests while retaining the primary safety and outcome
+  proofs.
 
 ## [0.5.10] - 2026-06-06
 

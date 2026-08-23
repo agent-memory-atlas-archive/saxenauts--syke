@@ -79,6 +79,18 @@ def _has_request_auth_config(provider_id: str) -> bool:
     )
 
 
+def provider_endpoint_configured(provider_id: str) -> bool:
+    if get_provider_base_url(provider_id):
+        return True
+    if provider_id == "azure-openai-responses":
+        return bool(
+            os.getenv("AZURE_OPENAI_ENDPOINT")
+            or os.getenv("AZURE_OPENAI_BASE_URL")
+            or os.getenv("AZURE_OPENAI_RESOURCE_NAME")
+        )
+    return False
+
+
 def evaluate_provider_readiness(provider_id: str) -> ProviderReadiness:
     """Return whether a provider is ready to be marked active and why."""
     catalog = _catalog_by_id()
@@ -95,7 +107,9 @@ def evaluate_provider_readiness(provider_id: str) -> ProviderReadiness:
     has_oauth = _has_oauth_credential(provider_id)
     has_request_auth = _has_request_auth_config(provider_id)
 
-    if bool(getattr(entry, "requires_base_url", False)) and not get_provider_base_url(provider_id):
+    if bool(getattr(entry, "requires_base_url", False)) and not provider_endpoint_configured(
+        provider_id
+    ):
         return ProviderReadiness(
             provider_id,
             False,

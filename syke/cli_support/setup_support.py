@@ -7,15 +7,11 @@ from typing import cast
 
 import click
 
-from syke.cli_support.context import observe_registry
 from syke.cli_support.daemon_state import daemon_payload
 from syke.cli_support.providers import provider_payload
-from syke.cli_support.render import (
-    SetupStatus,
-    console,
-    render_setup_line,
-)
+from syke.cli_support.render import SetupStatus, console
 from syke.config import user_syke_db_path
+from syke.observe.catalog import active_sources
 
 
 def run_setup_stage(label: str, fn):
@@ -23,44 +19,45 @@ def run_setup_stage(label: str, fn):
         return fn()
 
 
-def render_setup_source_result(source: str, status: str, detail: str | None = None) -> None:
-    render_setup_line(source, status, detail=detail)
-
-
 def trust_payload(user_id: str) -> dict[str, list[dict[str, str]]]:
     import platform
 
-    from syke.config import CODEX_GLOBAL_AGENTS, SKILLS_DIRS, user_data_dir
     from syke.daemon.daemon import LOG_PATH, PLIST_PATH, SYSTEMD_UNIT_PATH
+    from syke.distribution.context_files import capability_target_paths
     from syke.pi_state import (
         get_pi_agent_dir,
         get_pi_auth_path,
         get_pi_models_path,
         get_pi_settings_path,
     )
+    from syke.runtime import workspace as workspace_module
+    from syke.runtime.locator import SYKE_BIN
 
     sources: list[dict[str, str]] = []
-    registry = observe_registry(user_id)
-    for desc in registry.active_harnesses():
+    for desc in active_sources():
         if desc.discover is None:
             continue
         for root in desc.discover.roots:
             sources.append({"source": desc.source, "path": str(Path(root.path).expanduser())})
 
     targets: list[dict[str, str]] = [
-        {"kind": "user_data", "path": str(user_data_dir(user_id))},
-        {"kind": "workspace", "path": str(Path.home() / ".syke")},
+        {"kind": "user_data", "path": str(workspace_module.SYKE_ROOT)},
+        {"kind": "workspace", "path": str(workspace_module.WORKSPACE_ROOT)},
+        {"kind": "control", "path": str(workspace_module.CONTROL_ROOT)},
+        {"kind": "native_sessions", "path": str(workspace_module.SESSIONS_DIR)},
+        {"kind": "host_receipts", "path": str(workspace_module.RECEIPTS_DIR)},
+        {"kind": "incoming_records", "path": str(workspace_module.RECORDS_DIR)},
         {"kind": "pi_agent_dir", "path": str(get_pi_agent_dir())},
         {"kind": "pi_auth", "path": str(get_pi_auth_path())},
         {"kind": "pi_settings", "path": str(get_pi_settings_path())},
         {"kind": "pi_models", "path": str(get_pi_models_path())},
-        {"kind": "launcher", "path": str(Path.home() / ".syke" / "bin" / "syke")},
+        {"kind": "launcher", "path": str(SYKE_BIN)},
         {"kind": "daemon_log", "path": str(LOG_PATH)},
-        {"kind": "memex_export", "path": str(user_data_dir(user_id) / "MEMEX.md")},
-        {"kind": "memex_include", "path": str(Path.home() / ".claude" / "CLAUDE.md")},
-        {"kind": "codex_agents", "path": str(CODEX_GLOBAL_AGENTS)},
+        {"kind": "memex_export", "path": str(workspace_module.MEMEX_PATH)},
     ]
-    targets.extend({"kind": "skill_dir", "path": str(path)} for path in SKILLS_DIRS)
+    targets.extend(
+        {"kind": "capability_file", "path": str(path)} for path in capability_target_paths()
+    )
 
     if platform.system() == "Darwin":
         targets.append({"kind": "launch_agent", "path": str(PLIST_PATH)})
@@ -76,9 +73,7 @@ def setup_source_inventory(user_id: str) -> list[dict[str, object]]:
     from datetime import UTC, datetime
 
     sources: list[dict[str, object]] = []
-    registry = observe_registry(user_id)
-
-    for desc in registry.active_harnesses():
+    for desc in active_sources():
         files_found = 0
         detected_paths: list[str] = []
         roots: list[str] = []
@@ -181,8 +176,8 @@ def setup_target_payload(
     user_id: str,
     daemon: dict[str, object],
 ) -> list[dict[str, str]]:
-    from syke.config import user_data_dir
     from syke.daemon.daemon import LOG_PATH, PLIST_PATH, SYSTEMD_UNIT_PATH
+    from syke.distribution.context_files import capability_target_paths
     from syke.llm.pi_client import PI_BIN
     from syke.pi_state import (
         get_pi_agent_dir,
@@ -190,21 +185,30 @@ def setup_target_payload(
         get_pi_models_path,
         get_pi_settings_path,
     )
-    from syke.runtime.workspace import MEMEX_PATH, SYKE_DB, WORKSPACE_ROOT
+    from syke.runtime import workspace as workspace_module
 
     targets = [
-        {"kind": "user_data", "path": str(user_data_dir(user_id))},
+        {"kind": "user_data", "path": str(workspace_module.SYKE_ROOT)},
+        {"kind": "control", "path": str(workspace_module.CONTROL_ROOT)},
+        {"kind": "native_sessions", "path": str(workspace_module.SESSIONS_DIR)},
+        {"kind": "host_receipts", "path": str(workspace_module.RECEIPTS_DIR)},
+        {"kind": "incoming_records", "path": str(workspace_module.RECORDS_DIR)},
         {"kind": "syke_db", "path": str(user_syke_db_path(user_id))},
-        {"kind": "source_readers_dir", "path": str(WORKSPACE_ROOT / "adapters")},
-        {"kind": "workspace", "path": str(WORKSPACE_ROOT)},
-        {"kind": "workspace_syke_db", "path": str(SYKE_DB)},
-        {"kind": "workspace_memex", "path": str(MEMEX_PATH)},
+        {
+            "kind": "source_readers_dir",
+            "path": str(workspace_module.WORKSPACE_ROOT / "adapters"),
+        },
+        {"kind": "workspace", "path": str(workspace_module.WORKSPACE_ROOT)},
+        {"kind": "workspace_memex", "path": str(workspace_module.MEMEX_PATH)},
         {"kind": "pi_launcher", "path": str(PI_BIN)},
         {"kind": "pi_agent_dir", "path": str(get_pi_agent_dir())},
         {"kind": "pi_auth", "path": str(get_pi_auth_path())},
         {"kind": "pi_settings", "path": str(get_pi_settings_path())},
         {"kind": "pi_models", "path": str(get_pi_models_path())},
     ]
+    targets.extend(
+        {"kind": "capability_file", "path": str(path)} for path in capability_target_paths()
+    )
 
     if daemon.get("installable") and not daemon.get("running"):
         targets.append({"kind": "daemon_log", "path": str(LOG_PATH)})
@@ -276,13 +280,15 @@ def _build_next_steps(provider: dict[str, object], daemon: dict[str, object]) ->
     """Actionable commands an agent should run to complete setup non-interactively."""
     steps: list[str] = []
     if not provider.get("configured"):
-        steps.append("syke auth set <provider> <API_KEY> --use")
+        steps.append("syke auth set <provider> --api-key <KEY> --use")
     steps.append("syke setup --yes")
     return steps
 
 
 def build_setup_inspect_payload(*, user_id: str, cli_provider: str | None) -> dict[str, object]:
     from syke.daemon.ipc import daemon_runtime_status
+    from syke.runtime.macos_filesystem_access import macos_filesystem_access_status
+    from syke.runtime.sandbox import sandbox_enabled, sandbox_read_paths
     from syke.source_selection import get_selected_sources
 
     provider = provider_payload(cli_provider)
@@ -297,6 +303,9 @@ def build_setup_inspect_payload(*, user_id: str, cli_provider: str | None) -> di
         user_id=user_id,
         daemon=daemon,
     )
+    filesystem_sandboxed = sandbox_enabled()
+    filesystem_read_roots = list(sandbox_read_paths()) if filesystem_sandboxed else None
+    protected_folders = macos_filesystem_access_status()
 
     detected_sources = [item["source"] for item in sources if item["detected"]]
     proposed_actions: list[dict[str, object]] = [
@@ -313,6 +322,27 @@ def build_setup_inspect_payload(*, user_id: str, cli_provider: str | None) -> di
                 "id": "connect_sources",
                 "description": "Connect selected detected sources for synthesis and ask context.",
                 "sources": detected_sources,
+            }
+        )
+
+    if protected_folders.get("applicable") and not protected_folders.get("ok"):
+        proposed_actions.append(
+            {
+                "id": "verify_macos_protected_folders",
+                "description": (
+                    "Request and verify background access to Desktop, Documents, and Downloads."
+                ),
+            }
+        )
+        consent_points.append(
+            {
+                "id": "macos_protected_folders",
+                "question": (
+                    "Allow background Syke to request read access to Desktop, Documents, "
+                    "and Downloads?"
+                ),
+                "options": ["allow", "deny"],
+                "default": "allow",
             }
         )
 
@@ -371,6 +401,14 @@ def build_setup_inspect_payload(*, user_id: str, cli_provider: str | None) -> di
         "provider_choices": providers,
         "sources": sources,
         "selected_sources": list(selected_sources) if selected_sources is not None else None,
+        "filesystem_access": {
+            "mode": "sandboxed" if filesystem_sandboxed else "process_permissions",
+            "computer_read_roots": filesystem_read_roots,
+            "macos_protected_folders": protected_folders,
+            "persistent_write_roots": (
+                ["syke_workspace", "syke_runtime"] if filesystem_sandboxed else None
+            ),
+        },
         "trust": trust,
         "setup_targets": setup_targets,
         "runtime": runtime,
@@ -399,6 +437,33 @@ def render_setup_inspect_summary(info: dict[str, object]) -> None:
         )
     else:
         console.print("  [yellow]✗[/yellow] provider: not configured")
+
+    filesystem = cast(dict[str, object], info.get("filesystem_access") or {})
+    if filesystem.get("mode") == "sandboxed":
+        raw_roots = filesystem.get("computer_read_roots")
+        roots = raw_roots if isinstance(raw_roots, list) else []
+        home = str(Path.home().expanduser().resolve())
+        read_scope = (
+            "$HOME"
+            if roots == [home]
+            else ", ".join(str(root) for root in roots or []) or "no computer roots"
+        )
+        console.print(
+            f"  [green]✓[/green] computer files: sandbox allows read-only {read_scope}; "
+            "writes limited to workspace/runtime"
+        )
+    else:
+        console.print(
+            "  [yellow]✗[/yellow] computer files: sandbox unavailable or disabled; "
+            "process permissions apply"
+        )
+
+    protected = filesystem.get("macos_protected_folders")
+    if isinstance(protected, dict) and protected.get("applicable"):
+        ok = bool(protected.get("ok"))
+        icon = "[green]✓[/green]" if ok else "[yellow]·[/yellow]"
+        detail = str(protected.get("detail") or "not checked")
+        console.print(f"  {icon} macOS protected folders: {detail}")
 
     # Sources — files, last used, and span
     detected_sources = [
@@ -456,7 +521,7 @@ def render_setup_inspect_summary(info: dict[str, object]) -> None:
         info.get("setup_targets")
         or cast(dict[str, object], info.get("trust") or {}).get("targets", []),
     )
-    console.print(f"\n  {len(setup_targets)} files will be created under ~/.syke")
+    console.print(f"\n  {len(setup_targets)} planned write targets")
 
 
 def choose_setup_sources_interactive(sources: list[dict[str, object]]) -> list[str]:

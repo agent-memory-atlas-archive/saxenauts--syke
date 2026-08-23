@@ -21,34 +21,32 @@ console = Console()
 @click.option("--json", "use_json", is_flag=True, help="Output as JSON")
 @click.pass_context
 def cost(ctx: click.Context, days: int | None, use_json: bool) -> None:
-    """Show cumulative LLM cost and token usage from rollout traces."""
-    user_id = ctx.obj["user"]
-    db = get_db(user_id)
-    try:
-        runs = db.get_rollout_traces(user_id, limit=None)
-    finally:
-        db.close()
+    """Show cumulative LLM cost and token usage from native Pi sessions."""
+    from syke.runtime import workspace as workspace_module
+    from syke.runtime.pi_sessions import list_sessions, list_sessions_between
+
+    if days is None:
+        runs = list_sessions(workspace_module.SESSIONS_DIR, limit=None)
+    else:
+        now = datetime.now(UTC)
+        runs = list_sessions_between(
+            workspace_module.SESSIONS_DIR,
+            start_at=now - timedelta(days=days),
+            end_at=now,
+        )
 
     if not runs:
         if use_json:
             click.echo(json.dumps({"total_runs": 0, "total_cost_usd": 0, "runs": []}))
+        elif days is not None:
+            console.print(f"[dim]No metrics in the last {days} day(s).[/dim]")
         else:
             console.print("[dim]No metrics recorded yet. Run syke sync or syke ask first.[/dim]")
         return
 
-    if days is not None:
-        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-        runs = [run for run in runs if str(run.get("started_at", "")) >= cutoff]
-        if not runs:
-            if use_json:
-                click.echo(json.dumps({"total_runs": 0, "total_cost_usd": 0, "runs": []}))
-            else:
-                console.print(f"[dim]No metrics in the last {days} day(s).[/dim]")
-            return
-
-    total_cost = sum(float((run.get("metrics") or {}).get("cost_usd", 0) or 0) for run in runs)
-    total_input = sum(int((run.get("metrics") or {}).get("input_tokens", 0) or 0) for run in runs)
-    total_output = sum(int((run.get("metrics") or {}).get("output_tokens", 0) or 0) for run in runs)
+    total_cost = sum(float(run.get("cost_usd", 0) or 0) for run in runs)
+    total_input = sum(int(run.get("input_tokens", 0) or 0) for run in runs)
+    total_output = sum(int(run.get("output_tokens", 0) or 0) for run in runs)
     total_thinking = 0
     total_tokens = total_input + total_output + total_thinking
 
@@ -58,10 +56,9 @@ def cost(ctx: click.Context, days: int | None, use_json: bool) -> None:
         if operation not in by_operation:
             by_operation[operation] = {"count": 0, "cost_usd": 0.0, "tokens": 0, "errors": 0}
         by_operation[operation]["count"] += 1
-        metrics = run.get("metrics", {}) if isinstance(run.get("metrics"), dict) else {}
-        by_operation[operation]["cost_usd"] += float(metrics.get("cost_usd", 0) or 0)
-        by_operation[operation]["tokens"] += int(metrics.get("input_tokens", 0) or 0) + int(
-            metrics.get("output_tokens", 0) or 0
+        by_operation[operation]["cost_usd"] += float(run.get("cost_usd", 0) or 0)
+        by_operation[operation]["tokens"] += int(run.get("input_tokens", 0) or 0) + int(
+            run.get("output_tokens", 0) or 0
         )
         if run.get("status") != "completed":
             by_operation[operation]["errors"] += 1
@@ -117,18 +114,15 @@ def cost(ctx: click.Context, days: int | None, use_json: bool) -> None:
 
     console.print(op_table)
 
-    recent = runs[-10:]
+    recent = runs[:10]
     if recent:
         console.print("\n[bold]Recent Runs[/bold]")
-        for run in reversed(recent):
+        for run in recent:
             ts = run.get("started_at", "")[:19].replace("T", " ")
             operation = run.get("kind", "?")
-            metrics = run.get("metrics", {}) if isinstance(run.get("metrics"), dict) else {}
-            usd = float(metrics.get("cost_usd", 0) or 0)
-            tokens = int(metrics.get("input_tokens", 0) or 0) + int(
-                metrics.get("output_tokens", 0) or 0
-            )
-            duration = float(metrics.get("duration_ms", 0) or 0) / 1000.0
+            usd = float(run.get("cost_usd", 0) or 0)
+            tokens = int(run.get("input_tokens", 0) or 0) + int(run.get("output_tokens", 0) or 0)
+            duration = float(run.get("duration_ms", 0) or 0) / 1000.0
             ok = "[green]✓[/green]" if run.get("status") == "completed" else "[red]✗[/red]"
             console.print(
                 f"  {ts}  {ok}  [cyan]{operation}[/cyan]  "
@@ -234,11 +228,7 @@ def sync(
         if status == "completed":
             from syke.onboarding import mark_first_synthesis_complete
 
-            trace_id = result.get("trace_id")
-            mark_first_synthesis_complete(
-                user_id,
-                trace_id=str(trace_id) if trace_id else None,
-            )
+            mark_first_synthesis_complete(user_id)
 
         if use_json:
             click.echo(
@@ -249,8 +239,8 @@ def sync(
                         "status": status,
                         "memex_updated": result.get("memex_updated"),
                         "duration_ms": result.get("duration_ms"),
-                        "trace_id": result.get("trace_id"),
-                        "tool_calls": result.get("tool_calls"),
+                        "session_id": result.get("session_id"),
+                        "session_file": result.get("session_file"),
                         "num_turns": result.get("num_turns"),
                         "model": result.get("model"),
                         "cost_usd": result.get("cost_usd"),

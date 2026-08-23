@@ -1,10 +1,9 @@
 """observe — Syke's harness discovery and adapter surface.
 
 The agent reads harness data directly via adapter markdowns installed at
-~/.syke/adapters/{source}.md.
+~/.syke/workspace/adapters/{source}.md.
 
 Public API:
     from syke.observe.catalog import active_sources, get_source
     from syke.observe.bootstrap import ensure_adapters
-    from syke.trace_store import trace_store_status
 """

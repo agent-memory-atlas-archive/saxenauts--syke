@@ -1,255 +1,125 @@
-"""Tests for build_prompt() under the prompt block contract.
-
-Ask prompts: <psyche> + <now> + <operation_contract> + <memex> + <synthesis>
-Synthesis prompts: <psyche> + <now> + <memex> + <synthesis>
-"""
+"""System contracts for Syke's operative prompt assembly."""
 
 from __future__ import annotations
 
-from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from syke.db import SykeDB
-from syke.models import Memory
-from syke.runtime.psyche_md import SYNTHESIS_PATH, build_prompt, format_gap
+from syke.memory.memex import update_memex
+from syke.memory.memex_budget import warm_memex_tokenizer
+from syke.runtime.prompt_context import build_prompt
 
 NOW = "2026-04-15 14:00 PDT (UTC-7)"
 
 
-def test_prompt_without_db_contains_psyche_now_and_synthesis(tmp_path: Path) -> None:
-    result = build_prompt(tmp_path, now=NOW)
-    assert result.startswith("<psyche>")
-    assert "</psyche>" in result
-    assert "<now>" in result
-    assert "</now>" in result
-    assert f"As of: {NOW}" in result
-    assert "<synthesis>" in result
-    assert "</synthesis>" in result
-    assert "<memex>" not in result
-
-
-def test_prompt_contains_default_synthesis_block(tmp_path: Path) -> None:
-    result = build_prompt(tmp_path, now=NOW)
-    synthesis_content = SYNTHESIS_PATH.read_text(encoding="utf-8").strip()
-    first_line = synthesis_content.split("\n")[0]
-    assert first_line in result
-
-
-def test_default_synthesis_block_is_cycle_directive(tmp_path: Path) -> None:
-    result = build_prompt(tmp_path, now=NOW)
-    synthesis_block = result[result.rindex("<synthesis>") : result.rindex("</synthesis>")]
-    assert "scheduled Syke synthesis cycle" in synthesis_block
-    assert "MEMEX above is your prior" in synthesis_block
-    assert "syke.db is the source of truth" in synthesis_block
-    assert 'source_event_ids = ["__memex__"]' in synthesis_block
-    assert "Never delete or deactivate that row" in synthesis_block
-    assert "treat MEMEX as your prior" in synthesis_block
-    assert "cycle cheap" in synthesis_block
-    assert "</first_run_bootstrap>" not in synthesis_block
-    assert "Detected source inventory" not in synthesis_block
-    assert "Serve the ask" not in synthesis_block
-
-
-def test_prompt_exposes_default_synthesis_path() -> None:
-    assert SYNTHESIS_PATH.exists()
-
-
-def test_prompt_requires_now() -> None:
-    with pytest.raises(TypeError):
-        build_prompt(Path("/tmp"))  # type: ignore[call-arg]
-
-
-def test_prompt_with_empty_memex_includes_bootstrap_memex_block(
-    tmp_path: Path, db: SykeDB, user_id: str
+def test_prompt_assembles_state_and_operation_without_writes(
+    tmp_path: Path,
+    db: SykeDB,
+    user_id: str,
 ) -> None:
-    result = build_prompt(tmp_path, db=db, user_id=user_id, now=NOW)
-    assert "<psyche>" in result
-    assert "<now>" in result
-    assert "<memex>" in result
-    assert "First run" in result
-
-
-def test_prompt_with_real_memex_includes_memex_block(
-    tmp_path: Path, db: SykeDB, user_id: str
-) -> None:
-    from syke.memory.memex import update_memex
-
-    update_memex(db, user_id, "## Active threads\n- Working on sandbox hardening")
-
-    result = build_prompt(tmp_path, db=db, user_id=user_id, now=NOW)
-    assert "<memex>" in result
-    assert "sandbox hardening" in result
-
-
-def test_prompt_with_memories_no_memex_still_includes_bootstrap_memex_block(
-    tmp_path: Path, db: SykeDB, user_id: str
-) -> None:
-    db.insert_memory(Memory(id="m1", user_id=user_id, content="Test memory"))
-
-    result = build_prompt(tmp_path, db=db, user_id=user_id, now=NOW)
-    assert "<psyche>" in result
-    assert "<memex>" in result
-    assert "Test memory" in result or "1 memory" in result or "1 memories" in result
-
-
-def test_prompt_memex_error_swallowed(tmp_path: Path, db: SykeDB, user_id: str) -> None:
-    with patch(
-        "syke.memory.memex.get_memex_for_injection",
-        side_effect=RuntimeError("db exploded"),
-    ):
-        result = build_prompt(tmp_path, db=db, user_id=user_id, now=NOW)
-    assert "<psyche>" in result
-    assert "<now>" in result
-    assert "<synthesis>" in result
-
-
-def test_prompt_without_synthesis_file(tmp_path: Path) -> None:
-    fake_path = tmp_path / "nonexistent.md"
-    result = build_prompt(tmp_path, synthesis_path=fake_path, now=NOW)
-    assert "<psyche>" in result
-    assert "<now>" in result
-    assert "<synthesis>" not in result
-
-
-def test_prompt_opt_out_of_synthesis(tmp_path: Path) -> None:
-    result = build_prompt(tmp_path, now=NOW, include_synthesis=False)
-    assert "<psyche>" in result
-    assert "<now>" in result
-    assert "<synthesis>" not in result
-
-
-def test_prompt_opt_out_of_memex(tmp_path: Path, db: SykeDB, user_id: str) -> None:
-    from syke.memory.memex import update_memex
-
-    update_memex(db, user_id, "irrelevant when skipped")
-
-    result = build_prompt(tmp_path, db=db, user_id=user_id, now=NOW, include_memex=False)
-    assert "<psyche>" in result
-    assert "<now>" in result
-    assert "<memex>" not in result
-    assert "irrelevant when skipped" not in result
-
-
-def test_ask_prompt_includes_operation_contract(tmp_path: Path) -> None:
-    result = build_prompt(tmp_path, now=NOW)
-    assert "<operation_contract>" in result
-    assert "answer the user question first" in result
-    assert "operation_mode" in result
-    assert "source_refs" in result
-    assert "evidence_class=projection_only" in result
-
-
-def test_ask_operation_contract_appears_before_memex(
-    tmp_path: Path, db: SykeDB, user_id: str
-) -> None:
-    from syke.memory.memex import update_memex
-
-    update_memex(db, user_id, "## Active threads\n- Prompt contract test")
-
-    result = build_prompt(tmp_path, db=db, user_id=user_id, now=NOW)
-    now_start = result.index("<now>")
-    contract_start = result.index("<operation_contract>")
-    memex_start = result.index("<memex>")
-    assert now_start < contract_start < memex_start
-    assert "MEMEX is a projection from syke.db" in result
-
-
-def test_synthesis_prompt_omits_ask_operation_contract(tmp_path: Path) -> None:
-    result = build_prompt(tmp_path, now=NOW, context="synthesis")
-    assert "<psyche>" in result
-    assert "<now>" in result
-    assert "<synthesis>" in result
-    assert "<operation_contract>" not in result
-
-
-def test_prompt_includes_adapter_block(tmp_path: Path) -> None:
-    result = build_prompt(tmp_path, now=NOW)
-    assert "<adapters>" in result
-
-
-def test_prompt_respects_selected_sources_filter(tmp_path: Path) -> None:
-    adapters_dir = tmp_path / "adapters"
-    adapters_dir.mkdir(parents=True, exist_ok=True)
-    (adapters_dir / "codex.md").write_text("# codex", encoding="utf-8")
-    (adapters_dir / "claude-code.md").write_text("# claude", encoding="utf-8")
-
-    result = build_prompt(
-        tmp_path,
-        now=NOW,
-        selected_sources=("codex",),
-    )
-
-    assert "**codex**" in result
-    assert "**claude-code**" not in result
-
-
-def test_prompt_uses_tagged_structure(tmp_path: Path) -> None:
-    result = build_prompt(tmp_path, now=NOW)
-    assert "<psyche>" in result
-    assert "</psyche>" in result
-    assert "<now>" in result
-    assert "</now>" in result
-    assert "<synthesis>" in result
-    assert "---" not in result
-
-
-def test_prompt_now_block_appears_between_psyche_and_memex(
-    tmp_path: Path, db: SykeDB, user_id: str
-) -> None:
-    from syke.memory.memex import update_memex
-
-    update_memex(db, user_id, "## Active threads\n- Time-sensitive thread")
-
-    result = build_prompt(tmp_path, db=db, user_id=user_id, now=NOW)
-    psyche_end = result.index("</psyche>")
-    now_start = result.index("<now>")
-    memex_start = result.index("<memex>")
-    assert psyche_end < now_start < memex_start
-    assert "/ 2,000 tokens" in result
-
-
-def test_prompt_includes_temporal_fields_in_now_block(
-    tmp_path: Path, db: SykeDB, user_id: str
-) -> None:
-    from syke.memory.memex import update_memex
-
-    update_memex(db, user_id, "## Active threads\n- Time-sensitive thread")
+    row_id = update_memex(db, user_id, "## Active threads\n- Verify self-continuation")
+    warm_memex_tokenizer()
+    graph_changes = db.conn.total_changes
+    files_before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
 
     result = build_prompt(
         tmp_path,
         db=db,
         user_id=user_id,
-        now="2026-04-15 14:00 PDT (UTC-7)",
-        last_synthesis="2026-04-15 13:45 PDT",
-        cycle=12,
+        now=NOW,
+        context="ask",
+        operation_id="cycle-ask",
+        condition="after recovery",
+        incoming_records='record record-1\npayload: "new evidence"',
+        answer_obligation="What changed?",
     )
-    # Temporal fields now land in <now>, not <memex>
-    now_block = result[result.index("<now>") : result.index("</now>")]
-    assert "As of: 2026-04-15 14:00 PDT (UTC-7)" in now_block
-    assert "Cycle #12" in now_block
-    assert "Last cycle: 2026-04-15 13:45 PDT" in now_block
-    # Directive is present
-    assert "Ignore host `date`" in now_block
-    # These fields no longer live in <memex>
-    memex_block = result[result.index("<memex>") : result.index("</memex>")]
-    assert "Now:" not in memex_block
-    assert "Cycle: #12" not in memex_block
+
+    sections = ["# Self-observation", "# MEMEX", "# Operation"]
+    assert all(result.count(section) == 1 for section in sections)
+    assert [result.index(section) for section in sections] == sorted(
+        result.index(section) for section in sections
+    )
+    for value in (
+        user_id,
+        str(Path(db.db_path).resolve()),
+        str(tmp_path.resolve()),
+        row_id,
+        "Verify self-continuation",
+        "cycle-ask",
+        "after recovery",
+        "new evidence",
+        "What changed?",
+        NOW,
+    ):
+        assert value in result
+    assert db.conn.total_changes == graph_changes
+    assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")) == files_before
 
 
-def test_prompt_time_directive_can_be_disabled(tmp_path: Path) -> None:
-    result = build_prompt(tmp_path, now=NOW, time_directive=False)
-    now_block = result[result.index("<now>") : result.index("</now>")]
-    assert f"As of: {NOW}" in now_block
-    assert "Ignore host `date`" not in now_block
+def test_prompt_routes_each_trigger_and_optional_guidance(tmp_path: Path) -> None:
+    guidance = tmp_path / "condition.md"
+    guidance.write_text("condition-specific guidance", encoding="utf-8")
+
+    cases = (
+        ("ask", "direct ask", "direct answer to waiting caller"),
+        ("synthesis", "scheduled daemon wake", "background maintenance result"),
+        ("replay", "replay", "replay result"),
+    )
+    for context, trigger, route in cases:
+        result = build_prompt(
+            tmp_path,
+            now=NOW,
+            context=context,
+            synthesis_path=guidance if context == "synthesis" else None,
+            first_run_guidance=(
+                "Inspect the bounded source inventory." if context == "synthesis" else ""
+            ),
+        )
+        assert f"Trigger: {trigger}" in result
+        assert f"Output route: {route}" in result
+
+    assert "condition-specific guidance" in build_prompt(
+        tmp_path,
+        now=NOW,
+        context="synthesis",
+        synthesis_path=guidance,
+    )
 
 
-def test_format_gap_buckets() -> None:
-    assert format_gap(timedelta(seconds=30)) == "<1 min ago"
-    assert format_gap(timedelta(minutes=15)) == "15 min ago"
-    assert format_gap(timedelta(hours=2, minutes=30)) == "2 h ago"
-    assert format_gap(timedelta(days=3, hours=4)) == "3 d ago"
-    # Negative delta still produces a positive label
-    assert format_gap(timedelta(minutes=-15)) == "15 min ago"
+def test_prompt_dependency_failures_degrade_without_disclosing_exceptions(
+    tmp_path: Path,
+    db: SykeDB,
+    user_id: str,
+) -> None:
+    with patch(
+        "syke.runtime.self_view.build_self_view",
+        side_effect=RuntimeError("private history failure"),
+    ):
+        self_view_failure = build_prompt(tmp_path, db=db, user_id=user_id, now=NOW)
+
+    with patch(
+        "syke.memory.memex.get_memex_for_injection",
+        side_effect=RuntimeError("private database failure"),
+    ):
+        memex_failure = build_prompt(tmp_path, db=db, user_id=user_id, now=NOW)
+
+    assert "unknown rather than healthy" in self_view_failure
+    assert "private history failure" not in self_view_failure
+    assert "No current MEMEX is available" in memex_failure
+    assert "private database failure" not in memex_failure
+    assert "# Operation" in self_view_failure
+    assert "# Operation" in memex_failure
+
+
+def test_reference_time_rule_can_be_disabled_without_removing_the_reference(
+    tmp_path: Path,
+) -> None:
+    with_directive = build_prompt(tmp_path, now=NOW)
+    without_directive = build_prompt(tmp_path, now=NOW, time_directive=False)
+    directive = "Resolve relative time against this reference time. Do not use the host clock"
+
+    assert NOW in with_directive
+    assert NOW in without_directive
+    assert directive in with_directive
+    assert directive not in without_directive

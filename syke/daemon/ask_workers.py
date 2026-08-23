@@ -51,11 +51,10 @@ class DaemonAskWorkerSupervisor:
         syke_db_path: str,
         question: str,
         on_event: Callable[[AskEvent], None] | None,
-        timeout: float | None,
         transport_details: dict[str, object],
     ) -> tuple[str, dict[str, object]]:
         wait_started = time.monotonic()
-        if not self._acquire_capacity(timeout):
+        if not self._acquire_capacity():
             raise DaemonAskCapacityExceeded(
                 f"ask worker capacity exceeded ({self.max_workers} temporary workers)"
             )
@@ -67,14 +66,12 @@ class DaemonAskWorkerSupervisor:
                     "user_id": user_id,
                     "syke_db_path": syke_db_path,
                     "question": question,
-                    "timeout": timeout,
                     "transport_details": {
                         **transport_details,
                         "worker_slot_wait_ms": worker_slot_wait_ms,
                     },
                 },
                 on_event=on_event,
-                timeout=timeout,
             )
             enriched = {**transport_details, **metadata}
             enriched.setdefault("transport", "daemon_worker")
@@ -99,14 +96,11 @@ class DaemonAskWorkerSupervisor:
             except OSError:
                 logger.debug("Failed to stop ask worker %s", child.pid, exc_info=True)
 
-    def _acquire_capacity(self, timeout: float | None) -> bool:
+    def _acquire_capacity(self) -> bool:
         semaphore = self._semaphore
         if semaphore is None:
             return True
-        wait_s = self.capacity_wait_s
-        if isinstance(timeout, (int, float)) and timeout > 0:
-            wait_s = min(wait_s, max(float(timeout) - 1.0, 0.0))
-        return semaphore.acquire(timeout=wait_s)
+        return semaphore.acquire(timeout=self.capacity_wait_s)
 
     def _release_capacity(self) -> None:
         if self._semaphore is not None:
@@ -143,7 +137,6 @@ class DaemonAskWorkerSupervisor:
         request: dict[str, object],
         *,
         on_event: Callable[[AskEvent], None] | None,
-        timeout: float | None,
     ) -> tuple[str, dict[str, object]]:
         child = self._start_child()
         stderr_lines: list[str] = []
@@ -155,18 +148,16 @@ class DaemonAskWorkerSupervisor:
             child.stdin.write(json.dumps(request, default=str))
             child.stdin.close()
 
-            deadline = time.monotonic() + (
-                float(timeout) + 5.0
-                if isinstance(timeout, (int, float)) and timeout > 0
-                else float(ASK_TIMEOUT) + 5.0
-            )
+            # Wall-clock liveness deadline: monotonic clocks freeze during
+            # system sleep, stretching this timeout by the sleep duration.
+            deadline = time.time() + float(ASK_TIMEOUT) + 5.0
             selector = selectors.DefaultSelector()
             selector.register(child.stdout, selectors.EVENT_READ, "stdout")
             selector.register(child.stderr, selectors.EVENT_READ, "stderr")
 
             try:
                 while selector.get_map():
-                    remaining = deadline - time.monotonic()
+                    remaining = deadline - time.time()
                     if remaining <= 0:
                         raise TimeoutError("ask worker timed out")
                     events = selector.select(timeout=min(remaining, 0.25))

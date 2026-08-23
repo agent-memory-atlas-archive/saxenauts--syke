@@ -7,27 +7,26 @@ import sys
 
 import click
 from rich.console import Console
-from uuid_extensions import uuid7
 
-from syke.cli_support.context import get_db
-from syke.models import Memory
+from syke.config import user_control_dir
+from syke.control import admit_record
 
 console = Console()
 
 
-@click.command(short_help="Add a note or observation.")
+@click.command(short_help="Send a note or observation to Syke.")
 @click.argument("text", required=False)
 @click.option(
     "--json",
     "use_json",
     is_flag=True,
-    help="Parse TEXT or stdin as a single JSON memory",
+    help="Validate TEXT or stdin as one JSON record",
 )
 @click.option(
     "--jsonl",
     "use_jsonl",
     is_flag=True,
-    help="Parse stdin as newline-delimited JSON memories (batch)",
+    help="Validate stdin as newline-delimited JSON records",
 )
 @click.pass_context
 def record(
@@ -36,66 +35,58 @@ def record(
     use_json: bool,
     use_jsonl: bool,
 ) -> None:
-    """Record an observation, note, or research dump into Syke.
+    """Send an observation, note, or research dump to Syke.
 
-    Records become memories — available to synthesis and ask immediately.
+    For long or shell-sensitive content, pipe stdin instead of putting the
+    content directly in your shell history.
+
+    A record is protected input. A later synthesis decides whether it changes
+    memory, workspace artifacts, or nothing.
     """
     user_id = ctx.obj["user"]
-    db = get_db(user_id)
+    control_dir = user_control_dir(user_id)
 
-    try:
-        if use_jsonl:
-            if not sys.stdin.isatty():
-                lines = sys.stdin.read().strip().splitlines()
-            elif text:
-                lines = text.strip().splitlines()
-            else:
-                raise click.UsageError("--jsonl requires piped input or text argument")
+    if use_jsonl:
+        if not sys.stdin.isatty():
+            lines = sys.stdin.read().strip().splitlines()
+        elif text:
+            lines = text.strip().splitlines()
+        else:
+            raise click.UsageError("--jsonl requires piped input or text argument")
 
-            inserted = 0
-            for i, line in enumerate(lines):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError as e:
-                    raise click.UsageError(f"Line {i + 1}: invalid JSON — {e}") from None
-
-                content = obj.get("text") or obj.get("content") or ""
-                if not content:
-                    continue
-                mem = Memory(id=str(uuid7()), user_id=user_id, content=content)
-                db.insert_memory(mem)
-                inserted += 1
-
-            console.print(f"Recorded [green]{inserted}[/green] memories")
-            return
-
-        if use_json:
-            raw = text or (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
-            if not raw:
-                raise click.UsageError("--json requires a JSON string as argument or stdin")
-
+        accepted = 0
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
             try:
-                obj = json.loads(raw)
+                json.loads(line)
             except json.JSONDecodeError as e:
-                raise click.UsageError(f"Invalid JSON: {e}") from None
+                raise click.UsageError(f"Line {i + 1}: invalid JSON — {e}") from None
 
-            content = obj.get("text") or obj.get("content") or ""
-            if not content:
-                raise click.UsageError("JSON object must have 'text' or 'content' field")
-            mem = Memory(id=str(uuid7()), user_id=user_id, content=content)
-            mid = db.insert_memory(mem)
-            console.print(f"Recorded. [dim]({mid[:8]})[/dim]")
-            return
+            admit_record(control_dir, line)
+            accepted += 1
 
-        content = text or (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
-        if not content:
-            raise click.UsageError("Nothing to record. Pass text as argument or pipe stdin.")
+        console.print(f"Accepted [green]{accepted}[/green] records")
+        return
 
-        mem = Memory(id=str(uuid7()), user_id=user_id, content=content)
-        mid = db.insert_memory(mem)
-        console.print(f"Recorded. [dim]({mid[:8]})[/dim]")
-    finally:
-        db.close()
+    if use_json:
+        raw = text or (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
+        if not raw:
+            raise click.UsageError("--json requires a JSON string as argument or stdin")
+
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise click.UsageError(f"Invalid JSON: {e}") from None
+
+        record_id = admit_record(control_dir, raw)
+        console.print(f"Record accepted. [dim]({record_id})[/dim]")
+        return
+
+    content = text or (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
+    if not content:
+        raise click.UsageError("Nothing to record. Pass text as argument or pipe stdin.")
+
+    record_id = admit_record(control_dir, content)
+    console.print(f"Record accepted. [dim]({record_id})[/dim]")

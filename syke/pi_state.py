@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import stat
+import sys
 import tempfile
 import traceback
 from pathlib import Path
@@ -28,10 +28,6 @@ def get_pi_agent_dir() -> Path:
     if root:
         return Path(root).expanduser().resolve()
     return (config.SYKE_HOME / "pi-agent").resolve()
-
-
-def get_legacy_pi_agent_dir() -> Path:
-    return (Path.home() / ".pi" / "agent").resolve()
 
 
 def get_pi_auth_path() -> Path:
@@ -55,7 +51,6 @@ def get_pi_state_audit_path() -> Path:
 
 def ensure_pi_agent_dir() -> Path:
     root = get_pi_agent_dir()
-    _migrate_legacy_pi_state(root)
     root.mkdir(parents=True, exist_ok=True)
     os.chmod(root, _PRIVATE_DIR_MODE)
     return root
@@ -69,8 +64,6 @@ def build_pi_agent_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
-    if path.parent == get_pi_agent_dir():
-        _migrate_legacy_pi_state(path.parent)
     if not path.exists():
         return dict(default)
     try:
@@ -80,53 +73,10 @@ def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else dict(default)
 
 
-def _migrate_legacy_pi_state(target: Path) -> None:
-    """Import legacy Pi-native state into Syke-owned state once.
-
-    This preserves local auth/default provider state when switching containment
-    back from the brief ~/.pi/agent default.
-    """
-    if os.getenv(_PI_AGENT_DIR_ENV):
-        return
-    if target.exists():
-        return
-
-    legacy_root = get_legacy_pi_agent_dir()
-    if legacy_root == target or not legacy_root.exists() or not legacy_root.is_dir():
-        return
-
-    files = ("auth.json", "settings.json", "models.json")
-    if not any((legacy_root / name).exists() for name in files):
-        return
-
-    target.mkdir(parents=True, exist_ok=True)
-    os.chmod(target, _PRIVATE_DIR_MODE)
-    migrated: list[str] = []
-    for name in files:
-        source_path = legacy_root / name
-        target_path = target / name
-        if (
-            not source_path.exists()
-            or source_path.is_symlink()
-            or not source_path.is_file()
-            or target_path.exists()
-        ):
-            continue
-        shutil.copy2(source_path, target_path)
-        os.chmod(target_path, _PRIVATE_FILE_MODE)
-        migrated.append(name)
-
-    if migrated:
-        _append_pi_state_audit(
-            event="migrate_legacy_pi_state",
-            path=target,
-            before={},
-            after={"migrated_files": migrated, "source": str(legacy_root)},
-        )
-
-
 def _write_json(path: Path, data: dict[str, Any], *, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if mode is not None:
+        os.chmod(path.parent, _PRIVATE_DIR_MODE)
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -230,7 +180,7 @@ def _append_pi_state_audit(
         "pid": os.getpid(),
         "ppid": os.getppid(),
         "cwd": os.getcwd(),
-        "argv": _redact_argv_for_audit(list(os.sys.argv)),
+        "argv": _redact_argv_for_audit(list(sys.argv)),
         "before": _redact_for_audit(before),
         "after": _redact_for_audit(after),
         "metadata": _redact_for_audit(metadata or {}),
@@ -267,10 +217,6 @@ def get_credential(provider_id: str) -> dict[str, Any] | None:
     return credential if isinstance(credential, dict) else None
 
 
-def has_credential(provider_id: str) -> bool:
-    return get_credential(provider_id) is not None
-
-
 def list_credential_providers() -> list[str]:
     return sorted(load_pi_auth())
 
@@ -287,9 +233,6 @@ def remove_credential(provider_id: str) -> bool:
         return False
     del auth[provider_id]
     save_pi_auth(auth, reason="remove_credential")
-    if get_default_provider() == provider_id:
-        set_default_provider(None)
-        set_default_model(None)
     return True
 
 
@@ -309,27 +252,26 @@ def get_default_provider() -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def set_default_provider(provider_id: str | None) -> None:
-    settings = load_pi_settings()
-    if provider_id:
-        settings["defaultProvider"] = provider_id
-    else:
-        settings.pop("defaultProvider", None)
-    save_pi_settings(settings, reason="set_default_provider")
-
-
 def get_default_model() -> str | None:
     value = load_pi_settings().get("defaultModel")
     return value if isinstance(value, str) and value else None
 
 
-def set_default_model(model_id: str | None) -> None:
+def set_default_provider_and_model(
+    provider_id: str | None,
+    model_id: str | None,
+) -> None:
+    if (provider_id is None) != (model_id is None):
+        raise ValueError("Provider and model defaults must be changed together")
+
     settings = load_pi_settings()
-    if model_id:
+    if provider_id is not None and model_id is not None:
+        settings["defaultProvider"] = provider_id
         settings["defaultModel"] = model_id
     else:
+        settings.pop("defaultProvider", None)
         settings.pop("defaultModel", None)
-    save_pi_settings(settings, reason="set_default_model")
+    save_pi_settings(settings, reason="set_default_provider_and_model")
 
 
 def load_pi_models() -> dict[str, Any]:
@@ -398,11 +340,6 @@ def remove_provider_override(provider_id: str) -> bool:
     if not isinstance(providers, dict) or provider_id not in providers:
         return False
     del providers[provider_id]
-    if providers:
-        payload["providers"] = providers
-        save_pi_models(payload, reason="remove_provider_override")
-    else:
-        path = get_pi_models_path()
-        if path.exists():
-            path.unlink()
+    payload["providers"] = providers
+    save_pi_models(payload, reason="remove_provider_override")
     return True

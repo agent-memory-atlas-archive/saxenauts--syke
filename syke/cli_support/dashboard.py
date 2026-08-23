@@ -7,7 +7,8 @@ from syke.cli_support.context import get_db
 from syke.cli_support.daemon_state import daemon_payload
 from syke.cli_support.providers import provider_payload
 from syke.cli_support.render import console
-from syke.config import user_syke_db_path
+from syke.config import user_control_dir, user_syke_db_path
+from syke.control import receipt_rollup
 
 
 def show_dashboard(user_id: str) -> None:
@@ -26,8 +27,6 @@ def show_dashboard(user_id: str) -> None:
         daemon_label = "[yellow]stale[/yellow] (service registration broken)"
     elif daemon.get("running") and daemon.get("pid") is not None:
         daemon_label = f"[green]running[/green] (PID {daemon['pid']})"
-    elif daemon.get("state") == "legacy_scheduled_sync":
-        daemon_label = "[yellow]legacy scheduled sync[/yellow] (no background service)"
     elif daemon.get("registered"):
         daemon_label = f"[yellow]registered[/yellow] ({daemon.get('detail')})"
     else:
@@ -44,11 +43,8 @@ def show_dashboard(user_id: str) -> None:
     try:
         memex = db.get_memex(user_id)
         if memex:
-            mem_count = db.count_memories(user_id)
-            cycle_count = db.conn.execute(
-                "SELECT COUNT(*) FROM cycle_records WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()[0]
+            mem_count = int(db.get_graph_stats(user_id)["memories"])
+            cycle_count = receipt_rollup(user_control_dir(user_id))["total"]
             console.print(f"  Memory:  {mem_count} memories, {cycle_count} cycles")
             console.print("  Memex:   [green]synthesized[/green]")
         else:

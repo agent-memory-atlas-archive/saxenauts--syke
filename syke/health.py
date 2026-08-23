@@ -1,17 +1,17 @@
 """Observe — the system watching itself.
 
-Reads from SQLite rollout traces + runtime state, returns structured dicts
-with raw numbers and qualitative assessments. One format, both audiences
-(human + agent).
+Reads protected host receipts, native Pi sessions, and runtime state. Returns
+structured data with raw numbers and qualitative assessments for both humans
+and agents.
 """
 
 from __future__ import annotations
 
-import math
 from datetime import UTC, datetime
 from pathlib import Path
 
-STALENESS_HALF_LIFE_DAYS = 30
+from syke.config import user_control_dir
+from syke.control import list_receipts, receipt_rollup
 
 
 def _hours_ago(iso_timestamp: str | None) -> float | None:
@@ -42,10 +42,6 @@ def _human_ago(hours: float | None) -> str:
     return f"{weeks:.0f}w ago"
 
 
-def _staleness_score(age_days: float) -> float:
-    return 1 - math.exp(-math.log(2) * age_days / STALENESS_HALF_LIFE_DAYS)
-
-
 def _assess_staleness(hours: float | None) -> str:
     if hours is None:
         return "unknown"
@@ -62,20 +58,11 @@ def _assess_staleness(hours: float | None) -> str:
 
 def memory_health(db, user_id: str) -> dict:
     stats = db.get_graph_stats(user_id)
-    orphan_pct = round(stats["orphan_rate"] * 100, 1)
-
-    if stats["active"] == 0:
-        assessment = "empty"
-    elif stats["orphan_rate"] > 0.5:
-        assessment = "fragmented"
-    elif stats["density"] < 0.1:
-        assessment = "sparse"
-    elif stats["density"] > 2.0:
-        assessment = "dense"
-    else:
-        assessment = "healthy"
-
-    return {**stats, "orphan_pct": orphan_pct, "assessment": assessment}
+    return {
+        **stats,
+        "unlinked_pct": round(stats["unlinked_rate"] * 100, 1),
+        "assessment": "available" if stats["memories"] else "empty",
+    }
 
 
 def _parse_iso_timestamp(raw: object) -> datetime | None:
@@ -90,17 +77,14 @@ def _parse_iso_timestamp(raw: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _recent_cycle_records(db, user_id: str, *, limit: int = 20) -> list[dict]:
+def _recent_receipts(user_id: str, *, limit: int = 20) -> list[dict]:
     try:
-        rows = db.get_cycle_records(user_id, limit=limit)
+        return list_receipts(user_control_dir(user_id), limit=limit)
     except Exception:
         return []
-    return [
-        row for row in rows if isinstance(row, dict) and row.get("status") not in ("running", None)
-    ]
 
 
-def _cycle_rollup(db, user_id: str) -> dict[str, float | int]:
+def _cycle_rollup(user_id: str) -> dict[str, float | int]:
     empty = {
         "total_runs": 0,
         "completed_runs": 0,
@@ -109,97 +93,84 @@ def _cycle_rollup(db, user_id: str) -> dict[str, float | int]:
         "total_cost_usd": 0.0,
     }
     try:
-        row = db.conn.execute(
-            """
-            SELECT
-                COALESCE(
-                    SUM(CASE WHEN status != 'running' THEN 1 ELSE 0 END),
-                    0
-                ) AS total_runs,
-                COALESCE(
-                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END),
-                    0
-                ) AS completed_runs,
-                COALESCE(
-                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END),
-                    0
-                ) AS failed_runs,
-                COALESCE(
-                    SUM(CASE WHEN status = 'incomplete' THEN 1 ELSE 0 END),
-                    0
-                ) AS incomplete_runs,
-                COALESCE(
-                    SUM(CASE WHEN status != 'running' THEN cost_usd ELSE 0 END),
-                    0
-                ) AS total_cost_usd
-            FROM cycle_records
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ).fetchone()
+        counts = receipt_rollup(user_control_dir(user_id))
+        synthesis_sessions = [
+            entry for entry in _load_session_entries() if entry.get("kind") == "synthesis"
+        ]
     except Exception:
         return empty
-    if row is None:
-        return empty
     return {
-        "total_runs": int(row["total_runs"] or 0),
-        "completed_runs": int(row["completed_runs"] or 0),
-        "failed_runs": int(row["failed_runs"] or 0),
-        "incomplete_runs": int(row["incomplete_runs"] or 0),
-        "total_cost_usd": round(float(row["total_cost_usd"] or 0.0), 4),
+        "total_runs": counts["total"],
+        "completed_runs": counts["completed"],
+        "failed_runs": counts["failed"],
+        "incomplete_runs": counts["incomplete"],
+        "total_cost_usd": round(
+            sum(float(entry.get("cost_usd") or 0) for entry in synthesis_sessions),
+            4,
+        ),
     }
 
 
+def _receipt_memex_moved(receipt: dict) -> bool:
+    """Read current version evidence while tolerating old MEMEX update flags."""
+    if receipt.get("status") != "completed":
+        return False
+    return isinstance(receipt.get("memex_version"), dict) or bool(receipt.get("memex_updated"))
+
+
+def _receipt_recovered(receipt: dict) -> bool:
+    recovery = receipt.get("recovery")
+    if isinstance(recovery, dict):
+        return recovery.get("restored") is True
+    # Legacy compatibility is limited to the operational rollback verdict.
+    state_change = receipt.get("state_change")
+    return isinstance(state_change, dict) and state_change.get("graph_outcome") == "restored"
+
+
 def synthesis_health(db, user_id: str, metrics_dir: Path | None = None) -> dict:
-    cycles = _recent_cycle_records(db, user_id, limit=5)
-    cycle_rollup = _cycle_rollup(db, user_id)
+    _ = db, metrics_dir
+    cycles = _recent_receipts(user_id, limit=5)
+    cycle_rollup = _cycle_rollup(user_id)
+    native_by_cycle = {
+        str(entry.get("operation_id") or ""): entry
+        for entry in _load_session_entries()
+        if entry.get("kind") == "synthesis"
+    }
 
     if cycles:
         last_run = cycles[0]
         last_ts = last_run.get("completed_at") or last_run.get("started_at")
-        recent_costs = [float(c.get("cost_usd", 0) or 0) for c in cycles if c.get("cost_usd")]
+        recent_sessions = [native_by_cycle.get(str(cycle.get("id") or "")) for cycle in cycles]
+        recent_costs = [
+            float(session.get("cost_usd") or 0)
+            for session in recent_sessions
+            if isinstance(session, dict)
+        ]
         avg_cost = round(sum(recent_costs) / len(recent_costs), 4) if recent_costs else 0
         total_cost = float(cycle_rollup["total_cost_usd"])
-        created = int(last_run.get("memories_created") or 0)
-        superseded = int(last_run.get("memories_updated") or 0)
-        linked = int(last_run.get("links_created") or 0)
-        deactivated = 0
-        memex_updated = bool(last_run.get("memex_updated"))
-        duration_ms = int(last_run.get("duration_ms") or 0)
-        cost_usd = round(float(last_run.get("cost_usd") or 0), 4)
+        memex_moved = _receipt_memex_moved(last_run)
+        recovered = _receipt_recovered(last_run)
+        last_session = native_by_cycle.get(str(last_run.get("id") or ""))
+        duration_ms = int(last_session.get("duration_ms") or 0) if last_session else 0
+        cost_usd = round(float(last_session.get("cost_usd") or 0), 4) if last_session else 0
         recent_runs = len(cycles)
         last_status = str(last_run.get("status") or "unknown")
     else:
-        try:
-            traces = db.get_rollout_traces(user_id, kind="synthesis", limit=200)
-        except Exception:
-            traces = []
-        recent_traces = traces[:5]
-        last_run = recent_traces[0] if recent_traces else {}
-        last_ts = last_run.get("completed_at") or last_run.get("started_at")
-        trace_costs = []
-        for trace in traces:
-            trace_metrics = trace.get("metrics") if isinstance(trace.get("metrics"), dict) else {}
-            trace_costs.append(float(trace_metrics.get("cost_usd", trace.get("cost_usd", 0)) or 0))
-        recent_costs = [cost for cost in trace_costs[:5] if cost]
-        avg_cost = round(sum(recent_costs) / len(recent_costs), 4) if recent_costs else 0
-        total_cost = round(sum(trace_costs), 4)
-        created = 0
-        superseded = 0
-        linked = 0
-        deactivated = 0
-        extras = last_run.get("extras") if isinstance(last_run.get("extras"), dict) else {}
-        memex_updated = bool(extras.get("memex_updated", False))
-        metrics = last_run.get("metrics") if isinstance(last_run.get("metrics"), dict) else {}
-        duration_ms = metrics.get("duration_ms", last_run.get("duration_ms")) if last_run else None
-        cost_usd = round(float(metrics.get("cost_usd", last_run.get("cost_usd", 0)) or 0), 4)
-        recent_runs = len(recent_traces)
-        last_status = str(last_run.get("status") or "unknown") if last_run else "unknown"
+        last_run = {}
+        last_ts = None
+        avg_cost = 0
+        total_cost = float(cycle_rollup["total_cost_usd"])
+        memex_moved = False
+        recovered = False
+        duration_ms = None
+        cost_usd = 0
+        recent_runs = 0
+        last_status = "unknown"
 
     hours = _hours_ago(last_ts if isinstance(last_ts, str) else None)
     if hours is None:
         assessment = "never_run"
-    elif last_status in {"failed", "incomplete"} and hours < 24:
+    elif last_status in {"failed", "blocked", "incomplete"} and hours < 24:
         assessment = "degraded"
     elif hours < 1:
         assessment = "active"
@@ -215,11 +186,8 @@ def synthesis_health(db, user_id: str, metrics_dir: Path | None = None) -> dict:
         "last_run_ago": _human_ago(hours),
         "last_run_hours": hours,
         "last_status": last_status,
-        "created": created,
-        "superseded": superseded,
-        "linked": linked,
-        "deactivated": deactivated,
-        "memex_updated": memex_updated,
+        "memex_moved": memex_moved,
+        "recovered": recovered,
         "duration_ms": duration_ms,
         "cost_usd": cost_usd,
         "avg_cost_usd": avg_cost,
@@ -233,24 +201,25 @@ def synthesis_health(db, user_id: str, metrics_dir: Path | None = None) -> dict:
 
 
 def evolution_trends(db, user_id: str, days: int = 7) -> dict:
-    trends = db.get_memory_trends(user_id, days)
-
-    if trends["created"] == 0 and trends["superseded"] == 0:
-        assessment = "dormant"
-    elif trends["superseded"] > trends["created"]:
-        assessment = "consolidating"
-    elif trends["net"] > 0 and trends["links_created"] > 0:
-        assessment = "growing"
-    elif trends["net"] > 0:
-        assessment = "accumulating"
-    else:
-        assessment = "stable"
-
-    supersession_rate = (
-        round(trends["superseded"] / trends["created"], 2) if trends["created"] > 0 else 0
-    )
-
-    return {**trends, "supersession_rate": supersession_rate, "assessment": assessment}
+    """Return operation outcomes without inventing ordinary graph history."""
+    _ = db
+    cutoff = datetime.now(UTC).timestamp() - (days * 86400)
+    receipts = []
+    for receipt in list_receipts(user_control_dir(user_id)):
+        event_time = _parse_iso_timestamp(receipt.get("completed_at") or receipt.get("started_at"))
+        if event_time is not None and event_time.timestamp() >= cutoff:
+            receipts.append(receipt)
+    statuses = [str(receipt.get("status") or "incomplete") for receipt in receipts]
+    return {
+        "days": days,
+        "cycles": len(receipts),
+        "completed": statuses.count("completed"),
+        "failed": statuses.count("failed"),
+        "blocked": statuses.count("blocked"),
+        "incomplete": statuses.count("incomplete"),
+        "recovered": sum(_receipt_recovered(receipt) for receipt in receipts),
+        "memex_movements": sum(_receipt_memex_moved(receipt) for receipt in receipts),
+    }
 
 
 def signals(db, user_id: str) -> list[dict]:
@@ -260,21 +229,9 @@ def signals(db, user_id: str) -> list[dict]:
 
     result = []
 
-    orphans = db.get_orphan_memories(user_id, limit=3)
-    for o in orphans:
-        age_hours = _hours_ago(o["created_at"])
-        age_str = _human_ago(age_hours)
-        preview = o["preview"].strip().split("\n")[0][:50]
-        result.append(
-            {
-                "type": "decay_candidate",
-                "detail": f'"{preview}" \u2014 {age_str}, 0 links',
-            }
-        )
-
     memex = db.get_memex(user_id)
     if memex:
-        memex_hours = _hours_ago(memex.get("created_at"))
+        memex_hours = _hours_ago(memex.get("updated_at") or memex.get("created_at"))
         if memex_hours and memex_hours > 24:
             result.append(
                 {
@@ -292,12 +249,12 @@ def signals(db, user_id: str) -> list[dict]:
                 "detail": str(file_logging["detail"]),
             }
         )
-    trace_store = visibility["trace_store"]
-    if not bool(trace_store["ok"]):
+    session_history = visibility["session_history"]
+    if not bool(session_history["ok"]):
         result.append(
             {
-                "type": "trace_store_disabled",
-                "detail": str(trace_store["detail"]),
+                "type": "session_history_unavailable",
+                "detail": str(session_history["detail"]),
             }
         )
 
@@ -326,9 +283,8 @@ def memex_health(db, user_id: str) -> dict:
 
     content = memex.get("content", "")
     lines = len(content.strip().split("\n")) if content else 0
-    hours = _hours_ago(memex.get("created_at"))
-
-    active_count = db.count_memories(user_id, active_only=True)
+    hours = _hours_ago(memex.get("updated_at") or memex.get("created_at"))
+    memory_count = db.get_graph_stats(user_id)["memories"]
 
     return {
         "exists": True,
@@ -336,7 +292,7 @@ def memex_health(db, user_id: str) -> dict:
         "chars": len(content),
         "updated_ago": _human_ago(hours),
         "updated_hours": hours,
-        "active_memories": active_count,
+        "memories": memory_count,
         "assessment": _assess_staleness(hours),
     }
 
@@ -354,9 +310,12 @@ def full_observe(db, user_id: str, days: int = 7) -> dict:
     }
 
 
-def _load_trace_entries(db, user_id: str) -> list[dict]:
+def _load_session_entries() -> list[dict]:
+    from syke.runtime import workspace as workspace_module
+    from syke.runtime.pi_sessions import list_sessions
+
     try:
-        return db.get_rollout_traces(user_id, limit=1000)
+        return list_sessions(workspace_module.SESSIONS_DIR, limit=1000)
     except Exception:
         return []
 
@@ -367,48 +326,25 @@ def runtime_health(db, user_id: str, metrics_dir: Path | None = None) -> dict:
     from syke.metrics import runtime_metrics_status
 
     _ = metrics_dir
-    runtime_entries = _load_trace_entries(db, user_id)
+    runtime_entries = _load_session_entries()
     ask_entries = [entry for entry in runtime_entries if entry.get("kind") == "ask"]
     synthesis_entries = [entry for entry in runtime_entries if entry.get("kind") == "synthesis"]
-    cycle_rollup = _cycle_rollup(db, user_id)
-    cycle_runs = _recent_cycle_records(db, user_id, limit=20)
+    cycle_rollup = _cycle_rollup(user_id)
+    cycle_runs = _recent_receipts(user_id, limit=20)
     cycle_failed_runs = int(cycle_rollup["failed_runs"]) + int(cycle_rollup["incomplete_runs"])
 
     total_tool_calls = 0
     cache_read_tokens = 0
     cache_write_tokens = 0
-    warm_reuse_runs = 0
-    cold_start_runs = 0
     failures = 0
-    daemon_ipc_runs = 0
-    daemon_worker_runs = 0
-    direct_runs = 0
     tool_name_counts: dict[str, int] = {}
 
     for entry in runtime_entries:
-        metrics = entry.get("metrics", {})
-        runtime = entry.get("runtime", {})
-        if not isinstance(metrics, dict):
-            metrics = {}
-        if not isinstance(runtime, dict):
-            runtime = {}
-
         total_tool_calls += len(entry.get("tool_calls") or [])
-        cache_read_tokens += int(metrics.get("cache_read_tokens", 0) or 0)
-        cache_write_tokens += int(metrics.get("cache_write_tokens", 0) or 0)
-        if runtime.get("runtime_reused") is True:
-            warm_reuse_runs += 1
-        elif runtime.get("runtime_reused") is False:
-            cold_start_runs += 1
+        cache_read_tokens += int(entry.get("cache_read_tokens", 0) or 0)
+        cache_write_tokens += int(entry.get("cache_write_tokens", 0) or 0)
         if entry.get("status") == "failed":
             failures += 1
-        transport = runtime.get("transport")
-        if transport == "daemon_ipc":
-            daemon_ipc_runs += 1
-        elif transport == "daemon_worker":
-            daemon_worker_runs += 1
-        elif transport == "direct":
-            direct_runs += 1
 
         for tool_call in entry.get("tool_calls") or []:
             if isinstance(tool_call, dict):
@@ -417,17 +353,12 @@ def runtime_health(db, user_id: str, metrics_dir: Path | None = None) -> dict:
                     tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
 
     def _avg_duration_ms(rows: list[dict]) -> int | None:
-        durations: list[int] = []
-        for row in rows:
-            metrics = row.get("metrics")
-            if isinstance(metrics, dict) and metrics.get("duration_ms"):
-                durations.append(int(metrics.get("duration_ms", 0) or 0))
+        durations = [int(row.get("duration_ms") or 0) for row in rows if row.get("duration_ms")]
         if not durations:
             return None
         return int(sum(durations) / len(durations))
 
     last_entry = runtime_entries[0] if runtime_entries else None
-    last_runtime = last_entry.get("runtime", {}) if isinstance(last_entry, dict) else {}
     metric_ts = None
     if isinstance(last_entry, dict):
         metric_ts = last_entry.get("completed_at") or last_entry.get("started_at")
@@ -451,12 +382,10 @@ def runtime_health(db, user_id: str, metrics_dir: Path | None = None) -> dict:
         assessment = "no_telemetry"
     elif failures > 0 or cycle_failed_runs > 0:
         assessment = "degraded"
-    elif runtime_entries and cold_start_runs > warm_reuse_runs:
-        assessment = "cold"
     elif not runtime_entries:
         assessment = "cycle_only"
     else:
-        assessment = "warm"
+        assessment = "observed"
 
     return {
         "recent_runs": len(runtime_entries),
@@ -476,29 +405,20 @@ def runtime_health(db, user_id: str, metrics_dir: Path | None = None) -> dict:
             if isinstance(last_entry, dict)
             else None
         ),
-        "last_provider": last_runtime.get("provider") if isinstance(last_runtime, dict) else None,
-        "last_model": last_runtime.get("model") if isinstance(last_runtime, dict) else None,
-        "last_response_id": last_runtime.get("response_id")
-        if isinstance(last_runtime, dict)
-        else None,
+        "last_provider": last_entry.get("provider") if isinstance(last_entry, dict) else None,
+        "last_model": last_entry.get("model") if isinstance(last_entry, dict) else None,
+        "last_response_id": last_entry.get("response_id") if isinstance(last_entry, dict) else None,
         "avg_ask_ms": _avg_duration_ms(ask_entries),
         "avg_synthesis_ms": _avg_duration_ms(synthesis_entries),
         "total_tool_calls": total_tool_calls,
         "cache_read_tokens": cache_read_tokens,
         "cache_write_tokens": cache_write_tokens,
-        "warm_reuse_runs": warm_reuse_runs,
-        "cold_start_runs": cold_start_runs,
-        "daemon_ipc_runs": daemon_ipc_runs,
-        "daemon_worker_runs": daemon_worker_runs,
-        "direct_runs": direct_runs,
         "failures": failures + cycle_failed_runs,
         "top_tools": top_tools,
-        "session_count": 0,
-        "scripts_count": 0,
         "file_logging_enabled": bool(visibility["file_logging"]["ok"]),
         "file_logging_error": visibility["file_logging"]["detail"],
-        "trace_store_enabled": bool(visibility["trace_store"]["ok"]),
-        "trace_store_error": visibility["trace_store"]["detail"],
+        "session_history_available": bool(visibility["session_history"]["ok"]),
+        "session_history_detail": visibility["session_history"]["detail"],
         "daemon_running": daemon_running,
         "daemon_ipc_available": bool(daemon_ipc["ok"]),
         "daemon_ipc_detail": daemon_ipc["detail"],
@@ -520,46 +440,32 @@ def format_observe(data: dict) -> str:
 
     lines.append("## Memory")
     lines.append(
-        f"{mem['active']} active memories, {mem['retired']} retired. "
-        f"{mem['links']} links across {mem['active']} nodes "
-        f"({mem['density']} connections/memory"
-        f"{', ' + mem['assessment'] if mem['assessment'] != 'healthy' else ''})."
+        f"{mem['memories']} current memories and {mem['links']} current links "
+        f"({mem['links_per_memory']} links/memory)."
     )
     if mem["hubs"]:
         hub_strs = [f'"{h["preview"]}" ({h["links"]})' for h in mem["hubs"][:3]]
         lines.append(f"Densest hubs: {', '.join(hub_strs)}.")
-    if mem["supersession_max_depth"] > 0:
+    if mem["unlinked"] > 0:
         lines.append(
-            f"Supersession depth: avg {mem['supersession_avg_depth']}, "
-            f"max {mem['supersession_max_depth']} "
-            f"({mem['chains_with_history']} memories have evolved)."
+            f"{mem['unlinked']} current memories have no current links "
+            f"({mem['unlinked_pct']}%); this is graph shape, not a health verdict."
         )
-    if mem["orphan_count"] > 0:
-        lines.append(f"{mem['orphan_count']} orphaned ({mem['orphan_pct']}% unlinked).")
     lines.append("")
 
     lines.append("## Synthesis")
     if syn["assessment"] == "never_run":
         lines.append("Synthesis has never run.")
     else:
-        parts = [f"Last run {syn['last_run_ago']}"]
-        outcomes = []
-        if syn["created"]:
-            outcomes.append(f"{syn['created']} created")
-        if syn["superseded"]:
-            outcomes.append(f"{syn['superseded']} superseded")
-        if syn["linked"]:
-            outcomes.append(f"{syn['linked']} linked")
-        if syn["deactivated"]:
-            outcomes.append(f"{syn['deactivated']} deactivated")
-        if outcomes:
-            parts.append(", ".join(outcomes))
+        parts = [f"Last run {syn['last_run_ago']}", f"status {syn['last_status']}"]
         if syn["duration_ms"]:
             parts.append(f"{syn['duration_ms'] / 1000:.0f}s")
         if syn["cost_usd"]:
             parts.append(f"${syn['cost_usd']:.2f}")
-        if syn["memex_updated"]:
-            parts.append("memex updated")
+        if syn["memex_moved"]:
+            parts.append("memex moved")
+        if syn["recovered"]:
+            parts.append("recovery restored")
         lines.append(". ".join(parts) + ".")
     if syn["total_cost_usd"] > 0:
         lines.append(f"Lifetime cost: ${syn['total_cost_usd']:.2f}.")
@@ -583,12 +489,6 @@ def format_observe(data: dict) -> str:
             f"{rt['total_tool_calls']} tool calls. Cache read {rt['cache_read_tokens']}, "
             f"cache write {rt['cache_write_tokens']}."
         )
-        lines.append(f"Warm reuse {rt['warm_reuse_runs']}, cold starts {rt['cold_start_runs']}.")
-        lines.append(
-            f"Daemon IPC asks {rt['daemon_ipc_runs']}, daemon worker asks "
-            f"{rt['daemon_worker_runs']}, legacy direct asks {rt['direct_runs']}."
-        )
-        lines.append(f"Workspace sessions {rt['session_count']}, scripts {rt['scripts_count']}.")
         if rt["top_tools"]:
             tools = ", ".join(f"{name} ({count})" for name, count in rt["top_tools"])
             lines.append(f"Top tools: {tools}.")
@@ -599,23 +499,19 @@ def format_observe(data: dict) -> str:
         lines.append("No memex yet.")
     else:
         lines.append(f"{mx['lines']} lines, {mx['chars']} chars. Last updated {mx['updated_ago']}.")
-        if mx["active_memories"]:
-            lines.append(f"{mx['active_memories']} active memories backing the map.")
+        if mx["memories"]:
+            lines.append(f"{mx['memories']} current memories backing the map.")
     lines.append("")
 
-    lines.append(f"## Evolution ({evo['days']}d)")
-    lines.append(
-        f"+{evo['created']} created, "
-        f"-{evo['superseded']} superseded, "
-        f"-{evo['deactivated']} deactivated. "
-        f"Net {'+' if evo['net'] >= 0 else ''}{evo['net']}."
-    )
-    if evo["links_per_day"] > 0:
-        lines.append(f"Links: {evo['links_per_day']}/day.")
-    if evo["supersession_rate"] > 0:
-        lines.append(f"Supersession rate: {evo['supersession_rate']:.0%} ({evo['assessment']}).")
-    elif evo["assessment"] != "dormant":
-        lines.append(f"Graph is {evo['assessment']}.")
+    lines.append(f"## Operations ({evo['days']}d)")
+    if evo["cycles"]:
+        lines.append(
+            f"{evo['cycles']} cycles: {evo['completed']} completed, {evo['failed']} failed, "
+            f"{evo['blocked']} blocked, {evo['incomplete']} incomplete; "
+            f"MEMEX moved {evo['memex_movements']} times."
+        )
+    else:
+        lines.append("No cycle receipts in this window.")
     lines.append("")
 
     if sigs:

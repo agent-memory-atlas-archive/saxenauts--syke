@@ -1,6 +1,6 @@
 # Syke Setup Guide
 
-Canonical first-run path for humans, agents, and release smoke tests.
+Canonical first-run path for humans and agents.
 
 Setup has one job: make Syke safe and boring to run on a real user's machine.
 It should show what it found, ask before writing, persist the chosen sources and
@@ -33,16 +33,20 @@ The user experience should be:
 2. Choose or confirm sources.
 3. Confirm provider/auth.
 4. Let setup start the background service/bootstrap unless intentionally skipped.
-5. Open the timeline and keep working while first synthesis runs.
+5. On macOS, allow the protected folders Syke should observe when prompted.
+6. Open the timeline and keep working while first synthesis runs.
 
 A healthy first run should end with:
 
 - provider selected and daemon-safe
 - detected sources selected or intentionally skipped
-- `~/.syke/syke.db` initialized
-- `~/.syke/MEMEX.md` available
-- adapter markdowns installed under `~/.syke/adapters/`
+- `~/.syke/workspace/syke.db` initialized
+- `~/.syke/workspace/MEMEX.md` available
+- adapter markdowns installed under `~/.syke/workspace/adapters/`
+- protected native sessions and final receipts available under
+  `~/.syke/control/{sessions,receipts}/`
 - background service install either confirmed or clearly skipped/explained
+- macOS protected-folder access verified or clearly reported as blocked
 - local timeline available through `syke web`
 
 ## Agent Mode (Non-Interactive)
@@ -53,7 +57,7 @@ syke setup --agent
 
 `--agent` returns JSON with a `status` field:
 
-- `needs_runtime` - install Node.js 20+ (22 LTS recommended) and rerun setup
+- `needs_runtime` - install Node.js 22.19 or newer and rerun setup
 - `needs_provider` - configure provider auth and rerun setup
 - `complete` - setup finished
 - `failed` - inspect the returned `error`
@@ -67,6 +71,7 @@ Agent payload fields that matter for orchestration:
 - `estimated_minutes`, `total_files`, `estimate_method`
 - `daemon` (`started` vs `skipped`)
 - `daemon_persistence`
+- `filesystem_access`
 - `monitor`
 - `onboarding`
 
@@ -79,11 +84,12 @@ Recommended automation flow:
    then run one explicit `syke sync`.
 4. Only enable daemon setup in environments where launchd/systemd side effects are intended.
 
-After manual `syke sync`, the JSON payload includes `duration_ms`, `trace_id`,
-`tool_calls`, `num_turns`, `model`, `cost_usd`, `memex_updated`, and
-`next_steps`. Agents should treat that as the handoff point: if `status` is
-`completed`, stop setup work, move on with normal user work, and use `syke ask`
-or the timeline only when useful.
+After manual `syke sync`, the JSON payload includes `duration_ms`,
+`session_id`, `session_file`, `num_turns`, `model`, `cost_usd`,
+`memex_updated`, and `next_steps`. The session fields point to Pi's protected
+native record when deeper evidence is needed. Agents should treat that as the
+handoff point: if `status` is `completed`, stop setup work, move on with normal
+user work, and use `syke ask` or the timeline only when useful.
 
 Agent behavior rules:
 
@@ -118,11 +124,13 @@ throwaway profiles.
 
 First sync is not just "fetch recent messages." It is a stitching pass:
 
-1. Detect selected harness roots/files.
+1. Detect the harness roots/files selected for ingestion.
 2. Read available event traces per harness.
 3. Synthesize a coherent cross-harness state.
-4. Commit durable memory to `~/.syke/syke.db`.
-5. Export current projection to `~/.syke/MEMEX.md`.
+4. Commit durable memory to `~/.syke/workspace/syke.db`.
+5. Export current projection to `~/.syke/workspace/MEMEX.md`.
+6. Keep the native Pi session in `~/.syke/control/sessions/` and write one final
+   host verdict to `~/.syke/control/receipts/`.
 
 The setup receipt is written to `~/.syke/onboarding.json` and surfaced by the
 local timeline. It exists so a fresh user does not stare at an empty timeline
@@ -136,8 +144,8 @@ Timeline states:
 - **MEMEX bootstrap is waiting** — setup is complete, but daemon/sync is not
   currently running. Run `syke sync` once or `syke daemon start`.
 - **No harness history detected yet** — Syke did not find prior local traces.
-  This is not a failure; future harness activity and `syke record` can still
-  create memory.
+  This is not a failure; future harness activity and records admitted by
+  `syke record` give later synthesis new evidence.
 
 Fresh-machine timing depends mostly on detected source volume. The agent output
 already includes a conservative estimate:
@@ -160,28 +168,6 @@ Heavier histories can take several minutes on first pass. During this window:
 If provider/model setup is missing, setup should stop at `needs_provider`.
 If someone starts the daemon anyway, the daemon backs off on configuration
 errors instead of writing failed cycles every few seconds.
-
-## Fresh Install/Setup Test Without Touching Real Data
-
-Use a separate HOME so your real `~/.syke` is untouched:
-
-```bash
-FRESH_HOME="$HOME/.syke-fresh-home"
-rm -rf "$FRESH_HOME"
-mkdir -p "$FRESH_HOME"
-
-HOME="$FRESH_HOME" uv tool install syke
-HOME="$FRESH_HOME" "$FRESH_HOME/.local/bin/syke" --user fresh setup --agent
-HOME="$FRESH_HOME" "$FRESH_HOME/.local/bin/syke" --user fresh status --json
-```
-
-If provider auth is already available in that fresh profile:
-
-```bash
-HOME="$FRESH_HOME" "$FRESH_HOME/.local/bin/syke" --user fresh setup --agent --skip-daemon
-HOME="$FRESH_HOME" "$FRESH_HOME/.local/bin/syke" --user fresh sync
-HOME="$FRESH_HOME" "$FRESH_HOME/.local/bin/syke" --user fresh ask --json "what am I working on"
-```
 
 ## Provider Setup
 
@@ -232,15 +218,26 @@ Notes:
 
 Primary runtime artifacts are under `~/.syke/`:
 
-- `syke.db`
-- `MEMEX.md`
-- `PSYCHE.md`
-- `adapters/{source}.md`
-- `pi-agent/auth.json`
-- `pi-agent/settings.json`
-- `pi-agent/models.json`
+- `workspace/syke.db`
+- `workspace/MEMEX.md`
+- `workspace/adapters/{source}.md`
+- `workspace/artifacts/`
+- `workspace/harness/`
+- `workspace/scratch/`
+- `control/runtime/tmp/`
+- `control/runtime/cycles/`
+- `pi-agent/{auth.json,settings.json,models.json}` (host-managed)
+- `control/sessions/`
+- `control/receipts/`
+- `control/records/`
+- `control/tokenizers/`
+- `control/recovery/`
 - `source_selection.json`
 - `onboarding.json`
+
+The Pi controller may persist learned artifacts under `workspace/` and
+operational files under `control/runtime/`. It can inspect but cannot modify
+protected sessions, receipts, records, or recovery state under `control/`.
 
 Daemon/system artifacts:
 
@@ -248,8 +245,21 @@ Daemon/system artifacts:
 - `~/Library/LaunchAgents/com.syke.daemon.plist` (macOS launchd installs)
 - `~/.config/systemd/user/syke-daemon.service` (Linux systemd user installs)
 
-Syke does not write replay or benchmark state into this repo. Replay-lab is a
-separate sibling repository.
+## Upgrading From A Pre-v3 Database
+
+This pre-1.0 release does not migrate databases or workspace layouts from
+`0.5.10` and earlier. Back up the old installation root and let setup create the
+current schema-v3 layout:
+
+```bash
+syke daemon stop
+mv ~/.syke ~/.syke.pre-v3-backup
+# upgrade Syke using the same installer that originally installed it
+syke setup
+```
+
+There is no automatic import from that backup. Keep it if historical state
+matters; do not copy its database or control files into the new layout.
 
 ## Verify After Setup
 
@@ -270,12 +280,15 @@ What to look for:
 - `syke daemon logs` should show explicit UTC timestamps on daemon-owned log lines.
 - `syke doctor` should explain actionable failures instead of hiding them behind
   a generic unhealthy state.
+- On macOS, interactive `syke doctor` rechecks protected-folder access through
+  the background Syke process. `syke doctor --json` reports the last stored
+  result without opening a system prompt.
 
 ## Background Service Behavior
 
 Syke presents one background-service contract. The platform manager differs,
 but the public state machine is the same: `stopped`, `registered`, `running`,
-`stale`, or `legacy_scheduled_sync`.
+or `stale`.
 
 On macOS, the manager is launchd. On Linux, the manager is a user systemd
 service. On other systems, run the service manually with `syke daemon run`.
@@ -292,7 +305,6 @@ Linux persistence contract:
 - user systemd unit starts the daemon with `Restart=always`
 - the daemon process also serves the local timeline UI while running
 - boot-time persistence requires user linger (`loginctl enable-linger <user>`)
-- legacy cron entries are treated as scheduled sync only, not daemon liveness
 
 Other non-macOS contract:
 
@@ -307,59 +319,50 @@ The daemon is intentionally conservative:
 - daemon health treats runtime reachability as critical
 - configuration failures should back off instead of hot-looping
 
-## Product QA Checklist
-
-Before a release, verify these from a clean or isolated profile:
-
-- `scripts/release-candidate.sh` passes before any push/tag/publish step; this
-  is the local proof, while GitHub Actions is the remote confirmation.
-- GitHub Actions passes on the exact pushed commit before any version bump or
-  release tag is treated as publishable.
-- `syke setup --agent` returns `needs_provider` with a non-zero auth exit when no provider exists.
-- `syke setup --agent --skip-daemon` completes without launchd/systemd side effects when provider auth exists.
-- `syke status --json` includes daemon, runtime, provider, and persistence fields.
-- `syke web` serves the normal timeline shell even before the first MEMEX exists.
-- `syke daemon run` or `syke daemon start` does not hot-loop when provider/model config is missing.
-- `scripts/fresh-install-test.sh --run` passes without touching the real `~/.syke`.
-- `scripts/linux-managed-service-smoke.sh` passes on a real Linux host with
-  `systemd --user` available; this is the release proof for Linux/Azure daemon
-  parity.
-- `scripts/linux-product-qa.sh --wheel dist/<wheel>` passes when the release
-  promise includes Linux end-to-end setup/web/browser confidence.
-- package version and changelog are bumped before tagging.
-- `scripts/release-candidate.sh --for-tag vX.Y.Z` passes for the actual tag;
-  this wraps local preflight plus `scripts/check_release_tag.py`.
-
 ## macOS Permissions And Sandbox
 
-On macOS, Syke uses `sandbox-exec` around the Pi runtime for ask and synthesis.
-The sandbox is intentionally scoped:
+On macOS, Syke uses `sandbox-exec` around each model-invoked tool process. Pi's
+host process remains outside that sandbox so it can use provider credentials
+and write its native session. Pi's built-in tools and untrusted extensions are
+disabled.
 
-- selected harness roots are read-only
-- Syke workspace and active Pi state are writable
-- broad home-directory reads are denied
-- sensitive directories such as `.ssh`, `.gnupg`, `.aws`, `.docker`, `.kube`,
-  and gcloud config are explicitly denied
+- the current user's full `$HOME`, installed Syke code, and protected
+  `control/` state are readable
+- ordinary computer files are read-only
+- only the Syke workspace and `control/runtime/` are writable
+- protected sessions, receipts, records, signals, and recovery state are
+  explicitly non-writable
 - outbound network is allowed for provider calls
 
-This is separate from launchd/TCC. If Syke is launched from a source checkout
-under `~/Documents`, `~/Desktop`, or `~/Downloads`, background launchd jobs can
-be blocked by macOS. In that case use:
+This is separate from macOS privacy permission. Normal folders under `$HOME`
+work without an extra step, but Desktop, Documents, and Downloads require user
+consent. During setup, Syke starts a temporary one-shot launchd job through the
+same installed launcher, Python runtime, Node runtime, and Seatbelt profile used
+by background work. That job tries to list each protected folder so macOS can
+ask for access and Syke can verify the answer immediately.
 
-```bash
-syke install-current
-syke setup
-```
+The check stores only each folder's granted, denied, or missing status plus the
+Python and Node runtime identities. It does not store filenames or file content.
+The one-shot job exits after the check; the normal Syke daemon remains the only
+persistent background process.
 
-Linux does not yet have an equivalent bubblewrap sandbox guarantee in this
-release.
+If access is denied, setup still completes because ordinary home folders remain
+usable. Enable the folder later in System Settings > Privacy & Security > Files
+& Folders, then run `syke doctor` in a terminal. A runtime replacement makes the
+stored result stale, so doctor rechecks it. No Apple Developer account or Syke
+app bundle is required for this installation-local consent flow.
+
+Linux does not yet have an equivalent model-tool sandbox guarantee in this
+release. Setup reports that OS read-only enforcement is unavailable instead of
+claiming the macOS boundary is active.
 
 ## Troubleshooting
 
-- `needs_runtime` from `syke setup --agent`: install Node.js 20+ (22 LTS recommended).
+- `needs_runtime` from `syke setup --agent`: install Node.js 22.19 or newer.
 - Provider/auth failures: run `syke auth status` then `syke doctor`.
 - Empty/old memex: run `syke sync`, then `syke memex`.
-- Background service unavailable on macOS source checkouts under protected folders: use `syke install-current` and rerun setup.
+- Protected macOS folder reported as blocked: enable it under System Settings >
+  Privacy & Security > Files & Folders, then run interactive `syke doctor`.
 - `syke ask --json` exits non-zero: read the structured `error` field. Do not
   treat a backend/runtime error as an answer.
 - Daemon running but ask path feels stale: run `syke daemon status` and compare
@@ -370,5 +373,4 @@ release.
 - [README](../README.md)
 - [Providers](PROVIDERS.md)
 - [Config Reference](CONFIG_REFERENCE.md)
-- [Runtime And Replay](RUNTIME_AND_REPLAY.md)
-- [Scripts Surface](../scripts/README.md)
+- [Architecture](ARCHITECTURE.md)

@@ -4,7 +4,11 @@ from pathlib import Path
 from syke.metrics import setup_logging
 
 
-def test_setup_logging_creates_private_log_file(monkeypatch, tmp_path: Path) -> None:
+def test_setup_logging_creates_private_log_file(
+    monkeypatch,
+    tmp_path: Path,
+    isolated_syke_logging,
+) -> None:
     monkeypatch.setattr("syke.metrics.user_data_dir", lambda _user: tmp_path)
 
     setup_logging("test-user")

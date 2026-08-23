@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from typing import cast
 
 import click
@@ -17,6 +18,8 @@ from syke.cli_support.render import (
     render_section,
     render_setup_line,
 )
+from syke.config import user_control_dir
+from syke.control import receipt_rollup
 from syke.onboarding import read_onboarding_state
 from syke.source_selection import get_selected_sources
 
@@ -24,14 +27,10 @@ from syke.source_selection import get_selected_sources
 def build_status_payload(db, *, user_id: str, cli_provider: str | None) -> dict[str, object]:
     from syke.daemon.ipc import daemon_ipc_status, daemon_runtime_status
     from syke.metrics import runtime_metrics_status
-    from syke.trace_store import trace_store_status
 
     memex = db.get_memex(user_id)
-    memory_count = db.count_memories(user_id)
-    cycle_count = db.conn.execute(
-        "SELECT COUNT(*) FROM cycle_records WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()[0]
+    memory_count = int(db.get_graph_stats(user_id)["memories"])
+    cycle_count = receipt_rollup(user_control_dir(user_id))["total"]
     selected_sources = get_selected_sources(user_id)
     return {
         "ok": True,
@@ -47,10 +46,10 @@ def build_status_payload(db, *, user_id: str, cli_provider: str | None) -> dict[
         "memex": {
             "present": bool(memex),
             "created_at": memex.get("created_at") if memex else None,
+            "updated_at": (memex.get("updated_at") or memex.get("created_at")) if memex else None,
             "memory_count": memory_count,
         },
         "runtime_signals": {
-            "trace_store": trace_store_status(user_id),
             "daemon_ipc": daemon_ipc_status(user_id),
             **runtime_metrics_status(user_id),
         },
@@ -89,12 +88,14 @@ def status(ctx: click.Context, use_json: bool) -> None:
                 show_unavailable=True,
             )
         runtime_signals = cast(dict[str, object], info.get("runtime_signals") or {})
-        trace_store = cast(dict[str, object], runtime_signals.get("trace_store") or {})
+        session_history = cast(dict[str, object], runtime_signals.get("session_history") or {})
         daemon_ipc = cast(dict[str, object], runtime_signals.get("daemon_ipc") or {})
 
         signals: list[tuple[str, bool, str]] = []
-        if trace_store and not trace_store.get("ok", True):
-            signals.append(("trace store", False, str(trace_store.get("detail", ""))))
+        if session_history and not session_history.get("ok", True):
+            signals.append(
+                ("native session history", False, str(session_history.get("detail", "")))
+            )
         if daemon_ipc and not daemon_ipc.get("ok", True):
             signals.append(("daemon IPC", False, str(daemon_ipc.get("detail", ""))))
 
@@ -130,10 +131,11 @@ def status(ctx: click.Context, use_json: bool) -> None:
         console.print(f"  {info['cycle_count']} cycles")
 
         render_section("Memex")
-        if info["memex"]["present"]:
-            mem_count = info["memex"]["memory_count"]
-            created = info["memex"]["created_at"] or "unknown"
-            console.print(f"  [green]✓[/green] memex  {mem_count} memories  [dim]{created}[/dim]")
+        memex = cast(dict[str, object], info["memex"])
+        if memex["present"]:
+            mem_count = memex["memory_count"]
+            updated = memex.get("updated_at") or memex.get("created_at") or "unknown"
+            console.print(f"  [green]✓[/green] memex  {mem_count} memories  [dim]{updated}[/dim]")
         else:
             console.print("  [dim]✗ memex  not yet built — run syke setup or syke sync[/dim]")
     finally:
@@ -215,7 +217,11 @@ def observe(ctx: click.Context, use_json: bool, watch: bool, days: int) -> None:
 @click.option("--json", "use_json", is_flag=True, help="Output as JSON")
 @click.pass_context
 def doctor(ctx: click.Context, network: bool, use_json: bool) -> None:
-    payload = build_doctor_payload(ctx, network=network)
+    payload = build_doctor_payload(
+        ctx,
+        network=network,
+        verify_filesystem=not use_json and sys.stdin.isatty(),
+    )
     if use_json:
         click.echo(json.dumps(payload, indent=2))
     else:

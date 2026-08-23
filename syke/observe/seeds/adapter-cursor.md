@@ -130,13 +130,19 @@ Per turn from JSON: `requestId`, `responseId`, `modelId`.
 
 Each session records a conversation between the user and the Cursor AI within a workspace. This includes: user prompts, assistant text responses, tool invocations (code edits, file reads, terminal commands), tool results, and workspace context. The data captures both chat-mode interactions and composer-mode multi-file editing sessions.
 
+## Project instructions
+
+After resolving the workspace through `workspace.json`, Cursor can use applicable `AGENTS.md` and `CLAUDE.md` files as project rules. Cursor-native project context also includes:
+
+- `.cursor/rules/` (preferred MDC files with scoped `globs`, `description`, and `alwaysApply` metadata)
+- `.cursorrules` in the project root (deprecated)
+- `.cursor/settings.json` for project-specific settings
+
+These files describe current project context. Do not assume an older chat received their current contents unless its native data records them.
+
 ## Harness memory
 
-Cursor reads project-level AI instructions from these sources:
-
-- `.cursor/rules/` directory (preferred, MDC format with `.mdc` extension). Rule files use frontmatter metadata for path-based scoping (e.g., `globs`, `description`, `alwaysApply`)
-- `.cursorrules` in the project root (deprecated in favor of `.cursor/rules/`)
-- `.cursor/settings.json` for project-specific settings
+The `aicontext.personalContext` key in user-level `globalStorage/state.vscdb` holds Cursor's retained global instruction context. Chat and composer records are session history; no separate local project-memory file is confirmed.
 
 ## Distribution
 

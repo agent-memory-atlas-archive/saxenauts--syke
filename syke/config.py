@@ -25,13 +25,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CFG: SykeConfig = load_config()
 
 
-def reload_config() -> SykeConfig:
-    """Re-read config.toml and replace the module-level CFG."""
-    global CFG
-    CFG = load_config()
-    return CFG
-
-
 def _is_source_install() -> bool:
     """True when running from a git clone (pyproject.toml exists at PROJECT_ROOT)."""
     return (PROJECT_ROOT / "pyproject.toml").exists()
@@ -40,12 +33,7 @@ def _is_source_install() -> bool:
 # ── Paths (config.toml → env var override) ──────────────────────────────────
 
 
-# Source paths (where to find session data)
-CODEX_DIR = expand_path(CFG.paths.sources.codex)
-CODEX_GLOBAL_AGENTS = CODEX_DIR / "AGENTS.md"
-
-# Distribution paths (where memex gets written)
-CLAUDE_GLOBAL_MD = expand_path(CFG.paths.distribution.claude_md)
+# Capability installation paths
 SKILLS_DIRS = [expand_path(p) for p in CFG.paths.distribution.skills_dirs]
 
 
@@ -66,10 +54,12 @@ def _env_int(var: str, cfg_val: int) -> int:
     return int(env) if env else cfg_val
 
 
-# ── Agent settings (env var > config.toml > hardcoded default) ──────────────
+# ── Agent settings ─────────────────────────────────────────────────────────
 
 # Ask agent
-ASK_TIMEOUT: int = _env_int("SYKE_ASK_TIMEOUT", CFG.ask.timeout)
+# The ask timeout is durable config, not caller-local environment. Agents often
+# launch Syke from transient shells; they must not be able to shorten daemon asks.
+ASK_TIMEOUT: int = CFG.ask.timeout
 ASK_MAX_PARALLEL: int = _env_int("SYKE_MAX_PARALLEL_ASKS", CFG.ask.max_parallel)
 
 # Synthesis agent
@@ -96,31 +86,50 @@ SYKE_TIMEZONE: str = os.getenv("SYKE_TIMEZONE", "") or CFG.timezone
 DEFAULT_USER: str = os.getenv("SYKE_USER", "") or CFG.user
 
 
-# ── Per-user paths ────────────────────────────────────────────────────────────
+# ── Single-person paths ──────────────────────────────────────────────────────
 #
-# Flat workspace: everything lives at SYKE_HOME directly.
-# The per-user data/{user}/ nesting has been removed.
-# user_id parameter is kept for future multi-user but currently ignored
-# for path resolution.
+# SYKE_HOME is the installation root. The controller can mutate workspace/
+# only; control/ is owned by the trusted host runtime.
+
+
+def user_workspace_dir(user_id: str) -> Path:
+    """Return the controller-writable workspace for this installation."""
+    _ = user_id
+    override = os.getenv("SYKE_WORKSPACE_ROOT")
+    path = Path(override).expanduser().resolve() if override else SYKE_HOME / "workspace"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def user_control_dir(user_id: str) -> Path:
+    """Return the host-owned control directory for this installation."""
+    _ = user_id
+    override = os.getenv("SYKE_CONTROL_ROOT")
+    path = Path(override).expanduser().resolve() if override else SYKE_HOME / "control"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def user_data_dir(user_id: str) -> Path:
-    """Return the user's data directory, creating it if needed.
-
-    In the flat workspace model, this is SYKE_HOME directly.
-    """
-    _ = user_id  # Reserved for future multi-user
+    """Return the installation root, creating it if needed."""
+    _ = user_id
     SYKE_HOME.mkdir(parents=True, exist_ok=True)
     return SYKE_HOME
 
 
 def user_syke_db_path(user_id: str) -> Path:
-    """Return the canonical Syke DB path.
+    """Return the controller-writable graph database path without changing state.
 
     Override: SYKE_DB env var bypasses the standard path resolution.
     """
+    _ = user_id
     env_override = os.getenv("SYKE_DB")
     if env_override:
-        return Path(env_override).resolve()
-    user_data_dir(user_id)  # ensure dir exists
-    return SYKE_HOME / "syke.db"
+        return Path(env_override).expanduser().resolve()
+    workspace_override = os.getenv("SYKE_WORKSPACE_ROOT")
+    workspace = (
+        Path(workspace_override).expanduser().resolve()
+        if workspace_override
+        else SYKE_HOME / "workspace"
+    )
+    return workspace / "syke.db"

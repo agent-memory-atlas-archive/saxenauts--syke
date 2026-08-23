@@ -1,234 +1,408 @@
-"""SQLite schema + queries."""
+"""SQLite schema and current-graph queries."""
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 
-from uuid_extensions import uuid7
+from syke.db_access import DatabaseLease, acquire_database_lease, maintenance_marker_path
 
-from syke.models import Memory
+SCHEMA_VERSION = 3
+GRAPH_IDENTITY_TABLES = ("memories", "links", "current_memex")
 
-VALID_CYCLE_STATUSES = ("running", "completed", "failed", "blocked", "incomplete")
-STALE_RUNNING_CYCLE_SECONDS = 6 * 60 * 60
+_TABLE_COLUMNS = {
+    "syke_identity": ("singleton", "user_id", "created_at"),
+    "memories": ("id", "user_id", "content", "created_at", "updated_at"),
+    "links": ("id", "user_id", "source_id", "target_id", "reason", "created_at"),
+    "current_memex": (
+        "singleton",
+        "id",
+        "user_id",
+        "content",
+        "created_at",
+        "updated_at",
+    ),
+    "memories_fts": ("memory_id", "content"),
+}
 
-# Migrations applied after initial schema creation.
-# The live system is a single-user local DB. Schema migrations must still be
-# idempotent, but obsolete local tables can be removed once code no longer uses
-# them.
-_MEMORY_MIGRATIONS = [
-    # -----------------------------------------------------------------------
-    # Memory layer (storage branch) — memories, links, FTS5
-    # -----------------------------------------------------------------------
-    # --- memories table ---
-    (
-        """CREATE TABLE IF NOT EXISTS memories (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            content TEXT NOT NULL,
-            source_event_ids TEXT DEFAULT '[]',
-            created_at TEXT NOT NULL,
-            updated_at TEXT,
-            superseded_by TEXT,
-            active INTEGER DEFAULT 1
-        )""",
-        "create_memories_table",
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_memories_user_active ON memories(user_id, active)",
-        "memories_user_active_idx",
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_memories_user_created "
-        "ON memories(user_id, created_at DESC)",
-        "memories_user_created_idx",
-    ),
-    # --- links table ---
-    (
-        """CREATE TABLE IF NOT EXISTS links (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            source_id TEXT NOT NULL,
-            target_id TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )""",
-        "create_links_table",
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_id)",
-        "links_source_idx",
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id)",
-        "links_target_idx",
-    ),
-    # --- FTS5 on memories (BM25 search) ---
-    (
-        "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5("
-        "memory_id UNINDEXED, content, tokenize='porter unicode61')",
-        "memories_fts5_table",
-    ),
-    # --- Synthesis cycle provenance ---
-    (
-        "CREATE TABLE IF NOT EXISTS cycle_records ("
-        "  id TEXT PRIMARY KEY,"
-        "  user_id TEXT NOT NULL,"
-        "  started_at TEXT NOT NULL,"
-        "  completed_at TEXT,"
-        "  cursor_start TEXT,"
-        "  cursor_end TEXT,"
-        "  skill_hash TEXT,"
-        "  prompt_hash TEXT,"
-        "  model TEXT,"
-        "  status TEXT NOT NULL DEFAULT 'running',"
-        "  memories_created INTEGER DEFAULT 0,"
-        "  memories_updated INTEGER DEFAULT 0,"
-        "  links_created INTEGER DEFAULT 0,"
-        "  memex_updated INTEGER DEFAULT 0,"
-        "  cost_usd REAL DEFAULT 0,"
-        "  input_tokens INTEGER DEFAULT 0,"
-        "  output_tokens INTEGER DEFAULT 0,"
-        "  cache_read_tokens INTEGER DEFAULT 0,"
-        "  duration_ms INTEGER DEFAULT 0"
-        ")",
-        "cycle_records_table",
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_cycle_records_user "
-        "ON cycle_records(user_id, started_at DESC)",
-        "cycle_records_user_idx",
-    ),
-    # --- Canonical rollout traces (ask / synthesis / daemon_cycle) ---
-    (
-        """CREATE TABLE IF NOT EXISTS rollout_traces (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            completed_at TEXT NOT NULL,
-            status TEXT NOT NULL,
-            error TEXT,
-            input_text TEXT,
-            output_text TEXT NOT NULL DEFAULT '',
-            thinking TEXT DEFAULT '[]',
-            transcript TEXT DEFAULT '[]',
-            tool_calls TEXT DEFAULT '[]',
-            duration_ms INTEGER DEFAULT 0,
-            cost_usd REAL DEFAULT 0,
-            input_tokens INTEGER DEFAULT 0,
-            output_tokens INTEGER DEFAULT 0,
-            cache_read_tokens INTEGER DEFAULT 0,
-            cache_write_tokens INTEGER DEFAULT 0,
-            num_turns INTEGER DEFAULT 0,
-            tool_calls_count INTEGER DEFAULT 0,
-            tool_name_counts TEXT DEFAULT '{}',
-            provider TEXT,
-            model TEXT,
-            response_id TEXT,
-            stop_reason TEXT,
-            transport TEXT,
-            runtime_reused INTEGER,
-            runtime TEXT DEFAULT '{}',
-            extras TEXT DEFAULT '{}'
-        )""",
-        "rollout_traces_table",
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_rollout_traces_user_time "
-        "ON rollout_traces(user_id, completed_at DESC)",
-        "rollout_traces_user_time_idx",
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_rollout_traces_user_kind_time "
-        "ON rollout_traces(user_id, kind, completed_at DESC)",
-        "rollout_traces_user_kind_time_idx",
-    ),
-    # --- cycle_records schema drift fix (columns added after initial CREATE TABLE) ---
-    ("ALTER TABLE cycle_records ADD COLUMN cost_usd REAL DEFAULT 0", "cycle_records_cost_usd_col"),
-    (
-        "ALTER TABLE cycle_records ADD COLUMN input_tokens INTEGER DEFAULT 0",
-        "cycle_records_input_tokens_col",
-    ),
-    (
-        "ALTER TABLE cycle_records ADD COLUMN output_tokens INTEGER DEFAULT 0",
-        "cycle_records_output_tokens_col",
-    ),
-    (
-        "ALTER TABLE cycle_records ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
-        "cycle_records_cache_read_col",
-    ),
-    (
-        "ALTER TABLE cycle_records ADD COLUMN duration_ms INTEGER DEFAULT 0",
-        "cycle_records_duration_ms_col",
-    ),
-    # --- FTS5 sync triggers on memories ---
-    (
-        "CREATE TRIGGER IF NOT EXISTS memories_fts_insert "
-        "AFTER INSERT ON memories BEGIN "
-        "INSERT INTO memories_fts(memory_id, content) VALUES (NEW.id, NEW.content); "
-        "END",
-        "memories_fts_insert_trigger",
-    ),
-    (
-        "CREATE TRIGGER IF NOT EXISTS memories_fts_update "
-        "AFTER UPDATE ON memories BEGIN "
-        "DELETE FROM memories_fts WHERE memory_id = OLD.id; "
-        "INSERT INTO memories_fts(memory_id, content) "
-        "SELECT NEW.id, NEW.content WHERE NEW.active = 1; "
-        "END",
-        "memories_fts_update_trigger",
-    ),
-    (
-        "CREATE TRIGGER IF NOT EXISTS memories_fts_delete "
-        "AFTER DELETE ON memories BEGIN "
-        "DELETE FROM memories_fts WHERE memory_id = OLD.id; "
-        "END",
-        "memories_fts_delete_trigger",
-    ),
-    # --- Local cleanup of retired pre-agent-workspace residue ---
-    ("DROP TABLE IF EXISTS memory_ops", "drop_legacy_memory_ops_table"),
-    ("DROP TABLE IF EXISTS cycle_annotations", "drop_legacy_cycle_annotations_table"),
-    (
-        "UPDATE cycle_records "
-        "SET status = 'incomplete', "
-        "    completed_at = COALESCE(completed_at, strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')) "
-        "WHERE status NOT IN ('running', 'completed', 'failed', 'blocked', 'incomplete')",
-        "normalize_unknown_cycle_statuses",
-    ),
-    (
-        "UPDATE cycle_records "
-        "SET status = 'incomplete', "
-        "    completed_at = COALESCE(completed_at, strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')), "
-        "    duration_ms = CASE "
-        "        WHEN duration_ms > 0 THEN duration_ms "
-        "        ELSE MAX(0, CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)) "
-        "    END "
-        "WHERE status = 'running' "
-        "  AND datetime(started_at) < datetime('now', '-6 hours')",
-        "mark_stale_running_cycles_incomplete",
-    ),
-]
+_FTS_SHADOW_TABLES = {
+    "memories_fts_config",
+    "memories_fts_content",
+    "memories_fts_data",
+    "memories_fts_docsize",
+    "memories_fts_idx",
+}
+
+_REQUIRED_INDEXES = {
+    "idx_memories_user_created",
+    "idx_links_source",
+    "idx_links_target",
+}
+
+_REQUIRED_TRIGGERS = {
+    "enforce_memories_identity_insert",
+    "enforce_memories_identity_update",
+    "enforce_links_identity_insert",
+    "enforce_links_identity_update",
+    "enforce_current_memex_identity_insert",
+    "enforce_current_memex_identity_update",
+    "protect_syke_identity_update",
+    "protect_syke_identity_delete",
+    "protect_memories_stable_fields",
+    "protect_links_stable_fields",
+    "protect_current_memex_stable_fields",
+    "protect_current_memex_delete",
+    "validate_link_endpoints_insert",
+    "validate_link_endpoints_update",
+    "require_link_removal_before_memory_delete",
+    "memories_fts_insert",
+    "memories_fts_update",
+    "memories_fts_delete",
+}
+
+_EXPECTED_SCHEMA_SIGNATURE = "022c723b41565db675291bbfaebe58c7f2e2de82b5fdb1f7ee3eb93da60e4992"
+
+_SCHEMA_SQL = f"""
+BEGIN IMMEDIATE;
+
+CREATE TABLE syke_identity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE memories (
+    id TEXT PRIMARY KEY NOT NULL CHECK (trim(id) <> ''),
+    user_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT
+);
+
+CREATE TABLE links (
+    id TEXT PRIMARY KEY NOT NULL CHECK (trim(id) <> ''),
+    user_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE RESTRICT,
+    FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE current_memex (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    id TEXT NOT NULL UNIQUE CHECK (trim(id) <> ''),
+    user_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT
+);
+
+CREATE INDEX idx_memories_user_created ON memories(user_id, created_at DESC);
+CREATE INDEX idx_links_source ON links(source_id);
+CREATE INDEX idx_links_target ON links(target_id);
+
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+    memory_id UNINDEXED,
+    content,
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER enforce_memories_identity_insert
+BEFORE INSERT ON memories
+WHEN EXISTS (SELECT 1 FROM syke_identity WHERE singleton = 1)
+ AND NEW.user_id != (SELECT user_id FROM syke_identity WHERE singleton = 1)
+BEGIN
+    SELECT RAISE(ABORT, 'memories.user_id does not match Syke identity');
+END;
+
+CREATE TRIGGER enforce_memories_identity_update
+BEFORE UPDATE OF user_id ON memories
+WHEN EXISTS (SELECT 1 FROM syke_identity WHERE singleton = 1)
+ AND NEW.user_id != (SELECT user_id FROM syke_identity WHERE singleton = 1)
+BEGIN
+    SELECT RAISE(ABORT, 'memories.user_id does not match Syke identity');
+END;
+
+CREATE TRIGGER enforce_links_identity_insert
+BEFORE INSERT ON links
+WHEN EXISTS (SELECT 1 FROM syke_identity WHERE singleton = 1)
+ AND NEW.user_id != (SELECT user_id FROM syke_identity WHERE singleton = 1)
+BEGIN
+    SELECT RAISE(ABORT, 'links.user_id does not match Syke identity');
+END;
+
+CREATE TRIGGER enforce_links_identity_update
+BEFORE UPDATE OF user_id ON links
+WHEN EXISTS (SELECT 1 FROM syke_identity WHERE singleton = 1)
+ AND NEW.user_id != (SELECT user_id FROM syke_identity WHERE singleton = 1)
+BEGIN
+    SELECT RAISE(ABORT, 'links.user_id does not match Syke identity');
+END;
+
+CREATE TRIGGER enforce_current_memex_identity_insert
+BEFORE INSERT ON current_memex
+WHEN EXISTS (SELECT 1 FROM syke_identity WHERE singleton = 1)
+ AND NEW.user_id != (SELECT user_id FROM syke_identity WHERE singleton = 1)
+BEGIN
+    SELECT RAISE(ABORT, 'current_memex.user_id does not match Syke identity');
+END;
+
+CREATE TRIGGER enforce_current_memex_identity_update
+BEFORE UPDATE OF user_id ON current_memex
+WHEN EXISTS (SELECT 1 FROM syke_identity WHERE singleton = 1)
+ AND NEW.user_id != (SELECT user_id FROM syke_identity WHERE singleton = 1)
+BEGIN
+    SELECT RAISE(ABORT, 'current_memex.user_id does not match Syke identity');
+END;
+
+CREATE TRIGGER protect_syke_identity_update
+BEFORE UPDATE ON syke_identity
+BEGIN
+    SELECT RAISE(ABORT, 'Syke identity is immutable');
+END;
+
+CREATE TRIGGER protect_syke_identity_delete
+BEFORE DELETE ON syke_identity
+BEGIN
+    SELECT RAISE(ABORT, 'Syke identity cannot be deleted');
+END;
+
+CREATE TRIGGER protect_memories_stable_fields
+BEFORE UPDATE OF id, created_at ON memories
+WHEN NEW.id IS NOT OLD.id OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'memory identity and created_at are immutable');
+END;
+
+CREATE TRIGGER protect_links_stable_fields
+BEFORE UPDATE OF id, created_at ON links
+WHEN NEW.id IS NOT OLD.id OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'link identity and created_at are immutable');
+END;
+
+CREATE TRIGGER protect_current_memex_stable_fields
+BEFORE UPDATE OF singleton, id, created_at ON current_memex
+WHEN NEW.singleton IS NOT OLD.singleton
+  OR NEW.id IS NOT OLD.id
+  OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'current MEMEX identity and created_at are immutable');
+END;
+
+CREATE TRIGGER protect_current_memex_delete
+BEFORE DELETE ON current_memex
+BEGIN
+    SELECT RAISE(ABORT, 'current MEMEX cannot be deleted');
+END;
+
+CREATE TRIGGER validate_link_endpoints_insert
+BEFORE INSERT ON links
+WHEN (
+    NOT EXISTS (SELECT 1 FROM syke_identity WHERE singleton = 1)
+    OR NEW.user_id = (SELECT user_id FROM syke_identity WHERE singleton = 1)
+)
+ AND NOT EXISTS (
+    SELECT 1
+    FROM memories AS source
+    JOIN memories AS target
+      ON target.id = NEW.target_id AND target.user_id = NEW.user_id
+    WHERE source.id = NEW.source_id AND source.user_id = NEW.user_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'link endpoints must reference memories for the same Syke identity');
+END;
+
+CREATE TRIGGER validate_link_endpoints_update
+BEFORE UPDATE OF user_id, source_id, target_id ON links
+WHEN (
+    NOT EXISTS (SELECT 1 FROM syke_identity WHERE singleton = 1)
+    OR NEW.user_id = (SELECT user_id FROM syke_identity WHERE singleton = 1)
+)
+ AND NOT EXISTS (
+    SELECT 1
+    FROM memories AS source
+    JOIN memories AS target
+      ON target.id = NEW.target_id AND target.user_id = NEW.user_id
+    WHERE source.id = NEW.source_id AND source.user_id = NEW.user_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'link endpoints must reference memories for the same Syke identity');
+END;
+
+CREATE TRIGGER require_link_removal_before_memory_delete
+BEFORE DELETE ON memories
+WHEN EXISTS (
+    SELECT 1 FROM links
+    WHERE source_id = OLD.id OR target_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'delete linked edges first');
+END;
+
+CREATE TRIGGER memories_fts_insert
+AFTER INSERT ON memories
+BEGIN
+    INSERT INTO memories_fts(memory_id, content) VALUES (NEW.id, NEW.content);
+END;
+
+CREATE TRIGGER memories_fts_update
+AFTER UPDATE OF content ON memories
+WHEN NEW.content IS NOT OLD.content
+BEGIN
+    DELETE FROM memories_fts WHERE memory_id = OLD.id;
+    INSERT INTO memories_fts(memory_id, content) VALUES (NEW.id, NEW.content);
+END;
+
+CREATE TRIGGER memories_fts_delete
+AFTER DELETE ON memories
+BEGIN
+    DELETE FROM memories_fts WHERE memory_id = OLD.id;
+END;
+
+PRAGMA user_version = {SCHEMA_VERSION};
+COMMIT;
+"""
+
+
+class UnsupportedSchemaError(RuntimeError):
+    """Raised when a database is not an empty store or the exact current schema."""
+
+
+class DatabaseMaintenanceError(RuntimeError):
+    """Raised when the external maintenance marker blocks ordinary database use."""
+
+
+def _application_tables(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+
+
+def _schema_version(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _normalize_schema_sql(sql: str) -> str:
+    return " ".join(sql.split()).lower()
+
+
+def _schema_signature(conn: sqlite3.Connection) -> str:
+    tracked_names = set(_TABLE_COLUMNS) | _REQUIRED_INDEXES | _REQUIRED_TRIGGERS
+    rows = conn.execute(
+        """SELECT type, name, sql
+           FROM sqlite_master
+           WHERE sql IS NOT NULL
+           ORDER BY type, name"""
+    ).fetchall()
+    definitions = [
+        f"{row[0]}\0{row[1]}\0{_normalize_schema_sql(str(row[2]))}"
+        for row in rows
+        if str(row[1]) in tracked_names
+    ]
+    return sha256("\n".join(definitions).encode("utf-8")).hexdigest()
+
+
+def _validate_current_schema(conn: sqlite3.Connection) -> None:
+    version = _schema_version(conn)
+    if version != SCHEMA_VERSION:
+        raise UnsupportedSchemaError(
+            f"Unsupported Syke database schema version {version}; expected {SCHEMA_VERSION}"
+        )
+
+    expected_tables = set(_TABLE_COLUMNS) | _FTS_SHADOW_TABLES
+    actual_tables = _application_tables(conn)
+    if actual_tables != expected_tables:
+        missing = sorted(expected_tables - actual_tables)
+        unexpected = sorted(actual_tables - expected_tables)
+        raise UnsupportedSchemaError(
+            f"Syke database schema does not match v{SCHEMA_VERSION} "
+            f"(missing tables: {missing}; unexpected tables: {unexpected})"
+        )
+
+    for table, expected_columns in _TABLE_COLUMNS.items():
+        actual_columns = tuple(
+            str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+        )
+        if actual_columns != expected_columns:
+            raise UnsupportedSchemaError(
+                f"Syke database table {table!r} does not match v{SCHEMA_VERSION}: {actual_columns}"
+            )
+
+    actual_triggers = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall()
+    }
+    if actual_triggers != _REQUIRED_TRIGGERS:
+        missing = sorted(_REQUIRED_TRIGGERS - actual_triggers)
+        unexpected = sorted(actual_triggers - _REQUIRED_TRIGGERS)
+        raise UnsupportedSchemaError(
+            f"Syke database trigger set does not match v{SCHEMA_VERSION} "
+            f"(missing: {missing}; unexpected: {unexpected})"
+        )
+
+    actual_indexes = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+        ).fetchall()
+    }
+    if actual_indexes != _REQUIRED_INDEXES:
+        missing = sorted(_REQUIRED_INDEXES - actual_indexes)
+        unexpected = sorted(actual_indexes - _REQUIRED_INDEXES)
+        raise UnsupportedSchemaError(
+            f"Syke database index set does not match v{SCHEMA_VERSION} "
+            f"(missing: {missing}; unexpected: {unexpected})"
+        )
+
+    actual_signature = _schema_signature(conn)
+    if actual_signature != _EXPECTED_SCHEMA_SIGNATURE:
+        raise UnsupportedSchemaError(
+            "Syke database schema definition signature does not match "
+            f"v{SCHEMA_VERSION} ({actual_signature})"
+        )
+
+
+def initialize_current_schema(conn: sqlite3.Connection) -> None:
+    """Create the v3 current-only schema in an already-open empty database."""
+    version = _schema_version(conn)
+    tables = _application_tables(conn)
+    if version != 0 or tables:
+        raise UnsupportedSchemaError(
+            "Current Syke schema initialization requires an empty unversioned database"
+        )
+
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        conn.executescript(_SCHEMA_SQL)
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    _validate_current_schema(conn)
 
 
 class SykeDB:
-    """SQLite wrapper for the Syke timeline database."""
+    """SQLite facade for Syke's mutable current graph."""
 
     def __init__(
         self,
         db_path: str | Path,
         *,
-        auto_initialize: bool = True,
+        user_id: str | None = None,
     ):
         if not isinstance(db_path, (str, os.PathLike)):
             raise TypeError(f"SykeDB(db_path) expects a path-like value, got {type(db_path)!r}")
         path_str = os.fspath(db_path)
-        # Guard against passing a bare username instead of a file path.
-        # Allow :memory: for tests and paths with a directory or .db extension.
         if (
             path_str != ":memory:"
             and "/" not in path_str
@@ -237,28 +411,62 @@ class SykeDB:
         ):
             raise ValueError(
                 f"SykeDB(db_path) looks like a username, not a file path: {path_str!r}. "
-                f"Use user_syke_db_path(user_id) to get the correct path."
+                "Use user_syke_db_path(user_id) to get the correct path."
             )
+
         self.db_path = path_str
-        self._conn = self._connect_db(self.db_path)
+        self._lease: DatabaseLease | None = None
+        self._conn: sqlite3.Connection | None = None
         self._in_transaction = False
-        if auto_initialize:
+        try:
+            self._ensure_lease()
+            self._conn = self._connect_db(path_str)
             self.initialize()
+            if user_id is not None:
+                self.bind_identity(user_id)
+        except BaseException:
+            self.close()
+            raise
+
+    def _ensure_lease(self) -> None:
+        if self.db_path != ":memory:" and self._lease is None:
+            self._lease = acquire_database_lease(self.db_path)
 
     @staticmethod
     def _connect_db(db_path: str) -> sqlite3.Connection:
         if db_path != ":memory:":
-            Path(db_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+            path = Path(db_path).expanduser().resolve()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            maintenance_path = maintenance_marker_path(path)
+            if maintenance_path.exists():
+                raise DatabaseMaintenanceError(
+                    f"Syke database is unavailable during maintenance: {maintenance_path}"
+                )
+
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout = 5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        try:
+            version = _schema_version(conn)
+            tables = _application_tables(conn)
+            if tables:
+                _validate_current_schema(conn)
+            elif version != 0:
+                raise UnsupportedSchemaError(
+                    f"Unsupported empty Syke database schema version {version}"
+                )
 
-    # Keep .conn as a read-only property for backward compatibility
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
+        except BaseException:
+            conn.close()
+            raise
+
     @property
     def conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise RuntimeError("Syke database connection is suspended or closed")
         return self._conn
 
     def __enter__(self) -> SykeDB:
@@ -269,474 +477,170 @@ class SykeDB:
 
     @contextmanager
     def transaction(self):
-        """Atomic write: all inserts succeed or all roll back.
-
-        Re-entrant: if already inside a transaction, inner calls pass
-        through and the outermost transaction controls commit/rollback.
-        """
+        """Commit the outermost atomic write and roll it back on any failure."""
+        conn = self.conn
         if self._in_transaction:
-            yield  # nested — outermost transaction owns the commit
+            yield
             return
 
-        connections = self._unique_connections()
-        for conn in connections:
-            if conn.in_transaction:
-                conn.commit()
-        for conn in connections:
-            conn.execute("BEGIN IMMEDIATE")
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
         self._in_transaction = True
         try:
             yield
-            for conn in connections:
-                conn.commit()
+            conn.commit()
         except BaseException:
-            for conn in reversed(connections):
-                conn.rollback()
+            conn.rollback()
             raise
         finally:
             self._in_transaction = False
 
     def initialize(self) -> None:
-        """Create tables and indexes, then apply migrations."""
-        self._migrate(self._conn, _MEMORY_MIGRATIONS)
+        """Create a fresh v3 schema or validate an existing v3 store."""
+        conn = self.conn
+        if not _application_tables(conn):
+            initialize_current_schema(conn)
+        else:
+            _validate_current_schema(conn)
 
-    def _migrate(
-        self,
-        conn: sqlite3.Connection,
-        migrations: list[tuple[str, str]],
-    ) -> None:
-        """Apply schema migrations safely (idempotent)."""
-        for sql, _label in migrations:
-            try:
-                conn.execute(sql)
-                conn.commit()
-            except sqlite3.OperationalError as e:
-                if "already exists" in str(e).lower() or "duplicate column" in str(e).lower():
-                    pass  # Expected: column/index already present
-                else:
-                    raise
+    def bind_identity(self, user_id: str) -> None:
+        """Bind the current graph to one person."""
+        canonical_user_id = user_id.strip()
+        if not canonical_user_id:
+            raise ValueError("Syke identity cannot be empty")
 
-    def _unique_connections(self) -> list[sqlite3.Connection]:
-        return [self._conn]
+        conn = self.conn
+        identity_row = conn.execute(
+            "SELECT user_id FROM syke_identity WHERE singleton = 1"
+        ).fetchone()
+        if identity_row is not None:
+            bound_user_id = str(identity_row["user_id"])
+            if bound_user_id != canonical_user_id:
+                raise ValueError(
+                    f"Syke store is bound to {bound_user_id!r}, not {canonical_user_id!r}"
+                )
+            alias_counts = {
+                table: int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE user_id != ?",
+                        (canonical_user_id,),
+                    ).fetchone()[0]
+                )
+                for table in GRAPH_IDENTITY_TABLES
+            }
+            if any(alias_counts.values()):
+                raise RuntimeError(f"Syke graph contains rows outside its identity: {alias_counts}")
+            return
 
-    # ===================================================================
-    # Observe — graph health, synthesis stats, evolution metrics
-    # ===================================================================
+        with self.transaction():
+            for table in GRAPH_IDENTITY_TABLES:
+                conn.execute(
+                    f"UPDATE {table} SET user_id = ? WHERE user_id != ?",
+                    (canonical_user_id, canonical_user_id),
+                )
+            conn.execute(
+                "INSERT INTO syke_identity (singleton, user_id, created_at) VALUES (1, ?, ?)",
+                (canonical_user_id, datetime.now(UTC).isoformat()),
+            )
 
     def get_graph_stats(self, user_id: str) -> dict:
-        """Memory graph statistics: counts, density, hub nodes, orphans."""
-        active = self.count_memories(user_id, active_only=True)
-        retired = self.count_memories(user_id, active_only=False) - active
-
-        link_count = self._conn.execute(
-            "SELECT COUNT(*) FROM links WHERE user_id = ?", (user_id,)
-        ).fetchone()[0]
-
-        # Hub nodes: memories with the most links (either direction)
-        hub_rows = self._conn.execute(
-            """SELECT m.id, SUBSTR(m.content, 1, 60) as preview,
-                      COUNT(DISTINCT l.id) as link_count
-               FROM memories m
-               JOIN links l ON (l.source_id = m.id OR l.target_id = m.id)
-                            AND l.user_id = m.user_id
-               WHERE m.user_id = ? AND m.active = 1
-               GROUP BY m.id
-               ORDER BY link_count DESC LIMIT 5""",
-            (user_id,),
-        ).fetchall()
-
-        # Orphan count: active memories with zero links
-        orphan_count = self._conn.execute(
-            """SELECT COUNT(*) FROM memories m
-               WHERE m.user_id = ? AND m.active = 1
-               AND NOT EXISTS (
-                   SELECT 1 FROM links l
-                   WHERE l.user_id = m.user_id
-                   AND (l.source_id = m.id OR l.target_id = m.id)
-               )""",
-            (user_id,),
-        ).fetchone()[0]
-
-        # Supersession chain stats
-        chain_rows = self._conn.execute(
-            """WITH RECURSIVE chain(id, depth) AS (
-                   SELECT id, 0 FROM memories
-                   WHERE user_id = ? AND superseded_by IS NULL AND active = 1
-                 UNION ALL
-                   SELECT m.id, c.depth + 1
-                   FROM memories m JOIN chain c ON m.superseded_by = c.id
-                   WHERE m.user_id = ?
-               )
-               SELECT MAX(depth) as max_depth,
-                      AVG(depth) as avg_depth,
-                      COUNT(CASE WHEN depth > 0 THEN 1 END) as chains_with_history
-               FROM chain""",
-            (user_id, user_id),
-        ).fetchone()
-
-        return {
-            "active": active,
-            "retired": retired,
-            "links": link_count,
-            "density": round(link_count / active, 2) if active else 0,
-            "hubs": [
-                {"preview": r["preview"].strip().split("\n")[0], "links": r["link_count"]}
-                for r in hub_rows
-            ],
-            "orphan_count": orphan_count,
-            "orphan_rate": round(orphan_count / active, 2) if active else 0,
-            "supersession_max_depth": chain_rows["max_depth"] or 0,
-            "supersession_avg_depth": round(chain_rows["avg_depth"] or 0, 1),
-            "chains_with_history": chain_rows["chains_with_history"] or 0,
-        }
-
-    def get_orphan_memories(self, user_id: str, limit: int = 5) -> list[dict]:
-        """Active memories with zero links, oldest first (decay candidates)."""
-        rows = self._conn.execute(
-            """SELECT m.id, SUBSTR(m.content, 1, 80) as preview, m.created_at
-               FROM memories m
-               WHERE m.user_id = ? AND m.active = 1
-               AND NOT EXISTS (
-                   SELECT 1 FROM links l
-                   WHERE l.user_id = m.user_id
-                   AND (l.source_id = m.id OR l.target_id = m.id)
-               )
-               AND m.source_event_ids != '["__memex__"]'
-               ORDER BY m.created_at ASC LIMIT ?""",
-            (user_id, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_memory_trends(self, user_id: str, days: int = 7) -> dict:
-        """Memory creation, supersession, deactivation trends over N days."""
-        created = self._conn.execute(
-            """SELECT COUNT(*) FROM memories
-               WHERE user_id = ? AND created_at >= datetime('now', ?)""",
-            (user_id, f"-{days} days"),
-        ).fetchone()[0]
-
-        superseded = self._conn.execute(
-            """SELECT COUNT(*) FROM memories
-               WHERE user_id = ? AND active = 0 AND superseded_by IS NOT NULL
-               AND created_at >= datetime('now', ?)""",
-            (user_id, f"-{days} days"),
-        ).fetchone()[0]
-
-        deactivated = self._conn.execute(
-            """SELECT COUNT(*) FROM memories
-               WHERE user_id = ? AND active = 0 AND superseded_by IS NULL
-               AND created_at >= datetime('now', ?)""",
-            (user_id, f"-{days} days"),
-        ).fetchone()[0]
-
-        links_created = self._conn.execute(
-            """SELECT COUNT(*) FROM links
-               WHERE user_id = ? AND created_at >= datetime('now', ?)""",
-            (user_id, f"-{days} days"),
-        ).fetchone()[0]
-
-        return {
-            "days": days,
-            "created": created,
-            "superseded": superseded,
-            "deactivated": deactivated,
-            "net": created - superseded - deactivated,
-            "links_created": links_created,
-            "links_per_day": round(links_created / days, 1) if days else 0,
-        }
-
-    # ===================================================================
-    # Memories — Layer 2 of the memory architecture
-    # ===================================================================
-
-    def insert_memory(self, memory: Memory) -> str:
-        """Insert a memory, returning its ID. Syncs to FTS5."""
-        now = datetime.now(UTC).isoformat()
-        created = memory.created_at.isoformat() if isinstance(memory.created_at, datetime) else now
-        self._conn.execute(
-            """INSERT INTO memories
-               (id, user_id, content, source_event_ids, created_at, updated_at, superseded_by, active)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                memory.id,
-                memory.user_id,
-                memory.content,
-                json.dumps(memory.source_event_ids),
-                created,
-                None,
-                memory.superseded_by,
-                1 if memory.active else 0,
-            ),
+        """Return mechanical statistics for the current ordinary graph."""
+        conn = self.conn
+        memory_count = int(
+            conn.execute("SELECT COUNT(*) FROM memories WHERE user_id = ?", (user_id,)).fetchone()[
+                0
+            ]
         )
-
-        if not self._in_transaction:
-            self._conn.commit()
-        return memory.id
-
-    def count_memories(self, user_id: str, active_only: bool = True) -> int:
-        """Count memories for a user."""
-        if active_only:
-            return self._conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE user_id = ? AND active = 1",
+        link_count = int(
+            conn.execute("SELECT COUNT(*) FROM links WHERE user_id = ?", (user_id,)).fetchone()[0]
+        )
+        hub_rows = conn.execute(
+            """WITH degrees AS (
+                   SELECT id AS link_id, source_id AS memory_id
+                   FROM links WHERE user_id = ?
+                   UNION ALL
+                   SELECT id AS link_id, target_id AS memory_id
+                   FROM links WHERE user_id = ?
+               )
+               SELECT memory.id, SUBSTR(memory.content, 1, 60) AS preview,
+                      COUNT(DISTINCT degrees.link_id) AS link_count
+               FROM memories AS memory
+               JOIN degrees ON degrees.memory_id = memory.id
+               WHERE memory.user_id = ?
+               GROUP BY memory.id
+               ORDER BY link_count DESC, memory.id
+               LIMIT 5""",
+            (user_id, user_id, user_id),
+        ).fetchall()
+        unlinked_count = int(
+            conn.execute(
+                """SELECT COUNT(*)
+                   FROM memories AS memory
+                   WHERE memory.user_id = ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM links
+                         WHERE user_id = memory.user_id
+                           AND (source_id = memory.id OR target_id = memory.id)
+                     )""",
                 (user_id,),
             ).fetchone()[0]
-        return self._conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()[0]
+        )
+        return {
+            "memories": memory_count,
+            "links": link_count,
+            "links_per_memory": round(link_count / memory_count, 2) if memory_count else 0,
+            "hubs": [
+                {
+                    "preview": str(row["preview"]).strip().split("\n")[0],
+                    "links": int(row["link_count"]),
+                }
+                for row in hub_rows
+            ],
+            "unlinked": unlinked_count,
+            "unlinked_rate": round(unlinked_count / memory_count, 2) if memory_count else 0,
+            "links_outside_graph": 0,
+        }
+
+    def count_memories(self, user_id: str) -> int:
+        """Count current ordinary memories for a user."""
+        return int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE user_id = ?", (user_id,)
+            ).fetchone()[0]
+        )
 
     def get_memex(self, user_id: str) -> dict | None:
-        """Get the memex memory for a user.
-
-        Convention: memex memory has source_event_ids = '["__memex__"]'.
-        Returns the most recent active memex, or None.
-        """
-        row = self._conn.execute(
-            "SELECT * FROM memories "
-            "WHERE user_id = ? AND active = 1 AND source_event_ids = ? "
-            "ORDER BY datetime(created_at) DESC, id DESC LIMIT 1",
-            (user_id, json.dumps(["__memex__"])),
+        """Return the current MEMEX singleton for a user."""
+        row = self.conn.execute(
+            "SELECT * FROM current_memex WHERE singleton = 1 AND user_id = ?", (user_id,)
         ).fetchone()
         return dict(row) if row else None
 
-    # ===================================================================
-    # Cycle Records
-    # ===================================================================
-
-    def insert_cycle_record(
-        self,
-        user_id: str,
-        *,
-        cursor_start: str | None = None,
-        skill_hash: str | None = None,
-        prompt_hash: str | None = None,
-        model: str | None = None,
-        started_at_override: str | None = None,
-    ) -> str:
-        cycle_id = str(uuid7())
-        started_at = started_at_override or datetime.now(UTC).isoformat()
-        self._conn.execute(
-            """INSERT INTO cycle_records
-               (id, user_id, started_at, cursor_start, skill_hash, prompt_hash, model, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'running')""",
-            (cycle_id, user_id, started_at, cursor_start, skill_hash, prompt_hash, model),
-        )
-        if not self._in_transaction:
-            self._conn.commit()
-        return cycle_id
-
-    def complete_cycle_record(
-        self,
-        cycle_id: str,
-        *,
-        status: str = "completed",
-        cursor_end: str | None = None,
-        memories_created: int | None = None,
-        memories_updated: int | None = None,
-        links_created: int | None = None,
-        memex_updated: int | None = None,
-        cost_usd: float = 0,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        cache_read_tokens: int = 0,
-        duration_ms: int = 0,
-        completed_at_override: str | None = None,
-    ) -> None:
-        completed_at = completed_at_override or datetime.now(UTC).isoformat()
-        self._conn.execute(
-            """UPDATE cycle_records SET
-               completed_at = ?, cursor_end = ?, status = ?,
-               memories_created = COALESCE(?, memories_created),
-               memories_updated = COALESCE(?, memories_updated),
-               links_created = COALESCE(?, links_created),
-               memex_updated = COALESCE(?, memex_updated),
-               cost_usd = ?, input_tokens = ?, output_tokens = ?,
-               cache_read_tokens = ?, duration_ms = ?
-               WHERE id = ?""",
-            (
-                completed_at,
-                cursor_end,
-                status,
-                memories_created,
-                memories_updated,
-                links_created,
-                memex_updated,
-                cost_usd,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                duration_ms,
-                cycle_id,
-            ),
-        )
-        if not self._in_transaction:
-            self._conn.commit()
-
-    def mark_stale_running_cycles(
-        self,
-        user_id: str,
-        *,
-        started_before: str,
-        completed_at_override: str | None = None,
-    ) -> int:
-        """Mark abandoned running cycle records as incomplete."""
-        completed_at = completed_at_override or datetime.now(UTC).isoformat()
-        cursor = self._conn.execute(
-            """UPDATE cycle_records
-               SET status = 'incomplete',
-                   completed_at = ?,
-                   duration_ms = CASE
-                       WHEN duration_ms > 0 THEN duration_ms
-                       ELSE MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER))
-                   END
-               WHERE user_id = ?
-                 AND status = 'running'
-                 AND datetime(started_at) < datetime(?)""",
-            (completed_at, completed_at, user_id, started_before),
-        )
-        if not self._in_transaction:
-            self._conn.commit()
-        return int(cursor.rowcount or 0)
-
-    def get_cycle_records(self, user_id: str, limit: int = 20) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT * FROM cycle_records WHERE user_id = ? ORDER BY started_at DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-        return [dict(row) for row in rows]
-
-    # ===================================================================
-    # Rollout traces — canonical self-observation records
-    # ===================================================================
-
-    def insert_rollout_trace(
-        self,
-        *,
-        trace_id: str,
-        user_id: str,
-        kind: str,
-        started_at: str,
-        completed_at: str,
-        status: str,
-        error: str | None = None,
-        input_text: str | None = None,
-        output_text: str = "",
-        thinking: list[dict] | list[str] | None = None,
-        transcript: list[dict] | None = None,
-        tool_calls: list[dict] | None = None,
-        duration_ms: int = 0,
-        cost_usd: float = 0.0,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        cache_read_tokens: int = 0,
-        cache_write_tokens: int = 0,
-        num_turns: int = 0,
-        tool_calls_count: int = 0,
-        tool_name_counts: dict[str, int] | None = None,
-        provider: str | None = None,
-        model: str | None = None,
-        response_id: str | None = None,
-        stop_reason: str | None = None,
-        transport: str | None = None,
-        runtime_reused: bool | None = None,
-        runtime: dict | None = None,
-        extras: dict | None = None,
-    ) -> str:
-        self._conn.execute(
-            """INSERT OR REPLACE INTO rollout_traces (
-                id, user_id, kind, started_at, completed_at, status, error,
-                input_text, output_text, thinking, transcript, tool_calls,
-                duration_ms, cost_usd, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, num_turns, tool_calls_count,
-                tool_name_counts, provider, model, response_id, stop_reason,
-                transport, runtime_reused, runtime, extras
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                trace_id,
-                user_id,
-                kind,
-                started_at,
-                completed_at,
-                status,
-                error,
-                input_text,
-                output_text,
-                json.dumps(thinking or []),
-                json.dumps(transcript or []),
-                json.dumps(tool_calls or []),
-                int(duration_ms or 0),
-                float(cost_usd or 0.0),
-                int(input_tokens or 0),
-                int(output_tokens or 0),
-                int(cache_read_tokens or 0),
-                int(cache_write_tokens or 0),
-                int(num_turns or 0),
-                int(tool_calls_count or 0),
-                json.dumps(tool_name_counts or {}),
-                provider,
-                model,
-                response_id,
-                stop_reason,
-                transport,
-                1 if runtime_reused is True else 0 if runtime_reused is False else None,
-                json.dumps(runtime or {}),
-                json.dumps(extras or {}),
-            ),
-        )
-        if not self._in_transaction:
-            self._conn.commit()
-        return trace_id
-
-    def get_rollout_traces(
-        self,
-        user_id: str,
-        *,
-        kind: str | None = None,
-        limit: int | None = 100,
-    ) -> list[dict]:
-        query = "SELECT * FROM rollout_traces WHERE user_id = ?"
-        params: list[object] = [user_id]
-        if kind:
-            query += " AND kind = ?"
-            params.append(kind)
-        query += " ORDER BY completed_at DESC"
-        if limit is not None:
-            query += " LIMIT ?"
-            params.append(limit)
-        rows = self._conn.execute(query, params).fetchall()
-        result: list[dict] = []
-        for row in rows:
-            item = dict(row)
-            item["version"] = 1
-            for key in (
-                "thinking",
-                "transcript",
-                "tool_calls",
-                "tool_name_counts",
-                "runtime",
-                "extras",
-            ):
-                raw = item.get(key)
-                if isinstance(raw, str):
-                    try:
-                        item[key] = json.loads(raw)
-                    except (json.JSONDecodeError, TypeError):
-                        item[key] = [] if key in {"thinking", "transcript", "tool_calls"} else {}
-            item["metrics"] = {
-                "duration_ms": int(item.get("duration_ms") or 0),
-                "cost_usd": float(item.get("cost_usd") or 0.0),
-                "input_tokens": int(item.get("input_tokens") or 0),
-                "output_tokens": int(item.get("output_tokens") or 0),
-                "cache_read_tokens": int(item.get("cache_read_tokens") or 0),
-                "cache_write_tokens": int(item.get("cache_write_tokens") or 0),
-            }
-            item["run_id"] = item.get("id")
-            result.append(item)
-        return result
-
-    # ===================================================================
-    # Lifecycle
-    # ===================================================================
-
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self.suspend()
+        finally:
+            lease, self._lease = self._lease, None
+            if lease is not None:
+                lease.release()
+
+    def suspend(self) -> None:
+        """Close SQLite while retaining this process's shared database lease."""
+        conn, self._conn = self._conn, None
+        self._in_transaction = False
+        if conn is not None:
+            conn.close()
+
+    def reopen(self) -> None:
+        """Reopen SQLite, reusing a retained lease or acquiring a new one."""
+        if self._conn is not None:
+            self.suspend()
+        try:
+            self._ensure_lease()
+            self._conn = self._connect_db(self.db_path)
+            self._in_transaction = False
+            self.initialize()
+        except BaseException:
+            self.close()
+            raise

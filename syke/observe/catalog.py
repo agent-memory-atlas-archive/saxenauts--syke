@@ -52,6 +52,20 @@ _CATALOG: tuple[SourceSpec, ...] = (
         ),
     ),
     SourceSpec(
+        source="pi",
+        format_cluster="jsonl",
+        artifact_hints=("jsonl", "session", "branch", "compaction"),
+        discover=DiscoverConfig(
+            roots=[
+                DiscoverRoot(
+                    path="~/.pi/agent",
+                    include=["sessions/**/*.jsonl"],
+                    priority=20,
+                ),
+            ]
+        ),
+    ),
+    SourceSpec(
         source="opencode",
         format_cluster="sqlite",
         artifact_hints=("sqlite",),
@@ -144,17 +158,44 @@ _CATALOG: tuple[SourceSpec, ...] = (
     SourceSpec(
         source="antigravity",
         format_cluster="mixed",
-        artifact_hints=("workflow", "markdown", "metadata", "browser-recording"),
+        artifact_hints=(
+            "jsonl",
+            "transcript",
+            "subagent",
+            "workflow",
+            "markdown",
+            "metadata",
+            "browser-recording",
+        ),
         discover=DiscoverConfig(
             roots=[
                 DiscoverRoot(
                     path="~/.gemini/antigravity",
                     include=[
+                        "brain/*/.system_generated/logs/transcript.jsonl",
                         "brain/**/*.md",
                         "brain/**/*.md.metadata.json",
                         "browser_recordings/*/metadata.json",
                     ],
                     priority=20,
+                ),
+                DiscoverRoot(
+                    path="~/.gemini/antigravity-cli",
+                    include=[
+                        "brain/*/.system_generated/logs/transcript.jsonl",
+                        "brain/**/*.md",
+                        "brain/**/*.md.metadata.json",
+                    ],
+                    priority=20,
+                ),
+                DiscoverRoot(
+                    path="~/.gemini/antigravity-ide",
+                    include=[
+                        "brain/*/.system_generated/logs/transcript.jsonl",
+                        "brain/**/*.md",
+                        "brain/**/*.md.metadata.json",
+                    ],
+                    priority=15,
                 ),
             ]
         ),
@@ -168,20 +209,6 @@ _CATALOG: tuple[SourceSpec, ...] = (
                 DiscoverRoot(
                     path="~/.hermes",
                     include=["state.db", "sessions/*.json"],
-                    priority=20,
-                )
-            ]
-        ),
-    ),
-    SourceSpec(
-        source="gemini-cli",
-        format_cluster="mixed",
-        artifact_hints=("json", "chat", "checkpoint"),
-        discover=DiscoverConfig(
-            roots=[
-                DiscoverRoot(
-                    path="~/.gemini/tmp",
-                    include=["**/chats/**/*.json", "**/checkpoints/**/*.json"],
                     priority=20,
                 )
             ]

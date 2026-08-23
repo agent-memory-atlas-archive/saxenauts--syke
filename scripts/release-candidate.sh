@@ -24,6 +24,7 @@ usage: scripts/release-candidate.sh [options]
 
 Default gate:
   - require a clean git worktree
+  - run repository-wide formatting, lint, and tests
   - run scripts/release-preflight.sh
   - verify local loopback /api/health and /api/timeline if the daemon is serving
   - print version/tag/publication state
@@ -33,7 +34,7 @@ Options:
   --skip-preflight              skip scripts/release-preflight.sh
   --skip-local-web              skip local loopback web API smoke
   --with-linux-product-qa       run Dockerized Linux product QA on the built wheel
-  --provider-state <dir>        provider state for Linux product QA
+  --provider-state <dir>        provider state for installed/live and Linux proof
   --with-linux-managed-service  run Linux user-systemd smoke on the current host
   --for-tag <vX.Y.Z>            verify package version matches the intended tag
   -h, --help                    show this help
@@ -42,7 +43,7 @@ Release order:
   1. Run this script locally before pushing.
   2. Push only after it passes.
   3. Let GitHub Actions confirm the pushed commit.
-  4. Bump version/changelog, run this script with --for-tag, then tag/publish.
+  4. Bump version/changelog, then run --for-tag with provider state and Linux QA.
 EOF
 }
 
@@ -102,6 +103,28 @@ done
 
 cd "$REPO_DIR"
 
+if [[ -n "$PROVIDER_STATE" ]]; then
+  if [[ ! -d "$PROVIDER_STATE" || ! -f "$PROVIDER_STATE/auth.json" ]]; then
+    echo "[candidate] provider state must contain auth.json: $PROVIDER_STATE" >&2
+    exit 2
+  fi
+fi
+
+if [[ -n "$TAG_NAME" ]]; then
+  if [[ "$RUN_PREFLIGHT" != true ]]; then
+    echo "[candidate] tag proof cannot skip preflight" >&2
+    exit 2
+  fi
+  if [[ -z "$PROVIDER_STATE" ]]; then
+    echo "[candidate] tag proof requires --provider-state" >&2
+    exit 2
+  fi
+  if [[ "$RUN_LINUX_PRODUCT_QA" != true ]]; then
+    echo "[candidate] tag proof requires --with-linux-product-qa" >&2
+    exit 2
+  fi
+fi
+
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "[candidate] missing required command: $1" >&2
@@ -143,8 +166,23 @@ fi
 if [[ "$RUN_PREFLIGHT" == true ]]; then
   step "running local release preflight"
   bash "$SCRIPT_DIR/release-preflight.sh"
+  deterministic_proof="PASS"
+  artifact_proof="PASS"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    macos_sandbox_pi_bash_proof="PASS"
+  else
+    macos_sandbox_pi_bash_proof="UNRUN (requires macOS)"
+  fi
 else
-  step "skipping local release preflight"
+  step "running repository quality without preflight"
+  uv run ruff format --check .
+  uv run ruff check .
+  pytest_base="$(mktemp -d "${TMPDIR:-/tmp}/syke-pytest.XXXXXX")"
+  trap 'rm -rf "$pytest_base"' EXIT
+  uv run pytest tests/ -q --basetemp="$pytest_base"
+  deterministic_proof="PASS"
+  artifact_proof="UNRUN (--skip-preflight)"
+  macos_sandbox_pi_bash_proof="UNRUN (--skip-preflight)"
 fi
 
 wheel_path="$(uv run python - <<'PY'
@@ -161,6 +199,31 @@ PY
 if [[ -z "$wheel_path" && "$RUN_LINUX_PRODUCT_QA" == true ]]; then
   echo "[candidate] Linux product QA needs a built wheel; run preflight or build first." >&2
   exit 1
+fi
+
+if [[ -n "$PROVIDER_STATE" ]]; then
+  if [[ -z "$wheel_path" ]]; then
+    echo "[candidate] provider proof needs a built wheel; run preflight first." >&2
+    exit 1
+  fi
+  step "running provider-backed installed and live runtime proof"
+  bash "$SCRIPT_DIR/fresh-install-test.sh" \
+    --run \
+    --wheel "$wheel_path" \
+    --provider-state "$PROVIDER_STATE"
+  live_pytest_base="$(mktemp -d "${TMPDIR:-/tmp}/syke-live-pytest.XXXXXX")"
+  if ! env \
+    SYKE_RUN_PI_INTEGRATION=1 \
+    SYKE_LIVE_PI_AGENT_DIR="$PROVIDER_STATE" \
+    uv run pytest -m live tests/test_pi_integration.py -q \
+      --basetemp="$live_pytest_base"; then
+    rm -rf "$live_pytest_base"
+    exit 1
+  fi
+  rm -rf "$live_pytest_base"
+  live_provider_proof="PASS"
+else
+  live_provider_proof="UNRUN (use --provider-state)"
 fi
 
 if [[ "$RUN_LOCAL_WEB" == true ]]; then
@@ -195,8 +258,10 @@ print(
     f"events={len(timeline['events'])} setup_blocker={health.get('setup_blocker')}"
 )
 PY
+  local_web_proof="PASS"
 else
   step "skipping local timeline API smoke"
+  local_web_proof="UNRUN (--skip-local-web)"
 fi
 
 if [[ "$RUN_LINUX_PRODUCT_QA" == true ]]; then
@@ -208,15 +273,19 @@ if [[ "$RUN_LINUX_PRODUCT_QA" == true ]]; then
     args+=(--allow-no-provider)
   fi
   bash "$SCRIPT_DIR/linux-product-qa.sh" "${args[@]}"
+  linux_product_proof="PASS"
 else
   step "skipping Linux product QA"
+  linux_product_proof="UNRUN (use --with-linux-product-qa)"
 fi
 
 if [[ "$RUN_LINUX_MANAGED_SERVICE" == true ]]; then
   step "running Linux managed-service smoke on this host"
   bash "$SCRIPT_DIR/linux-managed-service-smoke.sh"
+  linux_service_proof="PASS"
 else
   step "skipping Linux managed-service smoke"
+  linux_service_proof="UNRUN (use --with-linux-managed-service)"
 fi
 
 step "candidate summary"
@@ -232,4 +301,13 @@ echo "[candidate] git_describe=$(git describe --tags --dirty --always)"
 if [[ -n "$wheel_path" ]]; then
   echo "[candidate] wheel=$wheel_path"
 fi
-echo "[candidate] passed"
+echo "[candidate] proof deterministic=$deterministic_proof"
+echo "[candidate] proof artifacts=$artifact_proof"
+echo "[candidate] proof macos_sandbox_pi_bash=$macos_sandbox_pi_bash_proof"
+echo "[candidate] proof local_web=$local_web_proof"
+echo "[candidate] proof linux_product=$linux_product_proof"
+echo "[candidate] proof linux_service=$linux_service_proof"
+echo "[candidate] proof live_provider=$live_provider_proof"
+echo "[candidate] proof clean_user_or_revoked_macos_tcc=UNRUN"
+echo "[candidate] proof physical_sleep_wake=UNRUN"
+echo "[candidate] completed; this is not a complete system proof"

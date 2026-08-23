@@ -346,25 +346,6 @@ def resolve_provider_auth_interactive(provider_id: str) -> FlowChoice:
             return FlowChoice("back")
 
 
-def setup_pi_provider_flow(provider_id: str) -> bool:
-    return run_interactive_provider_flow(initial_provider_id=provider_id).status == "selected"
-
-
-def setup_api_key_flow(provider_id: str | None = None) -> bool:
-    from syke.cli_support.setup_support import setup_provider_choices
-
-    if provider_id is None:
-        api_providers = [
-            item["id"] for item in setup_provider_choices() if not cast(bool, item.get("oauth"))
-        ]
-        entries = [f"{pid}" for pid in api_providers]
-        idx = term_menu_select(entries, title="\n  Which provider?\n")
-        if idx is None:
-            return False
-        provider_id = api_providers[idx]
-    return setup_pi_provider_flow(provider_id)
-
-
 def ensure_setup_pi_runtime() -> tuple[str, str]:
     try:
         from syke.llm.pi_client import ensure_pi_binary, get_pi_version
@@ -375,33 +356,11 @@ def ensure_setup_pi_runtime() -> tuple[str, str]:
         console.print(f"  [red]✗[/red]  Pi runtime: {exc}")
         raise SykeRuntimeException(
             "Setup requires a working Pi runtime before provider setup. "
-            "Install Node.js (>= 20; 22 LTS recommended) and rerun."
+            "Install Node.js 22.19 or newer and rerun."
         ) from exc
 
     console.print(f"  [green]✓[/green] Pi v{ver}")
     return str(pi_path), str(ver)
-
-
-def verify_setup_provider_connection(provider_id: str, model_id: str) -> str:
-    from datetime import datetime
-
-    from syke.llm.pi_client import probe_pi_provider_connection
-
-    ts = datetime.now().strftime("%B %d, %Y at %I:%M %p")
-    ok, detail = probe_pi_provider_connection(
-        provider_id,
-        model_id,
-        prompt=(
-            f"The time is {ts}. You are Syke's synthesis agent. "
-            f"Confirm you're ready in under 10 words."
-        ),
-    )
-    if not ok:
-        raise SykeRuntimeException(
-            "Provider setup did not complete successfully. "
-            f"Pi probe failed for {provider_id}/{model_id}: {detail}"
-        )
-    return detail
 
 
 def resolve_activation_model(provider_id: str, *, explicit_model: str | None = None) -> str:
@@ -489,7 +448,7 @@ def run_interactive_provider_flow(
     initial_provider_id: str | None = None,
 ) -> FlowChoice:
     from syke.cli_support.setup_support import run_setup_stage, setup_provider_choices
-    from syke.pi_state import set_default_model, set_default_provider
+    from syke.pi_state import set_default_provider_and_model
 
     choices = run_setup_stage("Loading providers...", setup_provider_choices)
     provider_id = initial_provider_id
@@ -536,7 +495,6 @@ def run_interactive_provider_flow(
                 console.print(f"  [green]✓[/green] {provider_id}/{model_id} connected")
                 if handshake:
                     console.print(f"    [dim]{handshake}[/dim]")
-                set_default_provider(provider_id)
-                set_default_model(model_id)
+                set_default_provider_and_model(provider_id, model_id)
                 return FlowChoice("selected", provider_id)
             stage = "auth"

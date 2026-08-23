@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import getpass
+import json
 import logging
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import Any, get_origin, get_type_hints
 
 log = logging.getLogger(__name__)
 
@@ -22,7 +23,6 @@ THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh")
 
 @dataclass(frozen=True)
 class SynthesisConfig:
-    threshold: int = 5
     thinking_level: str = "medium"
     timeout: int = 600
     first_run_timeout: int = 1500
@@ -40,18 +40,12 @@ class AskConfig:
 
 
 @dataclass(frozen=True)
-class SourcePathsConfig:
-    claude_code: str = "~/.claude"
-    codex: str = "~/.codex"
-
-
-@dataclass(frozen=True)
 class DistributionPathsConfig:
-    claude_md: str = "~/.claude/CLAUDE.md"
     skills_dirs: tuple[str, ...] = (
         "~/.agents/skills",
+        "~/.pi/agent/skills",
         "~/.claude/skills",
-        "~/.gemini/skills",
+        "~/.gemini/antigravity-cli/skills",
         "~/.hermes/skills",
         "~/.codex/skills",
         "~/.cursor/skills",
@@ -61,8 +55,6 @@ class DistributionPathsConfig:
 
 @dataclass(frozen=True)
 class PathsConfig:
-    data_dir: str = "~/.syke"
-    sources: SourcePathsConfig = field(default_factory=SourcePathsConfig)
     distribution: DistributionPathsConfig = field(default_factory=DistributionPathsConfig)
 
 
@@ -93,6 +85,16 @@ def expand_path(p: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _matches_type(value: object, expected: object) -> bool:
+    if expected is int:
+        return type(value) is int
+    if expected is str:
+        return isinstance(value, str)
+    if get_origin(expected) is tuple:
+        return isinstance(value, tuple) and all(isinstance(item, str) for item in value)
+    return isinstance(expected, type) and isinstance(value, expected)
+
+
 def _build_nested(cls: Any, raw: dict[str, Any]) -> Any:
     """Construct a frozen dataclass from a raw TOML dict, ignoring unknown keys."""
     kwargs: dict[str, Any] = {}
@@ -103,13 +105,15 @@ def _build_nested(cls: Any, raw: dict[str, Any]) -> Any:
         if py_key not in valid_names:
             log.warning("config.toml: ignoring unknown key %r in [%s]", key, cls.__name__)
             continue
-        field_type = resolved_hints.get(py_key)
+        field_type = resolved_hints[py_key]
         if isinstance(value, dict) and hasattr(field_type, "__dataclass_fields__"):
             kwargs[py_key] = _build_nested(field_type, value)
-        elif py_key == "skills_dirs" and isinstance(value, list):
-            kwargs[py_key] = tuple(value)
-        else:
-            kwargs[py_key] = value
+            continue
+        if py_key == "skills_dirs" and isinstance(value, list):
+            value = tuple(value)
+        if not _matches_type(value, field_type):
+            raise ValueError(f"{cls.__name__}.{py_key} has the wrong type")
+        kwargs[py_key] = value
     return cls(**kwargs)
 
 
@@ -120,6 +124,8 @@ def _build_config(raw: dict[str, Any]) -> SykeConfig:
     # Scalar top-level keys
     for key in ("user", "timezone"):
         if key in raw:
+            if not isinstance(raw[key], str):
+                raise ValueError(f"SykeConfig.{key} has the wrong type")
             kwargs[key] = raw[key]
 
     # Nested sections → sub-dataclasses
@@ -137,11 +143,26 @@ def _build_config(raw: dict[str, Any]) -> SykeConfig:
         if section_name in raw:
             section_raw = raw[section_name]
             if not isinstance(section_raw, dict):
-                log.warning("config.toml: [%s] should be a table, ignoring", section_name)
-                continue
+                raise ValueError(f"config.toml: [{section_name}] must be a table")
             kwargs[section_name] = _build_nested(section_cls, section_raw)
 
-    return SykeConfig(**kwargs)
+    config = SykeConfig(**kwargs)
+    positive_values = {
+        "synthesis.timeout": config.synthesis.timeout,
+        "synthesis.first_run_timeout": config.synthesis.first_run_timeout,
+        "daemon.interval": config.daemon.interval,
+        "ask.timeout": config.ask.timeout,
+    }
+    invalid_positive = [name for name, value in positive_values.items() if value <= 0]
+    if invalid_positive:
+        raise ValueError(f"config.toml values must be positive: {', '.join(invalid_positive)}")
+    if config.ask.max_parallel < 0:
+        raise ValueError("config.toml ask.max_parallel cannot be negative")
+    if config.synthesis.thinking_level not in THINKING_LEVELS:
+        raise ValueError(
+            "config.toml synthesis.thinking_level must be one of " + ", ".join(THINKING_LEVELS)
+        )
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +208,9 @@ def load_config(path: Path | None = None) -> SykeConfig:
     except OSError as e:
         log.warning("Cannot read %s: %s — using defaults", config_path, e)
         return SykeConfig(user=getpass.getuser())
+    except (TypeError, ValueError) as e:
+        log.error("Invalid configuration in %s: %s — using defaults", config_path, e)
+        return SykeConfig(user=getpass.getuser())
 
 
 # ---------------------------------------------------------------------------
@@ -197,17 +221,17 @@ def load_config(path: Path | None = None) -> SykeConfig:
 def generate_default_config(user: str = "") -> str:
     """Generate a default config.toml with comments."""
     user = user or getpass.getuser()
+    encoded_user = json.dumps(user)
     return f"""\
 # Syke configuration
 # Docs: https://github.com/saxenauts/syke
 
 # ── Identity ────────────────────────────────────────────────────────────────
-user = "{user}"
+user = {encoded_user}
 timezone = "auto"
 
 # ── Synthesis agent ─────────────────────────────────────────────────────────
 [synthesis]
-threshold = 5            # min new events before synthesizing
 thinking_level = "medium"  # off|minimal|low|medium|high|xhigh
 timeout = 600            # wall-clock timeout (seconds)
 first_run_timeout = 1500 # wall-clock timeout for the first synthesis
@@ -221,20 +245,13 @@ interval = 900           # seconds between sync cycles
 timeout = 600            # seconds
 max_parallel = 8         # max daemon-owned temporary ask workers (0 = unlimited)
 
-# ── Paths ───────────────────────────────────────────────────────────────────
-[paths]
-data_dir = "~/.syke"
-
-[paths.sources]
-claude_code = "~/.claude"
-codex = "~/.codex"
-
+# ── Capability installation paths ──────────────────────────────────────────
 [paths.distribution]
-claude_md = "~/.claude/CLAUDE.md"
 skills_dirs = [
     "~/.agents/skills",
+    "~/.pi/agent/skills",
     "~/.claude/skills",
-    "~/.gemini/skills",
+    "~/.gemini/antigravity-cli/skills",
     "~/.hermes/skills",
     "~/.codex/skills",
     "~/.cursor/skills",

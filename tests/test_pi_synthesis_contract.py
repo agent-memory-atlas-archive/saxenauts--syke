@@ -1,31 +1,44 @@
 from __future__ import annotations
 
-import io
-import json
-import sqlite3
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
 import syke.runtime as runtime_module
+from syke.control import (
+    admit_record,
+    list_receipts,
+    pending_records,
+)
 from syke.db import SykeDB
 from syke.llm import pi_client
 from syke.llm.backends import pi_synthesis
 from syke.memory.memex import update_memex
-from syke.models import Memory
+
+pytestmark = pytest.mark.usefixtures("isolated_synthesis_paths")
 
 
-def _memory_row(db: SykeDB, user_id: str, memory_id: str) -> dict | None:
-    row = db.conn.execute(
-        "SELECT * FROM memories WHERE user_id = ? AND id = ?",
-        (user_id, memory_id),
-    ).fetchone()
-    return dict(row) if row else None
+def _control_dir() -> Path:
+    return pi_synthesis.SESSIONS_DIR.parent
+
+
+def _latest_receipt() -> dict:
+    receipts = list_receipts(_control_dir(), limit=1)
+    assert receipts
+    return receipts[0]
+
+
+def _insert_memory(db: SykeDB, memory_id: str, user_id: str, content: str) -> None:
+    db.conn.execute(
+        """INSERT INTO memories
+           (id, user_id, content, created_at, updated_at)
+           VALUES (?, ?, ?, '2026-01-01T00:00:00+00:00', NULL)""",
+        (memory_id, user_id, content),
+    )
+    db.conn.commit()
 
 
 def _corrupt_search_index(db: SykeDB) -> None:
@@ -64,7 +77,13 @@ def _install_success_runtime(monkeypatch, prompt_fn) -> None:
     monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
 
 
-def _pi_success_result(output: str = "done") -> SimpleNamespace:
+def _pi_success_result(
+    output: str = "done",
+    *,
+    session_name: str | None = None,
+    session_id: str | None = None,
+) -> SimpleNamespace:
+    resolved_session_id = session_id or ("native-test-session" if session_name else None)
     return SimpleNamespace(
         ok=True,
         output=output,
@@ -83,396 +102,204 @@ def _pi_success_result(output: str = "done") -> SimpleNamespace:
         transcript=[{"role": "assistant", "content": [{"type": "text", "text": output}]}],
         num_turns=1,
         thinking=[],
-    )
-
-
-def test_db_validation_issues_defers_malformed_search_index_to_semantic_gate() -> None:
-    validation = {
-        "issues": [
-            "syke.db integrity_check: malformed inverted index for FTS5 table main.memories_fts",
-            "syke.db quick_check: malformed inverted index for FTS5 table main.memories_fts",
-        ]
-    }
-
-    assert pi_synthesis._db_validation_issues(validation) == []
-
-
-def test_db_validation_issues_keeps_real_database_failures() -> None:
-    validation = {
-        "issues": [
-            "syke.db read error: database disk image is malformed",
-            "syke.db integrity_check: *** in database main *** broken page map",
-        ]
-    }
-
-    assert pi_synthesis._db_validation_issues(validation) == validation["issues"]
-
-
-def test_sync_memex_prefers_canonical_db_over_stale_artifact(
-    db,
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    memex_path = tmp_path / "MEMEX.md"
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
-
-    update_memex(db, user_id, "prior memex")
-    update_memex(db, user_id, "canonical db memex")
-    memex_path.write_text("stale artifact memex\n", encoding="utf-8")
-
-    result = pi_synthesis._sync_memex_to_db(
-        db,
-        user_id,
-        previous_content="prior memex",
-        previous_artifact_content="stale artifact memex",
-    )
-
-    assert result == {
-        "ok": True,
-        "updated": True,
-        "source": "db",
-        "artifact_written": True,
-    }
-    assert db.get_memex(user_id)["content"] == "canonical db memex"
-    written = memex_path.read_text(encoding="utf-8")
-    assert "canonical db memex" in written
-    assert written.startswith("# MEMEX [")  # fill indicator header
-    assert "/ 2,000 tokens" in written
-
-
-def test_sync_memex_imports_artifact_when_db_did_not_change(
-    db,
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    memex_path = tmp_path / "MEMEX.md"
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
-
-    update_memex(db, user_id, "prior memex")
-    memex_path.write_text("artifact memex\n", encoding="utf-8")
-
-    result = pi_synthesis._sync_memex_to_db(
-        db,
-        user_id,
-        previous_content="prior memex",
-        previous_artifact_content=None,
-    )
-
-    assert result["ok"] is True
-    assert result["updated"] is True
-    assert result["source"] == "artifact"
-    assert db.get_memex(user_id)["content"] == "artifact memex"
-    written = memex_path.read_text(encoding="utf-8")
-    assert "artifact memex" in written
-
-
-def test_sync_memex_accepts_projected_body_with_trailing_newline(
-    db,
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    memex_path = tmp_path / "MEMEX.md"
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
-
-    update_memex(db, user_id, "prior memex")
-    update_memex(db, user_id, "canonical db memex\n")
-
-    result = pi_synthesis._sync_memex_to_db(
-        db,
-        user_id,
-        previous_content="prior memex",
-        previous_artifact_content=None,
-    )
-
-    assert result["ok"] is True
-    assert result["updated"] is True
-    assert result["source"] == "db"
-    written = memex_path.read_text(encoding="utf-8")
-    assert written.startswith("# MEMEX [")
-    assert pi_synthesis._strip_memex_header(written).strip() == "canonical db memex"
-
-
-def test_sync_memex_normalizes_headered_canonical_db_row(
-    db,
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    memex_path = tmp_path / "MEMEX.md"
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
-    headered = "# MEMEX [10 / 2,000 tokens · 1%]\n\ncanonical body"
-    old_id = "headered-memex-row"
-    db.insert_memory(
-        Memory(
-            id=old_id,
-            user_id=user_id,
-            content=headered,
-            source_event_ids=["__memex__"],
-        )
-    )
-
-    result = pi_synthesis._sync_memex_to_db(
-        db,
-        user_id,
-        previous_content=headered,
-        previous_id=old_id,
-        previous_artifact_content=None,
-    )
-
-    assert result["ok"] is True
-    active = db.get_memex(user_id)
-    assert active is not None
-    assert active["id"] != old_id
-    assert active["content"] == "canonical body"
-    assert _memory_row(db, user_id, old_id)["active"] == 0
-    written = memex_path.read_text(encoding="utf-8")
-    assert written.startswith("# MEMEX [")
-    assert pi_synthesis._strip_memex_header(written).strip() == "canonical body"
-
-
-def test_sync_memex_versions_in_place_db_mutation(
-    db,
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    memex_path = tmp_path / "MEMEX.md"
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
-
-    old_id = update_memex(db, user_id, "old memex")
-    old_row = db.get_memex(user_id)
-    assert old_row is not None
-    db.conn.execute(
-        "UPDATE memories SET content = ?, updated_at = ? WHERE user_id = ? AND id = ?",
-        ("agent mutated active row in place", "2026-01-01T00:00:00+00:00", user_id, old_id),
-    )
-    db.conn.commit()
-
-    result = pi_synthesis._sync_memex_to_db(
-        db,
-        user_id,
-        previous_content="old memex",
-        previous_id=old_id,
-        previous_updated_at=old_row["updated_at"],
-        previous_artifact_content=None,
-    )
-
-    assert result["ok"] is True
-    assert result["updated"] is True
-    assert result["source"] == "db"
-    assert result["normalized_in_place"] is True
-    active = db.get_memex(user_id)
-    assert active is not None
-    assert active["id"] != old_id
-    assert active["content"] == "agent mutated active row in place"
-    old = _memory_row(db, user_id, old_id)
-    assert old is not None
-    assert old["active"] == 0
-    assert old["content"] == "old memex"
-    assert old["superseded_by"] == active["id"]
-    written = memex_path.read_text(encoding="utf-8")
-    assert "agent mutated active row in place" in written
-
-
-def test_sync_memex_projects_existing_canonical_memex_without_artifact(
-    db,
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    memex_path = tmp_path / "MEMEX.md"
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
-
-    update_memex(db, user_id, "canonical memex")
-
-    result = pi_synthesis._sync_memex_to_db(
-        db,
-        user_id,
-        previous_content="canonical memex",
-        previous_artifact_content=None,
-    )
-
-    assert result == {
-        "ok": True,
-        "updated": False,
-        "source": "db",
-        "artifact_written": True,
-    }
-    written = memex_path.read_text(encoding="utf-8")
-    assert "canonical memex" in written
-    assert written.startswith("# MEMEX [")
-
-
-def test_sync_memex_does_not_import_stale_artifact_when_nothing_changed(
-    db,
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    memex_path = tmp_path / "MEMEX.md"
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
-
-    update_memex(db, user_id, "canonical memex")
-    memex_path.write_text("stale artifact memex\n", encoding="utf-8")
-
-    result = pi_synthesis._sync_memex_to_db(
-        db,
-        user_id,
-        previous_content="canonical memex",
-        previous_artifact_content="stale artifact memex",
-    )
-
-    assert result == {
-        "ok": True,
-        "updated": False,
-        "source": "db",
-        "artifact_written": True,
-    }
-    assert db.get_memex(user_id)["content"] == "canonical memex"
-    written = memex_path.read_text(encoding="utf-8")
-    assert "canonical memex" in written
-    assert written.startswith("# MEMEX [")
-
-
-def test_sync_memex_restores_previous_when_canonical_row_disappears(
-    db,
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    memex_path = tmp_path / "MEMEX.md"
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
-
-    update_memex(db, user_id, "canonical memex")
-    existing = db.get_memex(user_id)
-    assert existing is not None
-    memex_path.write_text("canonical memex\n", encoding="utf-8")
-    db.conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (existing["id"],))
-    db.conn.commit()
-
-    result = pi_synthesis._sync_memex_to_db(
-        db,
-        user_id,
-        previous_content="canonical memex",
-        previous_artifact_content="canonical memex",
-    )
-
-    assert result == {
-        "ok": True,
-        "updated": False,
-        "source": "previous",
-        "artifact_written": True,
-    }
-    assert db.get_memex(user_id)["content"] == "canonical memex"
-    written = memex_path.read_text(encoding="utf-8")
-    assert "canonical memex" in written
-    assert written.startswith("# MEMEX [")
-
-
-def test_first_run_rejects_empty_memex_when_sources_have_history(
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    db = SykeDB(tmp_path / "syke.db")
-    memex_path = tmp_path / "MEMEX.md"
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
-    monkeypatch.setattr(
-        pi_synthesis,
-        "_discovered_source_file_counts",
-        lambda selected_sources, *, home=None: {"codex": 7},
-    )
-    monkeypatch.setattr(
-        pi_synthesis,
-        "_validate_cycle_output",
-        lambda: {"valid": True, "issues": [], "stats": {}},
-    )
-    monkeypatch.setattr(
-        pi_client,
-        "resolve_pi_launch_binding",
-        lambda model_override=None: pi_client.PiLaunchBinding(
-            provider="kimi-coding",
-            model=model_override or "k2p5",
+        session_id=resolved_session_id,
+        session_file=(
+            f"/protected/{resolved_session_id}.jsonl" if resolved_session_id is not None else None
         ),
+        session_name=session_name,
     )
 
-    captured_prompt: list[str] = []
 
-    def _prompt(*args, **kwargs) -> SimpleNamespace:
-        captured_prompt.append(args[0])
+def test_failed_graph_restore_still_restores_the_accepted_memex_projection(
+    user_id: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db = SykeDB(tmp_path / "syke.db", user_id=user_id)
+    memex_path = tmp_path / "MEMEX.md"
+    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
+    update_memex(db, user_id, "accepted memex")
+    memex_path.write_text("accepted projection", encoding="utf-8")
+
+    def _prompt(_prompt_text: str, **_kwargs):
+        memex_path.write_text("rejected projection", encoding="utf-8")
+        raise RuntimeError("runtime stopped")
+
+    _install_success_runtime(monkeypatch, _prompt)
+    monkeypatch.setattr(
+        pi_synthesis,
+        "restore_recovery_point",
+        lambda _point, **_kwargs: (_ for _ in ()).throw(RuntimeError("restore unavailable")),
+    )
+
+    try:
+        result = pi_synthesis.pi_synthesize(
+            db,
+            user_id,
+            skill_override="base synthesis prompt",
+            workspace_root=tmp_path,
+            first_run=False,
+        )
+
+        assert result["status"] == "failed"
+        assert "recovery" not in result
+        assert "restore unavailable" in str(result["recovery_error"])
+        restored_projection = memex_path.read_text(encoding="utf-8")
+        assert pi_synthesis._strip_memex_header(restored_projection).strip() == "accepted memex"
+    finally:
+        db.close()
+
+
+def test_synthesis_observes_snapshot_and_accepts_only_that_record(
+    user_id: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db = SykeDB(tmp_path / "syke.db", user_id=user_id)
+    update_memex(db, user_id, "canonical memex")
+    payload = "line one\n" + ("x" * 5_000)
+    record_id = admit_record(_control_dir(), payload)
+    block, included = pi_synthesis._build_incoming_records_block(
+        pending_records(_control_dir()),
+        record_dir=_control_dir() / "records",
+    )
+    assert len(block) <= pi_synthesis.INCOMING_RECORD_CONTEXT_CHAR_LIMIT
+    assert [record["id"] for record in included] == [record_id]
+    assert 'payload: "line one\\n' in block
+    assert "[preview; open the protected record file for the full payload]" in block
+    assert str(_control_dir() / "records" / "<record_id>.json") in block
+    prompts: list[str] = []
+    late_record_id: str | None = None
+
+    def _prompt(prompt: str, **_kwargs):
+        nonlocal late_record_id
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            raise RuntimeError("runtime stopped")
+        late_record_id = admit_record(_control_dir(), "arrived during synthesis")
+        return _pi_success_result()
+
+    _install_success_runtime(monkeypatch, _prompt)
+
+    try:
+        failed = pi_synthesis.pi_synthesize(
+            db,
+            user_id,
+            skill_override="base synthesis prompt",
+            workspace_root=tmp_path,
+            first_run=False,
+        )
+        assert failed["status"] == "failed"
+        assert failed["record_ids_in_context"] == [record_id]
+        assert _latest_receipt()["acknowledged_record_ids"] == []
+        assert [record["id"] for record in pending_records(_control_dir())] == [record_id]
+
+        accepted = pi_synthesis.pi_synthesize(
+            db,
+            user_id,
+            skill_override="base synthesis prompt",
+            workspace_root=tmp_path,
+            first_run=False,
+        )
+
+        assert accepted["status"] == "completed"
+        assert accepted["record_ids_in_context"] == [record_id]
+        assert len(prompts) == 2
+        assert all('payload: "line one\\n' in prompt for prompt in prompts)
+        assert all(payload not in prompt for prompt in prompts)
+        assert all("arrived during synthesis" not in prompt for prompt in prompts)
+        assert _latest_receipt()["acknowledged_record_ids"] == [record_id]
+        assert late_record_id is not None
+        assert [record["id"] for record in pending_records(_control_dir())] == [late_record_id]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_source", "expected_updated", "expected_content"),
+    [
+        ("db_changed", "db", True, "canonical db memex"),
+        ("artifact_changed", "artifact", True, "artifact memex"),
+        ("headered_db", "db", False, "canonical body"),
+        ("unchanged_db", "db", False, "canonical memex"),
+        ("missing_db", "previous", False, "canonical memex"),
+    ],
+)
+def test_sync_memex_authority_matrix(
+    db,
+    user_id: str,
+    tmp_path: Path,
+    monkeypatch,
+    scenario: str,
+    expected_source: str,
+    expected_updated: bool,
+    expected_content: str,
+) -> None:
+    memex_path = tmp_path / "MEMEX.md"
+    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
+    previous_content = "canonical memex"
+    previous_artifact_content: str | None = None
+    old_id = update_memex(db, user_id, previous_content)
+
+    if scenario == "db_changed":
+        previous_content = "prior memex"
+        previous_artifact_content = "stale artifact memex"
+        update_memex(db, user_id, previous_content)
+        update_memex(db, user_id, "canonical db memex")
+        memex_path.write_text(previous_artifact_content, encoding="utf-8")
+    elif scenario == "artifact_changed":
+        previous_content = "prior memex"
+        update_memex(db, user_id, previous_content)
         memex_path.write_text(
-            "As of now:\n- No durable user/project memories have been recorded yet.\n",
+            "# MEMEX [10 / 2,000 tokens · 1%]\n\nartifact memex\n",
             encoding="utf-8",
         )
-        return SimpleNamespace(
-            ok=True,
-            output="done",
-            duration_ms=5,
-            cost_usd=0.0,
-            input_tokens=10,
-            output_tokens=4,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-            provider="kimi-coding",
-            response_model="k2p5",
-            response_id="resp_empty_bootstrap",
-            stop_reason="stop",
-            tool_calls=[],
-            events=[],
-            transcript=[{"role": "assistant", "content": [{"type": "text", "text": "done"}]}],
-            num_turns=1,
-            thinking=[],
+    elif scenario == "headered_db":
+        headered = "# MEMEX [10 / 2,000 tokens · 1%]\n\ncanonical body"
+        previous_content = headered
+        update_memex(db, user_id, "canonical body")
+        db.conn.execute(
+            "UPDATE current_memex SET content = ? WHERE singleton = 1 AND user_id = ?",
+            (headered, user_id),
         )
+        db.conn.commit()
+    elif scenario == "unchanged_db":
+        previous_artifact_content = "stale artifact memex"
+        memex_path.write_text(previous_artifact_content, encoding="utf-8")
+    elif scenario == "missing_db":
+        previous_artifact_content = previous_content
+        memex_path.write_text(previous_content, encoding="utf-8")
+        current = db.get_memex(user_id)
+        assert current is not None
+        db.conn.execute("DROP TRIGGER protect_current_memex_delete")
+        db.conn.execute("DELETE FROM current_memex WHERE id = ?", (current["id"],))
+        db.conn.commit()
 
-    runtime = SimpleNamespace(
-        is_alive=True,
-        model="k2p5",
-        prompt=_prompt,
-        status=lambda: {
-            "workspace": str(pi_synthesis.WORKSPACE_ROOT),
-            "pid": 1,
-            "uptime_s": 1,
-            "session_count": 1,
-        },
+    result = pi_synthesis._sync_memex_to_db(
+        db,
+        user_id,
+        previous_content=previous_content,
+        previous_artifact_content=previous_artifact_content,
     )
-    monkeypatch.setattr(
-        runtime_module, "get_pi_runtime", lambda: (_ for _ in ()).throw(RuntimeError())
-    )
-    monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
 
-    try:
-        result = pi_synthesis.pi_synthesize(
-            db,
-            user_id,
-            first_run=True,
-            selected_sources=("codex",),
-            workspace_root=tmp_path,
-        )
-
-        assert result["status"] == "failed"
-        assert captured_prompt
-        assert "<first_run_bootstrap>" in captured_prompt[0]
-        assert "Use the bootstrap path" in captured_prompt[0]
-        assert "codex: 7 discovered files/rows" in captured_prompt[0]
-        assert "First synthesis produced an empty MEMEX" in str(result["error"])
-        assert "codex=7" in str(result["error"])
-        assert result["memex_updated"] is False
-        assert db.get_memex(user_id) is None
-        assert not memex_path.exists()
-        latest_cycle = db._conn.execute(
-            "SELECT status, memex_updated FROM cycle_records WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        assert latest_cycle["status"] == "failed"
-        assert latest_cycle["memex_updated"] == 0
-    finally:
-        db.close()
+    assert result == {
+        "ok": True,
+        "updated": expected_updated,
+        "source": expected_source,
+        "artifact_written": True,
+    }
+    active = db.get_memex(user_id)
+    assert active is not None
+    if scenario != "missing_db":
+        assert active["id"] == old_id
+    assert active["content"] == expected_content
+    written = memex_path.read_text(encoding="utf-8")
+    assert written.startswith("# MEMEX [")
+    assert "/ 2,000 tokens" in written
+    assert pi_synthesis._strip_memex_header(written).strip() == expected_content
 
 
-def test_first_run_records_empty_memex_when_no_history(
+def test_pi_synthesize_treats_header_only_memex_normalization_as_noop(
     user_id: str,
     tmp_path: Path,
     monkeypatch,
@@ -480,171 +307,118 @@ def test_first_run_records_empty_memex_when_no_history(
     db = SykeDB(tmp_path / "syke.db")
     memex_path = tmp_path / "MEMEX.md"
     monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
-    monkeypatch.setattr(
-        pi_synthesis,
-        "_discovered_source_file_counts",
-        lambda selected_sources, *, home=None: {},
+    update_memex(db, user_id, "canonical body")
+    headered = "# MEMEX [10 / 2,000 tokens · 1%]\n\ncanonical body"
+    db.conn.execute(
+        "UPDATE current_memex SET content = ? WHERE singleton = 1 AND user_id = ?",
+        (headered, user_id),
     )
-    monkeypatch.setattr(
-        pi_synthesis,
-        "_validate_cycle_output",
-        lambda: {"valid": True, "issues": [], "stats": {}},
-    )
-    monkeypatch.setattr(
-        pi_client,
-        "resolve_pi_launch_binding",
-        lambda model_override=None: pi_client.PiLaunchBinding(
-            provider="kimi-coding",
-            model=model_override or "k2p5",
-        ),
-    )
+    db.conn.commit()
 
-    runtime = SimpleNamespace(
-        is_alive=True,
-        model="k2p5",
-        prompt=lambda *args, **kwargs: SimpleNamespace(
-            ok=True,
-            output="done",
-            duration_ms=5,
-            cost_usd=0.0,
-            input_tokens=10,
-            output_tokens=4,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-            provider="kimi-coding",
-            response_model="k2p5",
-            response_id="resp_empty_clean_first_run",
-            stop_reason="stop",
-            tool_calls=[],
-            events=[],
-            transcript=[{"role": "assistant", "content": [{"type": "text", "text": "done"}]}],
-            num_turns=1,
-            thinking=[],
-        ),
-        status=lambda: {
-            "workspace": str(pi_synthesis.WORKSPACE_ROOT),
-            "pid": 1,
-            "uptime_s": 1,
-            "session_count": 1,
-        },
-    )
-    monkeypatch.setattr(
-        runtime_module, "get_pi_runtime", lambda: (_ for _ in ()).throw(RuntimeError())
-    )
-    monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
+    def _prompt(*_args, **kwargs) -> SimpleNamespace:
+        return _pi_success_result(
+            "no memex change",
+            session_name=kwargs["session_name"],
+            session_id="native-header-normalization-noop",
+        )
+
+    _install_success_runtime(monkeypatch, _prompt)
 
     try:
-        result = pi_synthesis.pi_synthesize(
-            db,
-            user_id,
-            first_run=True,
-            selected_sources=(),
-            workspace_root=tmp_path,
-        )
+        result = pi_synthesis.pi_synthesize(db, user_id, workspace_root=tmp_path)
 
         assert result["status"] == "completed"
-        assert result["memex_updated"] is True
-        memex = db.get_memex(user_id)
-        assert memex is not None
-        assert "No durable user/project memories have been captured yet." in memex["content"]
-        assert "No prior harness history was detected" in memex["content"]
-        written = memex_path.read_text(encoding="utf-8")
-        assert "No prior harness history was detected" in written
-        latest_cycle = db._conn.execute(
-            "SELECT status, memex_updated FROM cycle_records WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        assert latest_cycle["status"] == "completed"
-        assert latest_cycle["memex_updated"] == 1
+        assert result["memex_updated"] is False
+        current = db.get_memex(user_id)
+        assert current is not None
+        assert current["content"] == "canonical body"
+        receipt = _latest_receipt()
+        assert receipt["status"] == "completed"
+        assert receipt["memex_updated"] is False
+        assert "memex_version" not in receipt
     finally:
         db.close()
 
 
-def test_first_run_still_fails_empty_memex_when_memory_exists(
+@pytest.mark.parametrize("scenario", ["source_history", "empty_machine", "existing_graph"])
+def test_first_run_state_matches_available_history(
     user_id: str,
     tmp_path: Path,
     monkeypatch,
+    scenario: str,
 ) -> None:
     db = SykeDB(tmp_path / "syke.db")
-    db.insert_memory(
-        Memory(
-            id="mem-existing",
-            user_id=user_id,
-            content="Existing durable fact that should be synthesized.",
-        )
-    )
     memex_path = tmp_path / "MEMEX.md"
     monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
+    source_counts = {"codex": 7} if scenario == "source_history" else {}
     monkeypatch.setattr(
         pi_synthesis,
         "_discovered_source_file_counts",
-        lambda selected_sources, *, home=None: {},
+        lambda selected_sources, *, home=None: source_counts,
     )
     monkeypatch.setattr(
         pi_synthesis,
         "_validate_cycle_output",
         lambda: {"valid": True, "issues": [], "stats": {}},
     )
-    monkeypatch.setattr(
-        pi_client,
-        "resolve_pi_launch_binding",
-        lambda model_override=None: pi_client.PiLaunchBinding(
-            provider="kimi-coding",
-            model=model_override or "k2p5",
-        ),
-    )
+    if scenario == "existing_graph":
+        _insert_memory(db, "memory-existing", user_id, "existing durable fact")
 
-    runtime = SimpleNamespace(
-        is_alive=True,
-        model="k2p5",
-        prompt=lambda *args, **kwargs: SimpleNamespace(
-            ok=True,
-            output="done",
-            duration_ms=5,
-            cost_usd=0.0,
-            input_tokens=10,
-            output_tokens=4,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-            provider="kimi-coding",
-            response_model="k2p5",
-            response_id="resp_empty_existing_memory",
-            stop_reason="stop",
-            tool_calls=[],
-            events=[],
-            transcript=[{"role": "assistant", "content": [{"type": "text", "text": "done"}]}],
-            num_turns=1,
-            thinking=[],
-        ),
-        status=lambda: {
-            "workspace": str(pi_synthesis.WORKSPACE_ROOT),
-            "pid": 1,
-            "uptime_s": 1,
-            "session_count": 1,
-        },
-    )
-    monkeypatch.setattr(
-        runtime_module, "get_pi_runtime", lambda: (_ for _ in ()).throw(RuntimeError())
-    )
-    monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
+    prompts: list[str] = []
+
+    def _prompt(prompt: str, **kwargs) -> SimpleNamespace:
+        prompts.append(prompt)
+        if scenario == "source_history":
+            memex_path.write_text(
+                "No durable user/project memories have been recorded yet.\n",
+                encoding="utf-8",
+            )
+        return _pi_success_result(
+            session_name=kwargs.get("session_name"),
+            session_id=f"native-first-run-{scenario}",
+        )
+
+    _install_success_runtime(monkeypatch, _prompt)
 
     try:
         result = pi_synthesis.pi_synthesize(
             db,
             user_id,
             first_run=True,
-            selected_sources=(),
+            selected_sources=("codex",) if source_counts else (),
             workspace_root=tmp_path,
         )
 
-        assert result["status"] == "failed"
-        assert "canonical memex is unavailable" in str(result["error"])
-        assert db.get_memex(user_id) is None
+        if scenario == "source_history":
+            assert len(prompts) == 4
+            assert result["status"] == "failed"
+            assert "codex: 7 discovered files/rows" in prompts[0]
+            assert "First synthesis produced an empty MEMEX" in str(result["error"])
+            assert db.get_memex(user_id) is None
+            assert not memex_path.exists()
+            assert _latest_receipt()["status"] == "failed"
+        elif scenario == "empty_machine":
+            assert len(prompts) == 1
+            assert result["status"] == "completed"
+            memex = db.get_memex(user_id)
+            assert memex is not None
+            assert "No prior harness history was detected" in memex["content"]
+            assert (
+                pi_synthesis._strip_memex_header(memex_path.read_text(encoding="utf-8")).strip()
+                == memex["content"]
+            )
+            assert _latest_receipt()["status"] == "completed"
+        else:
+            assert len(prompts) == 4
+            assert result["status"] == "failed"
+            assert "canonical memex is unavailable" in str(result["error"])
+            assert db.get_memex(user_id) is None
+            assert db.count_memories(user_id) == 1
     finally:
         db.close()
 
 
-def test_pi_synthesize_blocks_missing_model_before_cycle(
+def test_pi_synthesize_records_missing_model_as_blocked(
     user_id: str,
     tmp_path: Path,
     monkeypatch,
@@ -669,409 +443,54 @@ def test_pi_synthesize_blocks_missing_model_before_cycle(
         assert result["reason"] == "setup_blocked"
         assert "No Pi model is configured" in str(result["error"])
 
-        cycle_count = db._conn.execute(
-            "SELECT COUNT(*) FROM cycle_records WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()[0]
-        assert cycle_count == 1
-        latest_cycle = db._conn.execute(
-            "SELECT status, memex_updated FROM cycle_records WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        assert latest_cycle["status"] == "blocked"
-        assert latest_cycle["memex_updated"] == 0
+        receipts = list_receipts(_control_dir())
+        assert len(receipts) == 1
+        assert receipts[0]["status"] == "blocked"
+        assert receipts[0]["memex_updated"] is False
 
-        trace_row = db._conn.execute(
-            "SELECT status, error FROM rollout_traces WHERE user_id = ? AND kind = 'synthesis'",
-            (user_id,),
-        ).fetchone()
-        assert trace_row["status"] == "blocked"
-        assert "No Pi model is configured" in trace_row["error"]
     finally:
         db.close()
 
 
 def test_pi_synthesize_skips_when_synthesis_lock_is_held(db, user_id: str) -> None:
-    with patch.object(
-        pi_synthesis,
-        "_acquire_synthesis_lock",
-        side_effect=pi_synthesis.SynthesisLockUnavailable("busy"),
-    ):
+    lock_handle, _ = pi_synthesis._acquire_synthesis_lock(user_id)
+    try:
         result = pi_synthesis.pi_synthesize(db, user_id)
+    finally:
+        pi_synthesis._release_synthesis_lock(lock_handle)
 
     assert result["status"] == "skipped"
     assert result["reason"] == "locked"
     assert result["memex_updated"] is False
+    assert "cycle_runtime" not in result
+    assert list_receipts(_control_dir()) == []
 
 
-def test_pi_synthesize_waits_for_retry_settlement_before_marking_cycle_failed(
+def test_pi_synthesize_uses_now_override_for_replay_receipt(
     user_id: str,
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     db = SykeDB(tmp_path / "syke.db")
     update_memex(db, user_id, "canonical memex")
-    # Synthesis doesn't need events — it reads harness data via adapters.
-    # Seed a memory so the agent has something to work with.
-    db.insert_memory(
-        Memory(
-            id="mem-seed",
-            user_id=user_id,
-            content="Seed memory for synthesis test",
-        )
-    )
-
-    monkeypatch.setattr(
-        pi_client,
-        "resolve_pi_launch_binding",
-        lambda model_override=None: pi_client.PiLaunchBinding(
-            provider="kimi-coding",
-            model=model_override or "k2p5",
-        ),
-    )
-    runtime = pi_client.PiRuntime(workspace_dir=tmp_path, model="k2p5")
-    runtime._process = SimpleNamespace(poll=lambda: None, pid=4242)
-    runtime._stream = pi_client.RpcEventStream(io.StringIO(""))
-
-    def _send(payload: dict[str, object]) -> None:
-        if payload.get("type") != "prompt":
-            return
-
-        def _emit() -> None:
-            assert runtime._stream is not None
-            stream = runtime._stream
-            time.sleep(0.1)
-            stream._events.append(
-                {
-                    "type": "agent_end",
-                    "messages": [
-                        {
-                            "role": "assistant",
-                            "provider": "kimi-coding",
-                            "model": "k2p5",
-                            "responseId": "resp_retryable",
-                            "stopReason": "error",
-                            "errorMessage": '429 {"error":{"type":"rate_limit_error","message":"busy"}}',
-                            "content": [],
-                        }
-                    ],
-                }
-            )
-            stream._done.set()
-            time.sleep(0.1)
-            stream._events.append(
-                {
-                    "type": "auto_retry_start",
-                    "attempt": 1,
-                    "maxAttempts": 3,
-                    "delayMs": 2000,
-                    "errorMessage": '429 {"error":{"type":"rate_limit_error","message":"busy"}}',
-                }
-            )
-            time.sleep(0.1)
-            stream._events.append({"type": "auto_retry_end", "success": True, "attempt": 1})
-            time.sleep(0.1)
-            stream._events.append(
-                {
-                    "type": "agent_end",
-                    "messages": [
-                        {
-                            "role": "assistant",
-                            "provider": "kimi-coding",
-                            "model": "k2p5",
-                            "responseId": "resp_final",
-                            "stopReason": "stop",
-                            "content": [{"type": "text", "text": "done"}],
-                            "usage": {
-                                "input": 10,
-                                "output": 4,
-                                "cacheRead": 2,
-                                "cacheWrite": 0,
-                                "cost": {"total": 0.0},
-                            },
-                        }
-                    ],
-                }
-            )
-            stream._done.set()
-
-        threading.Thread(target=_emit, daemon=True).start()
-
-    monkeypatch.setattr(runtime, "_send", _send)
-    monkeypatch.setattr(runtime, "new_session", lambda timeout=30.0: {})
-    monkeypatch.setattr(runtime, "get_session_stats", lambda timeout=10.0: {"assistantMessages": 1})
-    monkeypatch.setattr(
-        runtime,
-        "get_messages",
-        lambda timeout=10.0: [{"role": "assistant", "content": [{"type": "text", "text": "done"}]}],
-    )
-    monkeypatch.setattr(
-        runtime_module, "get_pi_runtime", lambda: (_ for _ in ()).throw(RuntimeError())
-    )
-    monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
-
-    try:
-        result = pi_synthesis.pi_synthesize(db, user_id)
-
-        assert result["status"] == "completed"
-        assert result["error"] is None
-        assert result["response_id"] == "resp_final"
-        assert result["stop_reason"] == "stop"
-        latest_cycle = db._conn.execute(
-            "SELECT status, cursor_end FROM cycle_records WHERE user_id = ? ORDER BY started_at DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        assert latest_cycle["status"] == "completed"
-        assert latest_cycle["cursor_end"] is not None
-    finally:
-        db.close()
-
-
-def test_pi_synthesize_uses_now_override_for_cycle_and_trace_timestamps(
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    db = SykeDB(tmp_path / "syke.db")
-    update_memex(db, user_id, "canonical memex")
-    db.insert_memory(
-        Memory(
-            id="mem-seed-time",
-            user_id=user_id,
-            content="Seed memory for time override test",
-        )
-    )
-
     now_override = datetime.fromisoformat("2026-03-07T23:59:00-08:00")
-    captured: dict[str, object] = {}
 
-    monkeypatch.setattr(
-        "syke.trace_store.persist_rollout_trace",
-        lambda **kwargs: captured.update(kwargs) or kwargs["run_id"],
-    )
-    monkeypatch.setattr(
-        pi_client,
-        "resolve_pi_launch_binding",
-        lambda model_override=None: pi_client.PiLaunchBinding(
-            provider="kimi-coding",
-            model=model_override or "k2p5",
-        ),
-    )
+    def _prompt(_prompt: str, **kwargs) -> SimpleNamespace:
+        return _pi_success_result(
+            session_name=kwargs.get("session_name"),
+            session_id="native-session-time",
+        )
 
-    runtime = SimpleNamespace(
-        is_alive=True,
-        model="k2p5",
-        prompt=lambda *args, **kwargs: SimpleNamespace(
-            ok=True,
-            output="done",
-            duration_ms=5,
-            cost_usd=0.0,
-            input_tokens=10,
-            output_tokens=4,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-            provider="kimi-coding",
-            response_model="k2p5",
-            response_id="resp_time",
-            stop_reason="stop",
-            tool_calls=[],
-            events=[],
-            transcript=[{"role": "assistant", "content": [{"type": "text", "text": "done"}]}],
-            num_turns=1,
-            thinking=[],
-        ),
-        status=lambda: {
-            "workspace": str(pi_synthesis.WORKSPACE_ROOT),
-            "pid": 1,
-            "uptime_s": 1,
-            "session_count": 1,
-        },
-    )
-
-    monkeypatch.setattr(
-        runtime_module, "get_pi_runtime", lambda: (_ for _ in ()).throw(RuntimeError())
-    )
-    monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
+    _install_success_runtime(monkeypatch, _prompt)
 
     try:
         result = pi_synthesis.pi_synthesize(db, user_id, now_override=now_override)
 
         assert result["status"] == "completed"
-        latest_cycle = db._conn.execute(
-            "SELECT started_at, completed_at FROM cycle_records WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        assert latest_cycle["started_at"] == "2026-03-07T23:59:00-08:00"
-        assert latest_cycle["completed_at"] == "2026-03-07T23:59:00-08:00"
-        assert captured["started_at"].isoformat() == "2026-03-07T23:59:00-08:00"
-        assert captured["completed_at"].isoformat() == "2026-03-07T23:59:00-08:00"
-    finally:
-        db.close()
-
-
-def test_pi_synthesize_versions_in_place_memex_mutation_before_marking_updated(
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    db = SykeDB(tmp_path / "syke.db")
-    old_id = update_memex(db, user_id, "old canonical memex")
-
-    monkeypatch.setattr(
-        pi_synthesis,
-        "_validate_cycle_output",
-        lambda: {"valid": True, "issues": [], "stats": {}},
-    )
-    monkeypatch.setattr(
-        pi_client,
-        "resolve_pi_launch_binding",
-        lambda model_override=None: pi_client.PiLaunchBinding(
-            provider="kimi-coding",
-            model=model_override or "k2p5",
-        ),
-    )
-
-    def _prompt(*args, **kwargs) -> SimpleNamespace:
-        cursor = db.conn.execute(
-            "UPDATE memories SET content = ?, updated_at = ? WHERE user_id = ? AND id = ?",
-            (
-                "agent wrote canonical memex in place",
-                "2026-01-01T00:00:00+00:00",
-                user_id,
-                old_id,
-            ),
-        )
-        db.conn.commit()
-        assert cursor.rowcount == 1
-        return SimpleNamespace(
-            ok=True,
-            output="Updated canonical MEMEX row.",
-            duration_ms=5,
-            cost_usd=0.0,
-            input_tokens=10,
-            output_tokens=4,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-            provider="kimi-coding",
-            response_model="k2p5",
-            response_id="resp_memex_in_place",
-            stop_reason="stop",
-            tool_calls=[],
-            events=[],
-            transcript=[{"role": "assistant", "content": [{"type": "text", "text": "done"}]}],
-            num_turns=1,
-            thinking=[],
-        )
-
-    runtime = SimpleNamespace(
-        is_alive=True,
-        model="k2p5",
-        prompt=_prompt,
-        status=lambda: {
-            "workspace": str(pi_synthesis.WORKSPACE_ROOT),
-            "pid": 1,
-            "uptime_s": 1,
-            "session_count": 1,
-        },
-    )
-    monkeypatch.setattr(
-        runtime_module, "get_pi_runtime", lambda: (_ for _ in ()).throw(RuntimeError())
-    )
-    monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
-
-    try:
-        result = pi_synthesis.pi_synthesize(db, user_id, workspace_root=tmp_path)
-
-        assert result["status"] == "completed"
-        assert result["memex_updated"] is True
-        active = db.get_memex(user_id)
-        assert active is not None
-        assert active["id"] != old_id
-        assert active["content"] == "agent wrote canonical memex in place"
-        old = _memory_row(db, user_id, old_id)
-        assert old is not None
-        assert old["active"] == 0
-        assert old["content"] == "old canonical memex"
-        assert old["superseded_by"] == active["id"]
-        latest_cycle = db._conn.execute(
-            "SELECT memex_updated FROM cycle_records WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        assert latest_cycle["memex_updated"] == 1
-    finally:
-        db.close()
-
-
-def test_pi_synthesize_marks_post_commit_exception_failed(
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    db = SykeDB(tmp_path / "syke.db")
-    update_memex(db, user_id, "canonical memex")
-
-    monkeypatch.setattr(
-        pi_client,
-        "resolve_pi_launch_binding",
-        lambda model_override=None: pi_client.PiLaunchBinding(
-            provider="kimi-coding",
-            model=model_override or "k2p5",
-        ),
-    )
-    runtime = SimpleNamespace(
-        is_alive=True,
-        model="k2p5",
-        prompt=lambda *args, **kwargs: SimpleNamespace(
-            ok=True,
-            output="done",
-            duration_ms=5,
-            cost_usd=0.0,
-            input_tokens=10,
-            output_tokens=4,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-            provider="kimi-coding",
-            response_model="k2p5",
-            response_id="resp_commit_fail",
-            stop_reason="stop",
-            tool_calls=[],
-            events=[],
-            transcript=[{"role": "assistant", "content": [{"type": "text", "text": "done"}]}],
-            num_turns=1,
-            thinking=[],
-        ),
-        status=lambda: {
-            "workspace": str(pi_synthesis.WORKSPACE_ROOT),
-            "pid": 1,
-            "uptime_s": 1,
-            "session_count": 1,
-        },
-    )
-
-    monkeypatch.setattr(
-        runtime_module, "get_pi_runtime", lambda: (_ for _ in ()).throw(RuntimeError())
-    )
-    monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
-    monkeypatch.setattr(
-        pi_synthesis,
-        "_sync_memex_to_db",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            sqlite3.OperationalError("Could not decode to UTF-8 column 'content'")
-        ),
-    )
-
-    try:
-        result = pi_synthesis.pi_synthesize(db, user_id)
-
-        assert result["status"] == "failed"
-        assert "Post-synthesis commit failed" in str(result["error"])
-        assert "Could not decode to UTF-8" in str(result["error"])
-        latest_cycle = db._conn.execute(
-            "SELECT status, memex_updated FROM cycle_records WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        assert latest_cycle["status"] == "failed"
-        assert latest_cycle["memex_updated"] == 0
+        receipt = _latest_receipt()
+        assert receipt["started_at"] == "2026-03-07T23:59:00-08:00"
+        assert receipt["completed_at"] == "2026-03-07T23:59:00-08:00"
+        assert result["session_id"] == "native-session-time"
     finally:
         db.close()
 
@@ -1144,102 +563,9 @@ def test_pi_synthesize_marks_replay_db_validation_issue_failed(
         assert result["validation"]["issues"] == [
             "syke.db read error: database disk image is malformed"
         ]
-        latest_cycle = db._conn.execute(
-            "SELECT status, memex_updated FROM cycle_records WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        assert latest_cycle["status"] == "failed"
-        assert latest_cycle["memex_updated"] == 0
-    finally:
-        db.close()
-
-
-def test_pi_synthesize_pauses_replay_db_connection_during_agent(
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    db = SykeDB(tmp_path / "syke.db")
-    update_memex(db, user_id, "canonical memex")
-
-    monkeypatch.setenv("SYKE_REPLAY_PAUSE_DB_CONNECTION_DURING_PI", "1")
-    monkeypatch.setattr(
-        pi_synthesis, "_validate_cycle_output", lambda: {"valid": True, "issues": [], "stats": {}}
-    )
-    monkeypatch.setattr(
-        pi_client,
-        "resolve_pi_launch_binding",
-        lambda model_override=None: pi_client.PiLaunchBinding(
-            provider="kimi-coding",
-            model=model_override or "k2p5",
-        ),
-    )
-
-    def _prompt(*args, **kwargs) -> SimpleNamespace:
-        with pytest.raises(sqlite3.ProgrammingError):
-            db.conn.execute("SELECT 1")
-        external = sqlite3.connect(db.db_path)
-        external.execute(
-            """INSERT INTO memories
-               (id, user_id, content, source_event_ids, created_at, updated_at, active)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "agent-memory",
-                user_id,
-                "agent wrote while parent connection was paused",
-                "[]",
-                "2026-03-08T00:00:00Z",
-                "2026-03-08T00:00:00Z",
-                1,
-            ),
-        )
-        external.commit()
-        external.close()
-        return SimpleNamespace(
-            ok=True,
-            output="done",
-            duration_ms=5,
-            cost_usd=0.0,
-            input_tokens=10,
-            output_tokens=4,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-            provider="kimi-coding",
-            response_model="k2p5",
-            response_id="resp_pause_db",
-            stop_reason="stop",
-            tool_calls=[],
-            events=[],
-            transcript=[{"role": "assistant", "content": [{"type": "text", "text": "done"}]}],
-            num_turns=1,
-            thinking=[],
-        )
-
-    runtime = SimpleNamespace(
-        is_alive=True,
-        model="k2p5",
-        prompt=_prompt,
-        status=lambda: {
-            "workspace": str(pi_synthesis.WORKSPACE_ROOT),
-            "pid": 1,
-            "uptime_s": 1,
-            "session_count": 1,
-        },
-    )
-
-    monkeypatch.setattr(
-        runtime_module, "get_pi_runtime", lambda: (_ for _ in ()).throw(RuntimeError())
-    )
-    monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
-
-    try:
-        result = pi_synthesis.pi_synthesize(db, user_id)
-
-        assert result["status"] == "completed"
-        count = db.conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE id = 'agent-memory'"
-        ).fetchone()[0]
-        assert count == 1
+        receipt = _latest_receipt()
+        assert receipt["status"] == "failed"
+        assert receipt["memex_updated"] is False
     finally:
         db.close()
 
@@ -1254,12 +580,11 @@ def test_pi_synthesize_restores_recovery_point_when_semantic_gate_fails(
     monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", memex_path)
     update_memex(db, user_id, "canonical memex")
     for index in range(6):
-        db.insert_memory(
-            Memory(
-                id=f"mem-collapse-{index}",
-                user_id=user_id,
-                content=f"Durable memory {index}",
-            )
+        _insert_memory(
+            db,
+            f"mem-collapse-{index}",
+            user_id,
+            f"Durable memory {index}",
         )
     monkeypatch.setattr(
         pi_synthesis,
@@ -1267,10 +592,18 @@ def test_pi_synthesize_restores_recovery_point_when_semantic_gate_fails(
         lambda: {"valid": True, "issues": [], "stats": {}},
     )
 
-    def _prompt(*args, **kwargs) -> SimpleNamespace:
+    prompts: list[tuple[str, dict[str, object]]] = []
+
+    def _prompt(prompt: str, **kwargs) -> SimpleNamespace:
+        prompts.append((prompt, kwargs))
+        db.conn.execute("DROP TRIGGER protect_memories_stable_fields")
         db.conn.execute(
-            "UPDATE memories SET active = 0 WHERE user_id = ? AND source_event_ids != ?",
-            (user_id, '["__memex__"]'),
+            "UPDATE memories SET content = content || ' collapsed' WHERE user_id = ?",
+            (user_id,),
+        )
+        db.conn.execute(
+            "UPDATE memories SET created_at = '1900-01-01T00:00:00+00:00' WHERE user_id = ?",
+            (user_id,),
         )
         db.conn.commit()
         return _pi_success_result("collapsed memories")
@@ -1282,182 +615,23 @@ def test_pi_synthesize_restores_recovery_point_when_semantic_gate_fails(
 
         assert result["status"] == "failed"
         assert "semantic gate failed" in str(result["error"])
-        active_count = db.conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE user_id = ? AND active = 1 AND source_event_ids != ?",
-            (user_id, '["__memex__"]'),
-        ).fetchone()[0]
-        assert active_count == 6
-        latest_cycle = db.conn.execute(
-            "SELECT id, status, memex_updated FROM cycle_records WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
+        restored_rows = db.conn.execute(
+            "SELECT id, content FROM memories WHERE user_id = ? ORDER BY id",
             (user_id,),
-        ).fetchone()
-        assert latest_cycle["status"] == "failed"
-        assert latest_cycle["memex_updated"] == 0
-        trace = db.conn.execute(
-            "SELECT status, error, extras FROM rollout_traces WHERE user_id = ? AND kind = 'synthesis'",
-            (user_id,),
-        ).fetchone()
-        assert trace["status"] == "failed"
-        assert "semantic gate failed" in trace["error"]
-        extras = json.loads(trace["extras"])
-        assert extras["recovery_restored"] is True
-        assert extras["reason"] == "semantic_gate_failed"
-    finally:
-        db.close()
-
-
-def test_pi_synthesize_marks_stale_running_cycles_incomplete(
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    db = SykeDB(tmp_path / "syke.db")
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", tmp_path / "MEMEX.md")
-    update_memex(db, user_id, "canonical memex")
-    stale_cycle = db.insert_cycle_record(
-        user_id,
-        model="pi",
-        started_at_override="2026-05-29T00:00:00+00:00",
-    )
-    recent_cycle = db.insert_cycle_record(
-        user_id,
-        model="pi",
-        started_at_override="2026-05-29T09:30:00+00:00",
-    )
-    monkeypatch.setattr(
-        pi_synthesis,
-        "_validate_cycle_output",
-        lambda: {"valid": True, "issues": [], "stats": {}},
-    )
-    _install_success_runtime(monkeypatch, lambda *args, **kwargs: _pi_success_result())
-
-    try:
-        result = pi_synthesis.pi_synthesize(
-            db,
-            user_id,
-            workspace_root=tmp_path,
-            now_override=datetime.fromisoformat("2026-05-29T10:00:00+00:00"),
-        )
-
-        assert result["status"] == "completed"
-        rows = {
-            row["id"]: row
-            for row in db.conn.execute(
-                "SELECT id, status, completed_at FROM cycle_records"
-            ).fetchall()
-        }
-        assert rows[stale_cycle]["status"] == "incomplete"
-        assert rows[stale_cycle]["completed_at"] == "2026-05-29T10:00:00+00:00"
-        assert rows[recent_cycle]["status"] == "running"
-    finally:
-        db.close()
-
-
-def test_pi_synthesize_allows_small_replacement_revision(
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    db = SykeDB(tmp_path / "syke.db")
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", tmp_path / "MEMEX.md")
-    update_memex(db, user_id, "canonical memex")
-    for index in range(5):
-        db.insert_memory(
-            Memory(
-                id=f"mem-revise-{index}",
-                user_id=user_id,
-                content=f"Durable memory {index}",
-            )
-        )
-    monkeypatch.setattr(
-        pi_synthesis,
-        "_validate_cycle_output",
-        lambda: {"valid": True, "issues": [], "stats": {}},
-    )
-
-    def _prompt(*args, **kwargs) -> SimpleNamespace:
-        db.insert_memory(
-            Memory(
-                id="mem-revise-new",
-                user_id=user_id,
-                content="Replacement memory",
-            )
-        )
-        db.conn.execute(
-            "UPDATE memories SET active = 0, superseded_by = ? WHERE id = ?",
-            ("mem-revise-new", "mem-revise-0"),
-        )
-        db.conn.commit()
-        return _pi_success_result("revised one memory")
-
-    _install_success_runtime(monkeypatch, _prompt)
-
-    try:
-        result = pi_synthesis.pi_synthesize(db, user_id, workspace_root=tmp_path)
-
-        assert result["status"] == "completed"
-        old = _memory_row(db, user_id, "mem-revise-0")
-        new = _memory_row(db, user_id, "mem-revise-new")
-        assert old["active"] == 0
-        assert old["superseded_by"] == "mem-revise-new"
-        assert new["active"] == 1
-        latest_cycle = db.conn.execute(
-            "SELECT status FROM cycle_records WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        assert latest_cycle["status"] == "completed"
-    finally:
-        db.close()
-
-
-def test_pi_synthesize_preserves_direct_active_memory_update(
-    user_id: str,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    db = SykeDB(tmp_path / "syke.db")
-    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", tmp_path / "MEMEX.md")
-    update_memex(db, user_id, "canonical memex")
-    db.insert_memory(
-        Memory(
-            id="mem-direct-update",
-            user_id=user_id,
-            content="Original durable memory",
-        )
-    )
-    monkeypatch.setattr(
-        pi_synthesis,
-        "_validate_cycle_output",
-        lambda: {"valid": True, "issues": [], "stats": {}},
-    )
-
-    def _prompt(*args, **kwargs) -> SimpleNamespace:
-        db.conn.execute(
-            "UPDATE memories SET content = ? WHERE user_id = ? AND id = ?",
-            ("Updated durable memory", user_id, "mem-direct-update"),
-        )
-        db.conn.commit()
-        return _pi_success_result("updated active memory")
-
-    _install_success_runtime(monkeypatch, _prompt)
-
-    try:
-        result = pi_synthesis.pi_synthesize(db, user_id, workspace_root=tmp_path)
-
-        assert result["status"] == "completed"
-        old = _memory_row(db, user_id, "mem-direct-update")
-        assert old is not None
-        assert old["content"] == "Original durable memory"
-        assert old["active"] == 0
-        successor = _memory_row(db, user_id, old["superseded_by"])
-        assert successor is not None
-        assert successor["content"] == "Updated durable memory"
-        assert successor["active"] == 1
-        latest_cycle = db.conn.execute(
-            "SELECT status FROM cycle_records WHERE user_id = ? ORDER BY rowid DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        assert latest_cycle["status"] == "completed"
+        ).fetchall()
+        assert [row["content"] for row in restored_rows] == [
+            f"Durable memory {index}" for index in range(6)
+        ]
+        receipt = _latest_receipt()
+        assert receipt["status"] == "failed"
+        assert receipt["memex_updated"] is False
+        assert result["recovery"]["restored"] is True
+        assert result["acceptance"]["repair_prompts"] == 3
+        assert result["acceptance"]["accepted_attempt"] is None
+        assert len(result["acceptance"]["rejections"]) == 4
+        assert len(prompts) == 4
+        assert prompts[0][1]["new_session"] is True
+        assert all(prompt_kwargs["new_session"] is False for _, prompt_kwargs in prompts[1:])
     finally:
         db.close()
 
@@ -1472,12 +646,11 @@ def test_pi_synthesize_repairs_malformed_search_index_during_cycle(
     monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", tmp_path / "MEMEX.md")
     monkeypatch.setattr(pi_synthesis, "SYKE_DB", db_path)
     update_memex(db, user_id, "canonical memex")
-    db.insert_memory(
-        Memory(
-            id="mem-search-cache",
-            user_id=user_id,
-            content="Searchable quantum memory",
-        )
+    _insert_memory(
+        db,
+        "mem-search-cache",
+        user_id,
+        "Searchable quantum memory",
     )
 
     def _prompt(*args, **kwargs) -> SimpleNamespace:
@@ -1498,10 +671,75 @@ def test_pi_synthesize_repairs_malformed_search_index_during_cycle(
                FROM memories_fts fts
                JOIN memories m ON m.id = fts.memory_id
                WHERE memories_fts MATCH ?
-                 AND m.user_id = ?
-                 AND m.active = 1""",
+                 AND m.user_id = ?""",
             ("quantum", user_id),
         ).fetchall()
         assert [row["memory_id"] for row in rows] == ["mem-search-cache"]
     finally:
         db.close()
+
+
+def test_pi_synthesize_repair_deadline_is_wall_clock(
+    user_id: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The cycle deadline must be wall time, not sleep-frozen monotonic time.
+
+    After a system sleep the monotonic clock barely advanced, so the old
+    monotonic deadline let repair prompts continue long past the intended
+    budget. Here the wall clock jumps past the deadline between attempts;
+    the cycle must refuse the next repair prompt instead of continuing.
+    """
+    db = SykeDB(tmp_path / "syke.db")
+    monkeypatch.setattr(pi_synthesis, "MEMEX_PATH", tmp_path / "MEMEX.md")
+    update_memex(db, user_id, "canonical memex")
+    _insert_memory(db, "mem-wallclock", user_id, "must remain current")
+
+    prompts: list[tuple[str, dict[str, object]]] = []
+
+    def _prompt(prompt: str, **kwargs) -> SimpleNamespace:
+        prompts.append((prompt, kwargs))
+        if len(prompts) == 1:
+            # Sabotage the DB so acceptance rejects attempt 1 and forces a
+            # repair-path evaluation of the deadline.
+            db.conn.execute("DROP TRIGGER protect_memories_stable_fields")
+            db.conn.execute(
+                "UPDATE memories SET content = 'unaccepted revision' WHERE id = 'mem-wallclock'"
+            )
+            db.conn.commit()
+            # Simulate a wake: wall clock jumps past the cycle deadline
+            # while the monotonic clock barely moved (sleep).
+            state["now"] += 1_000.0
+            return _pi_success_result("unaccepted answer")
+        return _pi_success_result("should never be reached")
+
+    _install_success_runtime(monkeypatch, _prompt)
+
+    real_time = time.time
+    real_monotonic = time.monotonic
+    state = {"now": real_time()}
+
+    def fake_time() -> float:
+        return state["now"]
+
+    monkeypatch.setattr(
+        pi_synthesis,
+        "time",
+        SimpleNamespace(time=fake_time, monotonic=real_monotonic),
+    )
+
+    try:
+        result = pi_synthesis.pi_synthesize(
+            db,
+            user_id,
+            workspace_root=tmp_path,
+            timeout_override=300.0,
+        )
+    finally:
+        state["now"] = real_time()
+
+    assert result["status"] == "failed"
+    assert "deadline expired" in str(result.get("error"))
+    # Only the first attempt ran; the expired wall deadline blocked repair.
+    assert len(prompts) == 1

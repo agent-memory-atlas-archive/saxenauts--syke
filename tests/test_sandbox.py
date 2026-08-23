@@ -3,199 +3,296 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+from syke.runtime.child_env import (
+    build_child_process_env,
+    darwin_user_temp_dir,
+    temp_paths_from_env,
+)
 from syke.runtime.sandbox import (
-    _harness_read_paths,
     _parent_listing_paths,
     _path_aliases,
     generate_seatbelt_profile,
     sandbox_available,
-    wrap_command,
+    sandbox_enabled,
+    sandbox_read_paths,
     write_sandbox_profile,
 )
 
 
-def test_profile_starts_with_deny_default(tmp_path: Path) -> None:
-    profile = generate_seatbelt_profile(tmp_path)
-    lines = profile.split("\n")
-    assert "(deny default)" in lines
-    assert "(deny file-read*)" in lines
+def _workspace(tmp_path: Path) -> Path:
+    return tmp_path / "workspace"
 
 
-def test_profile_contains_workspace_write(tmp_path: Path) -> None:
-    profile = generate_seatbelt_profile(tmp_path)
-    assert f'(allow file-write* (subpath "{tmp_path}"))' in profile
+def _sandboxed(cmd: list[str], profile_path: Path) -> list[str]:
+    return ["/usr/bin/sandbox-exec", "-f", str(profile_path), *cmd]
 
 
-def test_profile_contains_workspace_read(tmp_path: Path) -> None:
-    profile = generate_seatbelt_profile(tmp_path)
-    assert f'(allow file-read* (subpath "{tmp_path}"))' in profile
-    assert f'(allow file-map-executable (subpath "{tmp_path}"))' in profile
+def test_profile_declares_the_current_authority_boundary(monkeypatch, tmp_path: Path) -> None:
+    from syke.runtime import sandbox as sandbox_module
 
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    control = tmp_path / "control"
+    runtime = control / "runtime"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("SYKE_SANDBOX_HARNESS_PATHS", raising=False)
 
-def test_profile_contains_system_paths(tmp_path: Path) -> None:
-    profile = generate_seatbelt_profile(tmp_path)
+    profile = generate_seatbelt_profile(
+        workspace,
+        control_root=control,
+        runtime_root=runtime,
+    )
+
+    assert "(deny default)" in profile
+    assert "(deny file-read*)" in profile
+    assert "(allow network-outbound)" in profile
+    assert "(allow system-socket)" in profile
     assert '(allow file-read* (subpath "/usr"))' in profile
-    assert '(allow file-map-executable (subpath "/usr"))' in profile
-    assert '(allow file-read* (subpath "/bin"))' in profile
-    assert '(allow file-read* (subpath "/etc"))' in profile
+    assert f'(allow file-read* (subpath "{workspace.resolve()}"))' in profile
+    assert f'(allow file-write* (subpath "{workspace.resolve()}"))' in profile
+    assert f'(allow file-read* (subpath "{home.resolve()}"))' in profile
+    assert f'(allow file-write* (subpath "{home.resolve()}"))' not in profile
+
+    core = Path(sandbox_module.__file__).resolve().parents[1]
+    assert f'(allow file-read* (subpath "{core}"))' in profile
+    assert f'(allow file-write* (subpath "{core}"))' not in profile
+    assert f'(allow file-read* (subpath "{control.resolve()}"))' in profile
+    assert f'(allow file-write* (subpath "{runtime.resolve()}"))' in profile
+    for name in ("sessions", "receipts", "records", "recovery"):
+        assert f'(deny file-write* (subpath "{control.resolve() / name}"))' in profile
+    assert "signals" not in profile
+    assert "Legacy runtime pointer" not in profile
 
 
-def test_profile_contains_harness_paths(tmp_path: Path) -> None:
-    """Harness paths from catalog appear as subpath read allows."""
-    profile = generate_seatbelt_profile(tmp_path)
-    harness_paths = _harness_read_paths()
-    for p in harness_paths:
-        assert f'(allow file-read* (subpath "{p}"))' in profile
+def test_sandbox_read_paths_default_to_home(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("SYKE_SANDBOX_HARNESS_PATHS", raising=False)
+
+    assert sandbox_read_paths() == (str(home.resolve()),)
 
 
-def test_profile_respects_selected_sources_filter(tmp_path: Path) -> None:
-    all_paths = _harness_read_paths()
-    selected_paths = _harness_read_paths(selected_sources=("codex",))
-    selected_set = set(selected_paths)
-    skipped_paths = [path for path in all_paths if path not in selected_set]
-
-    assert selected_paths
-    assert skipped_paths
-
-    profile = generate_seatbelt_profile(tmp_path, selected_sources=("codex",))
-    for path in selected_paths:
-        assert f'(allow file-read* (subpath "{path}"))' in profile
-    for path in skipped_paths:
-        assert f'(allow file-read* (subpath "{path}"))' not in profile
-
-
-def test_harness_paths_can_be_overridden(monkeypatch) -> None:
+def test_sandbox_read_paths_can_be_overridden(monkeypatch) -> None:
     monkeypatch.setenv(
         "SYKE_SANDBOX_HARNESS_PATHS",
         os.pathsep.join(["/tmp/frozen-slice", "/tmp/frozen-slice-2"]),
     )
-    resolved = _harness_read_paths()
+    resolved = sandbox_read_paths()
     assert len(resolved) == 2
     assert resolved[0].endswith("/tmp/frozen-slice")
     assert resolved[1].endswith("/tmp/frozen-slice-2")
 
 
-def test_profile_scopes_pi_agent_dir(monkeypatch, tmp_path: Path) -> None:
-    agent_dir = (tmp_path / "pi-agent").resolve()
-    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(agent_dir))
+@pytest.mark.platform
+def test_profile_enforces_home_read_only_and_syke_write_boundary(
+    monkeypatch, tmp_path: Path
+) -> None:
+    if not sandbox_available():
+        pytest.fail("macOS sandbox-exec is unavailable")
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    source_file = home / "notes.txt"
+    source_file.write_text("remember this\n", encoding="utf-8")
+    dot_dir = home / ".private"
+    dot_dir.mkdir()
+    dot_file = dot_dir / "note.txt"
+    dot_file.write_text("also readable\n", encoding="utf-8")
+    ssh_config = home / ".ssh" / "config"
+    ssh_config.parent.mkdir()
+    ssh_config.write_text("ordinary config\n", encoding="utf-8")
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir()
+    codex_config.write_text("model = 'configured'\n", encoding="utf-8")
+    pi_auth = home / ".syke" / "pi-agent" / "auth.json"
+    pi_auth.parent.mkdir(parents=True)
+    pi_auth.write_text("placeholder credential\n", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    control = tmp_path / "control"
+    workspace.mkdir()
+    protected_file = control / "receipts" / "cycle.json"
+    protected_file.parent.mkdir(parents=True)
+    protected_file.write_text('{"status":"completed"}\n', encoding="utf-8")
+    runtime = control / "runtime"
+    runtime.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("SYKE_SANDBOX_HARNESS_PATHS", raising=False)
+    monkeypatch.setenv("SYKE_CONTROL_ROOT", str(control))
 
-    profile = generate_seatbelt_profile(tmp_path)
+    profile_path = write_sandbox_profile(workspace)
+    assert profile_path is not None
+    try:
+        read_result = subprocess.run(
+            _sandboxed(
+                [
+                    "/bin/cat",
+                    str(source_file),
+                    str(dot_file),
+                    str(ssh_config),
+                    str(codex_config),
+                    str(pi_auth),
+                ],
+                profile_path,
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        workspace_result = subprocess.run(
+            _sandboxed(["/usr/bin/touch", str(workspace / "allowed")], profile_path),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        runtime_result = subprocess.run(
+            _sandboxed(["/usr/bin/touch", str(runtime / "allowed")], profile_path),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        control_result = subprocess.run(
+            _sandboxed(["/usr/bin/touch", str(control / "blocked")], profile_path),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        protected_write_result = subprocess.run(
+            _sandboxed(
+                ["/bin/sh", "-c", 'printf changed >> "$1"', "sh", str(protected_file)],
+                profile_path,
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        create_result = subprocess.run(
+            _sandboxed(["/usr/bin/touch", str(home / "blocked")], profile_path),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        edit_result = subprocess.run(
+            _sandboxed(
+                ["/bin/sh", "-c", 'printf changed >> "$1"', "sh", str(source_file)],
+                profile_path,
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        rename_result = subprocess.run(
+            _sandboxed(["/bin/mv", str(dot_file), str(dot_dir / "renamed.txt")], profile_path),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        delete_result = subprocess.run(
+            _sandboxed(["/bin/rm", str(source_file)], profile_path),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        profile_path.unlink(missing_ok=True)
 
-    assert f'(allow file-read* (subpath "{agent_dir}"))' in profile
-    assert f'(allow file-map-executable (subpath "{agent_dir}"))' in profile
-    assert f'(allow file-write* (subpath "{agent_dir}"))' in profile
+    assert read_result.returncode == 0
+    assert read_result.stdout == (
+        "remember this\nalso readable\nordinary config\nmodel = 'configured'\n"
+        "placeholder credential\n"
+    )
+    assert workspace_result.returncode == 0
+    assert (workspace / "allowed").exists()
+    assert runtime_result.returncode == 0
+    assert (runtime / "allowed").exists()
+    assert control_result.returncode != 0
+    assert not (control / "blocked").exists()
+    assert protected_write_result.returncode != 0
+    assert protected_file.read_text(encoding="utf-8") == '{"status":"completed"}\n'
+    assert create_result.returncode != 0
+    assert edit_result.returncode != 0
+    assert rename_result.returncode != 0
+    assert delete_result.returncode != 0
+    assert not (home / "blocked").exists()
+    assert source_file.read_text(encoding="utf-8") == "remember this\n"
+    assert dot_file.read_text(encoding="utf-8") == "also readable\n"
+    assert not (dot_dir / "renamed.txt").exists()
 
-    syke_home = str((Path.home() / ".syke").resolve())
-    assert f'(allow file-read* (subpath "{syke_home}"))' not in profile
-    assert f'(allow file-write* (subpath "{syke_home}"))' not in profile
 
+def test_parent_listing_uses_literal_ancestors_and_macos_aliases(tmp_path: Path) -> None:
+    paths = _parent_listing_paths(["/Users/test/.claude/projects", "/private/tmp/syke/bin"])
+    assert {"/", "/Users", "/Users/test", "/Users/test/.claude"} <= set(paths)
+    assert {"/tmp", "/tmp/syke"} <= set(paths)
+    assert "/tmp/syke/bin" in _path_aliases("/private/tmp/syke/bin")
 
-def test_profile_denies_ssh(tmp_path: Path) -> None:
-    profile = generate_seatbelt_profile(tmp_path)
-    for line in profile.split("\n"):
-        if ".ssh" in line:
-            assert "(deny" in line, f".ssh appears in non-deny rule: {line}"
-
-
-def test_profile_denies_gnupg(tmp_path: Path) -> None:
-    profile = generate_seatbelt_profile(tmp_path)
-    for line in profile.split("\n"):
-        if ".gnupg" in line:
-            assert "(deny" in line, f".gnupg appears in non-deny rule: {line}"
-
-
-def test_parent_listing_paths_are_literal(tmp_path: Path) -> None:
-    profile = generate_seatbelt_profile(tmp_path)
-    # Parent directory traversal should use literal, not subpath
-    lines = [
-        line_text
-        for line_text in profile.split("\n")
-        if "Parent directory traversal" in line_text or "(literal" in line_text
+    profile = generate_seatbelt_profile(_workspace(tmp_path))
+    parent_rules = [
+        line for line in profile.splitlines() if line.startswith("(allow") and "literal" in line
     ]
-    for line in lines:
-        if "(literal" in line:
-            assert "file-read*" in line
-            assert "subpath" not in line
+    assert parent_rules
+    assert all("file-read*" in line and "subpath" not in line for line in parent_rules)
 
 
-def test_parent_listing_covers_ancestors() -> None:
-    paths = _parent_listing_paths(["/Users/test/.claude/projects"])
-    assert "/" in paths
-    assert "/Users" in paths
-    assert "/Users/test" in paths
-    assert "/Users/test/.claude" in paths
+def test_redirected_caller_tmpdir_cannot_strand_child_runtime_temp(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#46 regression: a caller with a redirected $TMPDIR must never yield a
+    profile whose temp allow-list excludes the temp dir the child will use.
 
+    Mirrors the PiRuntime.start wiring: the child env comes from
+    build_child_process_env and the profile gets that env's temp paths as
+    extra_temp_dirs.
+    """
+    redirected = tmp_path / "harness-tmp"
+    redirected.mkdir()
+    monkeypatch.setenv("TMPDIR", str(redirected))
+    monkeypatch.delenv("TMP", raising=False)
+    monkeypatch.delenv("TEMP", raising=False)
+    monkeypatch.delenv("SYKE_PI_TMPDIR", raising=False)
 
-def test_private_tmp_paths_get_public_aliases() -> None:
-    assert "/tmp/syke/.syke/bin" in _path_aliases("/private/tmp/syke/.syke/bin")
-    parents = _parent_listing_paths(["/private/tmp/syke/.syke/bin"])
-    assert "/tmp" in parents
-    assert "/tmp/syke" in parents
+    env = build_child_process_env({}, provider=None)
+    profile = generate_seatbelt_profile(
+        _workspace(tmp_path),
+        extra_temp_dirs=temp_paths_from_env(env),
+    )
 
-
-def test_profile_includes_extra_child_temp_dir(tmp_path: Path) -> None:
-    child_tmp = tmp_path / "child-tmp"
-    child_tmp.mkdir()
-
-    profile = generate_seatbelt_profile(tmp_path, extra_temp_dirs=(str(child_tmp),))
-
+    child_tmp = env["TMPDIR"]
     assert f'(allow file-read* (subpath "{child_tmp}"))' in profile
-    assert f'(allow file-write* (subpath "{child_tmp}"))' in profile
+    assert f'(allow file-write* (subpath "{child_tmp}"))' not in profile
+
+    if sys.platform == "darwin":
+        darwin_temp = darwin_user_temp_dir()
+        if darwin_temp:
+            # The child is steered to the macOS per-user temp, not the
+            # caller's redirected dir, and the profile allows it.
+            assert child_tmp == darwin_temp
 
 
 def test_unique_temp_file_per_call(tmp_path: Path) -> None:
     if not sandbox_available():
         return
-    p1 = write_sandbox_profile(tmp_path)
-    p2 = write_sandbox_profile(tmp_path)
+    p1 = write_sandbox_profile(_workspace(tmp_path))
+    p2 = write_sandbox_profile(_workspace(tmp_path))
     assert p1 is not None and p2 is not None
     assert p1 != p2  # Different files — no race
     p1.unlink(missing_ok=True)
     p2.unlink(missing_ok=True)
 
 
-def test_sandbox_available_returns_bool() -> None:
-    result = sandbox_available()
-    assert isinstance(result, bool)
-
-
-def test_sandbox_unavailable_on_non_darwin() -> None:
+def test_sandbox_activation_requires_macos_availability_and_no_override(monkeypatch) -> None:
     with patch.object(sys, "platform", "linux"):
         assert sandbox_available() is False
 
+    monkeypatch.setattr("syke.runtime.sandbox.sandbox_available", lambda: True)
+    monkeypatch.delenv("SYKE_DISABLE_SANDBOX", raising=False)
+    assert sandbox_enabled() is True
 
-def test_wrap_command_prepends_sandbox_exec() -> None:
-    cmd = ["/usr/bin/node", "agent.js"]
-    wrapped = wrap_command(cmd, Path("/tmp/test.sb"))
-    assert wrapped[0] == "/usr/bin/sandbox-exec"
-    assert wrapped[1] == "-f"
-    assert wrapped[2] == "/tmp/test.sb"
-    assert wrapped[3:] == cmd
-
-
-def test_network_allows_outbound(tmp_path: Path) -> None:
-    """Network outbound must be allowed (API calls)."""
-    profile = generate_seatbelt_profile(tmp_path)
-    assert "(allow network-outbound)" in profile
-
-
-def test_network_allows_system_socket(tmp_path: Path) -> None:
-    profile = generate_seatbelt_profile(tmp_path)
-    assert "(allow system-socket)" in profile
-
-
-def test_sensitive_dirs_explicitly_denied(tmp_path: Path) -> None:
-    """Sensitive dirs have explicit deny rules even though deny-default covers them."""
-    from syke.runtime.sandbox import _SENSITIVE_DIRS
-
-    profile = generate_seatbelt_profile(tmp_path)
-    for d in _SENSITIVE_DIRS:
-        assert f"/.{d.lstrip('.')}" in profile or f"/{d}" in profile, f"Missing deny for {d}"
-        # Must be a deny, not an allow
-        for line in profile.split("\n"):
-            if d in line:
-                assert "(deny" in line, f"Sensitive dir {d} appears in a non-deny rule: {line}"
+    monkeypatch.setenv("SYKE_DISABLE_SANDBOX", "1")
+    assert sandbox_enabled() is False

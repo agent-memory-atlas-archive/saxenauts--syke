@@ -1,52 +1,111 @@
-"""Recovery points and deterministic gates for the single Syke DB."""
+"""Recovery points and deterministic gates for the mutable graph database."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, field
+from contextlib import closing
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO, cast
 
-from uuid_extensions import uuid7
+from syke.config import user_control_dir, user_data_dir
+from syke.control import (
+    FINAL_RECEIPT_STATUSES,
+    _fsync_directory,
+    _safe_id,
+    _write_json_once,
+    get_receipt,
+    write_receipt,
+)
+from syke.db import GRAPH_IDENTITY_TABLES, SCHEMA_VERSION, _validate_current_schema
+from syke.db_access import (
+    DatabaseLease,
+    DatabaseLeaseUnavailable,
+    acquire_database_lease,
+    database_lock_path,
+    maintenance_marker_path,
+)
+from syke.memory.learned import (
+    apply_learned_memory_snapshot_to_connection,
+    get_learned_memory,
+    get_valid_learned_memory_from_path,
+    measure_learned_projection,
+)
+from syke.memory.memex_budget import format_memex_projection, measure_memex, strip_memex_header
 
-from syke.config import user_data_dir
+logger = logging.getLogger(__name__)
 
-MEMEX_MARKER_SQL = '["__memex__"]'
-REQUIRED_TABLES = {"memories", "links", "cycle_records", "rollout_traces"}
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows platforms
+    msvcrt = None
+
+REQUIRED_TABLES = {
+    *GRAPH_IDENTITY_TABLES,
+    "memories_fts",
+    "syke_identity",
+}
 MAX_FULL_COPY_FALLBACK_BYTES = 64 * 1024 * 1024
+RECOVERY_IN_PROGRESS_FILENAME = "synthesis-in-progress.json"
+RECOVERY_ARTIFACT_SUFFIXES = (
+    ".json",
+    ".sqlite",
+    ".sqlite-wal",
+    ".sqlite-shm",
+    ".sqlite.tmp",
+    ".db",
+    ".db-wal",
+    ".db-shm",
+    ".db.tmp",
+)
 
 
 @dataclass
 class MemoryFingerprint:
     id: str
-    content: str
     content_hash: str
-    source_event_ids: str
-    active: int
-    superseded_by: str | None
+    created_at: str
+    updated_at: str | None
+
+
+@dataclass
+class LinkFingerprint:
+    id: str
+    source_id: str
+    target_id: str
+    reason_hash: str
+    created_at: str
+
+
+@dataclass
+class MemexFingerprint:
+    id: str
+    content_hash: str
+    created_at: str
     updated_at: str | None
 
 
 @dataclass
 class StateBaseline:
     user_id: str
+    identity_user_id: str | None
     captured_at: str
-    active_non_memex_count: int
-    memories_total: int
-    links_total: int
-    active_memories: dict[str, MemoryFingerprint] = field(default_factory=dict)
-    memex_memories: dict[str, MemoryFingerprint] = field(default_factory=dict)
-    memex_id: str | None = None
-    memex_hash: str | None = None
-    memex_count: int = 0
-    table_counts: dict[str, int] = field(default_factory=dict)
+    memories: dict[str, MemoryFingerprint]
+    links: dict[str, LinkFingerprint]
+    current_memex: MemexFingerprint | None
 
 
 @dataclass
@@ -62,6 +121,77 @@ class RecoveryPoint:
     size_bytes: int
 
 
+@dataclass(frozen=True)
+class RecoveryInProgress:
+    cycle_id: str
+    recovery_point_id: str
+    started_at: str
+
+
+class SynthesisLockUnavailable(RuntimeError):
+    """Raised when another synthesis cycle owns the cross-process lock."""
+
+
+def synthesis_lock_path(user_id: str) -> Path:
+    return user_data_dir(user_id) / "synthesis.lock"
+
+
+def acquire_synthesis_lock(
+    user_id: str,
+    *,
+    blocking: bool = False,
+) -> tuple[TextIO, Path]:
+    """Acquire the per-user synthesis lock shared by recovery and execution."""
+    lock_path = synthesis_lock_path(user_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            try:
+                flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+                fcntl.flock(handle.fileno(), flags)
+            except BlockingIOError as exc:
+                raise SynthesisLockUnavailable(str(lock_path)) from exc
+        elif msvcrt is not None:  # pragma: no cover - Windows fallback
+            try:
+                windows_lock = cast(Any, msvcrt)
+                if lock_path.stat().st_size == 0:
+                    handle.write("0")
+                    handle.flush()
+                handle.seek(0)
+                mode = windows_lock.LK_LOCK if blocking else windows_lock.LK_NBLCK
+                windows_lock.locking(handle.fileno(), mode, 1)
+            except OSError as exc:
+                raise SynthesisLockUnavailable(str(lock_path)) from exc
+        else:  # pragma: no cover - unsupported platform
+            logger.warning(
+                "No synthesis lock backend available; recovery cannot distinguish live cycles"
+            )
+            return handle, lock_path
+
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\t{datetime.now(UTC).isoformat()}\n")
+        handle.flush()
+        return handle, lock_path
+    except Exception:
+        handle.close()
+        raise
+
+
+def release_synthesis_lock(handle: TextIO) -> None:
+    """Release a lock returned by :func:`acquire_synthesis_lock`."""
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        elif msvcrt is not None:  # pragma: no cover - Windows fallback
+            windows_lock = cast(Any, msvcrt)
+            handle.seek(0)
+            windows_lock.locking(handle.fileno(), windows_lock.LK_UNLCK, 1)
+    finally:
+        handle.close()
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
@@ -74,118 +204,88 @@ def _hash_text(value: Any) -> str:
     return hashlib.sha256(_text(value).encode("utf-8")).hexdigest()
 
 
-def _strip_memex_header(content: str) -> str:
-    lines = content.split("\n")
-    if lines and lines[0].startswith("# MEMEX ["):
-        return "\n".join(lines[1:]).lstrip("\n")
-    return content
-
-
-def _recovery_dir(user_id: str) -> Path:
-    path = user_data_dir(user_id) / "recovery"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def capture_baseline(db: Any, user_id: str) -> StateBaseline:
-    """Capture the pre-agent semantic shape used by the post-cycle gate."""
+def _capture_memories(db: Any, user_id: str) -> dict[str, MemoryFingerprint]:
     rows = db.conn.execute(
-        """SELECT id, content, source_event_ids, active, superseded_by, updated_at
+        """SELECT id, content, created_at, updated_at
            FROM memories
            WHERE user_id = ?
-             AND active = 1
-             AND (source_event_ids IS NULL OR source_event_ids != ?)""",
-        (user_id, MEMEX_MARKER_SQL),
+           ORDER BY id""",
+        (user_id,),
     ).fetchall()
-    active = {
+    return {
         str(row["id"]): MemoryFingerprint(
             id=str(row["id"]),
-            content=_text(row["content"]),
             content_hash=_hash_text(row["content"]),
-            source_event_ids=_text(row["source_event_ids"]) or "[]",
-            active=int(row["active"] or 0),
-            superseded_by=_text(row["superseded_by"]) or None,
+            created_at=_text(row["created_at"]),
             updated_at=_text(row["updated_at"]) or None,
         )
         for row in rows
     }
 
-    active_memex_rows = db.conn.execute(
-        """SELECT id, content
-           FROM memories
-           WHERE user_id = ? AND active = 1 AND source_event_ids = ?
-           ORDER BY datetime(created_at) DESC, id DESC""",
-        (user_id, MEMEX_MARKER_SQL),
-    ).fetchall()
-    memex_content = (
-        _strip_memex_header(_text(active_memex_rows[0]["content"])) if active_memex_rows else ""
-    )
 
-    memex_rows = db.conn.execute(
-        """SELECT id, content, active, superseded_by, updated_at
-           FROM memories
-           WHERE user_id = ? AND source_event_ids = ?
-           ORDER BY datetime(created_at) DESC, id DESC""",
-        (user_id, MEMEX_MARKER_SQL),
+def _capture_links(db: Any, user_id: str) -> dict[str, LinkFingerprint]:
+    rows = db.conn.execute(
+        """SELECT link.id, link.source_id, link.target_id, link.reason, link.created_at
+           FROM links AS link
+           WHERE link.user_id = ?
+           ORDER BY link.id""",
+        (user_id,),
     ).fetchall()
-    memex_memories = {
-        str(row["id"]): MemoryFingerprint(
+    return {
+        str(row["id"]): LinkFingerprint(
             id=str(row["id"]),
-            content=_strip_memex_header(_text(row["content"])),
-            content_hash=_hash_text(_strip_memex_header(_text(row["content"]))),
-            source_event_ids=MEMEX_MARKER_SQL,
-            active=int(row["active"] or 0),
-            superseded_by=_text(row["superseded_by"]) or None,
-            updated_at=_text(row["updated_at"]) or None,
+            source_id=str(row["source_id"]),
+            target_id=str(row["target_id"]),
+            reason_hash=_hash_text(row["reason"]),
+            created_at=_text(row["created_at"]),
         )
-        for row in memex_rows
+        for row in rows
     }
 
-    table_counts: dict[str, int] = {}
-    for table in ("memories", "links", "cycle_records", "rollout_traces"):
-        table_counts[table] = int(db.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+def _recovery_dir(user_id: str) -> Path:
+    path = user_control_dir(user_id) / "recovery"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def capture_baseline(db: Any, user_id: str) -> StateBaseline:
+    """Capture the transient pre-agent shape used by the post-cycle gate."""
+    _validate_current_schema(db.conn)
+    identity_row = db.conn.execute(
+        "SELECT user_id FROM syke_identity WHERE singleton = 1"
+    ).fetchone()
+    if identity_row is None:
+        raise ValueError("Current graph must be bound to one Syke identity before synthesis")
+    if str(identity_row["user_id"]) != user_id:
+        raise ValueError(
+            f"Current graph identity {identity_row['user_id']!r} does not match {user_id!r}"
+        )
+    memex_row = db.conn.execute(
+        """SELECT id, content, created_at, updated_at
+           FROM current_memex
+           WHERE singleton = 1 AND user_id = ?""",
+        (user_id,),
+    ).fetchone()
+    current_memex = (
+        MemexFingerprint(
+            id=str(memex_row["id"]),
+            content_hash=_hash_text(strip_memex_header(_text(memex_row["content"]))),
+            created_at=_text(memex_row["created_at"]),
+            updated_at=_text(memex_row["updated_at"]) or None,
+        )
+        if memex_row is not None
+        else None
+    )
 
     return StateBaseline(
         user_id=user_id,
+        identity_user_id=str(identity_row["user_id"]),
         captured_at=datetime.now(UTC).isoformat(),
-        active_non_memex_count=len(active),
-        memories_total=table_counts["memories"],
-        links_total=table_counts["links"],
-        active_memories=active,
-        memex_memories=memex_memories,
-        memex_id=str(active_memex_rows[0]["id"]) if active_memex_rows else None,
-        memex_hash=_hash_text(memex_content) if memex_content.strip() else None,
-        memex_count=len(active_memex_rows),
-        table_counts=table_counts,
+        memories=_capture_memories(db, user_id),
+        links=_capture_links(db, user_id),
+        current_memex=current_memex,
     )
-
-
-def _json_ready(value: Any) -> Any:
-    if isinstance(value, MemoryFingerprint):
-        data = asdict(value)
-        data["content"] = f"<redacted:{len(value.content)} chars>"
-        return _json_ready(data)
-    if isinstance(value, StateBaseline):
-        return {
-            "user_id": value.user_id,
-            "captured_at": value.captured_at,
-            "active_non_memex_count": value.active_non_memex_count,
-            "memories_total": value.memories_total,
-            "links_total": value.links_total,
-            "active_memories": _json_ready(value.active_memories),
-            "memex_memories": _json_ready(value.memex_memories),
-            "memex_id": value.memex_id,
-            "memex_hash": value.memex_hash,
-            "memex_count": value.memex_count,
-            "table_counts": _json_ready(value.table_counts),
-        }
-    if isinstance(value, dict):
-        return {key: _json_ready(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_json_ready(item) for item in value]
-    if hasattr(value, "__dataclass_fields__"):
-        return _json_ready(asdict(value))
-    return value
 
 
 def _unlink_if_exists(path: Path) -> None:
@@ -218,10 +318,10 @@ def _try_copy_on_write_clone(source: Path, destination: Path) -> bool:
             capture_output=True,
             text=True,
         )
+        if completed.returncode != 0 or not destination.exists():
+            _unlink_if_exists(destination)
+            return False
     except OSError:
-        _unlink_if_exists(destination)
-        return False
-    if completed.returncode != 0 or not destination.exists():
         _unlink_if_exists(destination)
         return False
     return True
@@ -229,12 +329,12 @@ def _try_copy_on_write_clone(source: Path, destination: Path) -> bool:
 
 def _sqlite_backup_copy(db: Any, destination: Path) -> None:
     _unlink_if_exists(destination)
-    with sqlite3.connect(str(destination)) as backup_conn:
+    with closing(sqlite3.connect(str(destination))) as backup_conn:
         db.conn.backup(backup_conn)
 
 
 def _sqlite_checks(path: Path) -> dict[str, str | None]:
-    with sqlite3.connect(str(path)) as conn:
+    with closing(sqlite3.connect(str(path))) as conn:
         return _connection_checks(conn)
 
 
@@ -250,7 +350,9 @@ def _connection_checks(conn: sqlite3.Connection) -> dict[str, str | None]:
 def is_search_index_integrity_issue(value: Any) -> bool:
     text = _text(value).lower()
     return "memories_fts" in text and (
-        "malformed inverted index" in text or "fts5: corruption found reading blob" in text
+        "malformed inverted index" in text
+        or "fts5: corruption found reading blob" in text
+        or "fts5: checksum mismatch" in text
     )
 
 
@@ -282,9 +384,26 @@ def _require_checks_ok(checks: dict[str, str | None], label: str) -> None:
         )
 
 
+def _search_index_matches_graph(db: Any) -> bool:
+    expected = [
+        (str(row["id"]), _text(row["content"]))
+        for row in db.conn.execute("SELECT id, content FROM memories ORDER BY id").fetchall()
+    ]
+    actual = [
+        (str(row["memory_id"]), _text(row["content"]))
+        for row in db.conn.execute(
+            "SELECT memory_id, content FROM memories_fts ORDER BY memory_id, rowid"
+        ).fetchall()
+    ]
+    return actual == expected
+
+
 def _repair_search_index_if_needed(db: Any) -> tuple[dict[str, str | None], bool, int]:
     checks = _connection_checks(db.conn)
-    if not _checks_are_search_index_only(checks):
+    search_corruption = _checks_are_search_index_only(checks)
+    if not _checks_ok(checks) and not search_corruption:
+        return checks, False, 0
+    if not search_corruption and _search_index_matches_graph(db):
         return checks, False, 0
 
     rebuilt_rows = _rebuild_search_index(db)
@@ -332,19 +451,24 @@ def create_recovery_point(
     *,
     run_id: str,
     cycle_id: str | None,
-    baseline: StateBaseline,
+    baseline: StateBaseline | None = None,
     max_full_copy_fallback_bytes: int = MAX_FULL_COPY_FALLBACK_BYTES,
 ) -> RecoveryPoint:
     """Create a cheap local recovery copy for the current cycle."""
+    run_id = _safe_id(run_id, label="recovery")
+    if cycle_id is not None:
+        cycle_id = _safe_id(cycle_id, label="cycle")
     db_path = Path(str(db.db_path)).expanduser().resolve()
     if str(db.db_path) == ":memory:":
         raise ValueError("Recovery points require a file-backed SQLite database")
     if not db_path.exists():
         raise FileNotFoundError(str(db_path))
 
-    source_checks, search_index_rebuilt, search_index_rebuilt_rows = _repair_search_index_if_needed(
-        db
-    )
+    # The semantic baseline stays in memory. The recovery manifest records only
+    # the operational facts required to verify and restore the copy.
+    del baseline
+    _validate_current_schema(db.conn)
+    source_checks, search_index_rebuilt, _ = _repair_search_index_if_needed(db)
     _require_checks_ok(source_checks, "Source database")
 
     created_at = datetime.now(UTC).isoformat()
@@ -362,6 +486,7 @@ def create_recovery_point(
         max_full_copy_fallback_bytes=max_full_copy_fallback_bytes,
     )
     os.replace(tmp_backup_path, backup_path)
+    _fsync_directory(recovery_dir)
     size_bytes = backup_path.stat().st_size
     backup_checks = _require_sqlite_ok(backup_path, "Recovery point")
 
@@ -378,30 +503,43 @@ def create_recovery_point(
     )
     manifest = {
         "recovery_point": asdict(point),
-        "baseline": _json_ready(baseline),
         "source_checks": source_checks,
         "backup_checks": backup_checks,
         "search_index_rebuilt": search_index_rebuilt,
-        "search_index_rebuilt_rows": search_index_rebuilt_rows,
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    _write_json_once(manifest_path, manifest)
     return point
 
 
-def rotate_recovery_points(user_id: str, *, keep: int = 8) -> None:
-    """Keep a small number of newest recovery point pairs."""
+def rotate_recovery_points(user_id: str, *, keep_id: str) -> None:
+    """Keep only the explicitly selected recovery bundle."""
     recovery_dir = _recovery_dir(user_id)
-    manifests = sorted(recovery_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for manifest in manifests[keep:]:
-        stem = manifest.stem
-        for candidate in (manifest, recovery_dir / f"{stem}.sqlite"):
-            try:
-                candidate.unlink()
-            except FileNotFoundError:
-                pass
+    keep_id = _safe_id(keep_id, label="recovery")
+
+    keep_paths = {
+        recovery_dir / f"{keep_id}.json",
+        recovery_dir / f"{keep_id}.sqlite",
+    }
+    missing = sorted(str(path) for path in keep_paths if not path.is_file())
+    if missing:
+        raise FileNotFoundError(
+            "Cannot retain a complete recovery bundle; missing: " + ", ".join(missing)
+        )
+
+    for candidate in recovery_dir.iterdir():
+        if candidate in keep_paths or not candidate.is_file():
+            continue
+        if candidate.name.endswith(RECOVERY_ARTIFACT_SUFFIXES):
+            candidate.unlink()
+    _fsync_directory(recovery_dir)
 
 
-def restore_recovery_point(point: RecoveryPoint) -> dict[str, Any]:
+def restore_recovery_point(
+    point: RecoveryPoint,
+    *,
+    exclusive_lease: DatabaseLease | None = None,
+    learned_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Restore the database file from a recovery point."""
     backup_path = Path(point.backup_path)
     db_path = Path(point.db_path)
@@ -412,16 +550,58 @@ def restore_recovery_point(point: RecoveryPoint) -> dict[str, Any]:
         raise ValueError("Recovery point size mismatch")
     backup_checks = _require_sqlite_ok(backup_path, "Recovery point")
 
-    tmp_path = db_path.with_name(f"{db_path.name}.restore-tmp")
-    _unlink_if_exists(tmp_path)
-    if not _try_copy_on_write_clone(backup_path, tmp_path):
-        shutil.copy2(backup_path, tmp_path)
-    for suffix in ("-wal", "-shm"):
-        _unlink_if_exists(Path(f"{db_path}{suffix}"))
-    os.replace(tmp_path, db_path)
+    owns_lease = exclusive_lease is None
+    if exclusive_lease is not None:
+        if not isinstance(exclusive_lease, DatabaseLease):
+            raise TypeError("Caller-owned recovery lease must be a DatabaseLease")
+        if exclusive_lease.released:
+            raise ValueError("Caller-owned recovery lease is already released")
+        if not exclusive_lease.exclusive:
+            raise ValueError("Caller-owned recovery lease must be exclusive")
+        if exclusive_lease.lock_path != database_lock_path(db_path):
+            raise ValueError("Caller-owned recovery lease does not match recovery database")
+        lease = exclusive_lease
+    else:
+        try:
+            lease = acquire_database_lease(db_path, exclusive=True, blocking=False)
+        except DatabaseLeaseUnavailable as exc:
+            raise RuntimeError(
+                f"Cannot restore {db_path}: active database users hold shared leases"
+            ) from exc
 
-    restored_checks = _require_sqlite_ok(db_path, "Restored database")
-    return {
+    try:
+        tmp_path = db_path.with_name(f"{db_path.name}.restore-tmp")
+        _unlink_if_exists(tmp_path)
+        try:
+            if not _try_copy_on_write_clone(backup_path, tmp_path):
+                shutil.copy2(backup_path, tmp_path)
+            if learned_snapshot is not None:
+                with closing(sqlite3.connect(tmp_path)) as conn:
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    conn.execute("BEGIN IMMEDIATE")
+                    apply_learned_memory_snapshot_to_connection(
+                        conn,
+                        point.user_id,
+                        learned_snapshot,
+                    )
+                    conn.commit()
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                for suffix in ("-wal", "-shm"):
+                    _unlink_if_exists(Path(f"{tmp_path}{suffix}"))
+                _require_sqlite_ok(tmp_path, "Recovery candidate")
+            for suffix in ("-wal", "-shm"):
+                _unlink_if_exists(Path(f"{db_path}{suffix}"))
+            os.replace(tmp_path, db_path)
+            _fsync_directory(db_path.parent)
+            restored_checks = _require_sqlite_ok(db_path, "Restored database")
+        finally:
+            _unlink_if_exists(tmp_path)
+            for suffix in ("-wal", "-shm"):
+                _unlink_if_exists(Path(f"{tmp_path}{suffix}"))
+    finally:
+        if owns_lease:
+            lease.release()
+    result = {
         "restored": True,
         "recovery_point": point.id,
         "integrity_check": restored_checks["integrity_check"],
@@ -429,18 +609,326 @@ def restore_recovery_point(point: RecoveryPoint) -> dict[str, Any]:
         "backup_integrity_check": backup_checks["integrity_check"],
         "backup_quick_check": backup_checks["quick_check"],
     }
+    if learned_snapshot is not None:
+        result["learned_memory_preserved"] = True
+    return result
 
 
-def _collapse_tolerance(count: int) -> int:
-    return max(2, count // 10)
+def recovery_in_progress_path(user_id: str) -> Path:
+    return user_control_dir(user_id) / RECOVERY_IN_PROGRESS_FILENAME
 
 
-def _bulk_change_tolerance(count: int) -> int:
-    return max(3, count // 10)
+def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid {label}: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid {label}: {path}")
+    return value
 
 
-def _plain_deactivation_tolerance(count: int) -> int:
-    return max(1, count // 50)
+def load_recovery_point(user_id: str, recovery_point_id: str) -> RecoveryPoint:
+    """Load and verify one protected recovery bundle."""
+    identifier = _safe_id(recovery_point_id, label="recovery")
+    recovery_dir = _recovery_dir(user_id)
+    manifest_path = recovery_dir / f"{identifier}.json"
+    backup_path = recovery_dir / f"{identifier}.sqlite"
+    manifest = _read_json_object(manifest_path, label="recovery manifest")
+    raw_point = manifest.get("recovery_point")
+    if not isinstance(raw_point, dict):
+        raise ValueError(f"Recovery manifest has no recovery point: {manifest_path}")
+    try:
+        point = RecoveryPoint(
+            id=str(raw_point["id"]),
+            user_id=str(raw_point["user_id"]),
+            cycle_id=(
+                str(raw_point["cycle_id"]) if raw_point.get("cycle_id") is not None else None
+            ),
+            db_path=str(raw_point["db_path"]),
+            backup_path=str(raw_point["backup_path"]),
+            manifest_path=str(raw_point["manifest_path"]),
+            created_at=str(raw_point["created_at"]),
+            method=str(raw_point["method"]),
+            size_bytes=int(raw_point["size_bytes"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Malformed recovery point: {manifest_path}") from exc
+
+    if point.id != identifier or point.user_id != user_id:
+        raise ValueError("Recovery point identity mismatch")
+    if point.cycle_id is not None:
+        _safe_id(point.cycle_id, label="cycle")
+    if Path(point.manifest_path).expanduser().resolve() != manifest_path.resolve():
+        raise ValueError("Recovery manifest path mismatch")
+    if Path(point.backup_path).expanduser().resolve() != backup_path.resolve():
+        raise ValueError("Recovery backup path mismatch")
+    if not Path(point.db_path).expanduser().is_absolute():
+        raise ValueError("Recovery database path must be absolute")
+    if not backup_path.is_file():
+        raise FileNotFoundError(str(backup_path))
+    if backup_path.stat().st_size != point.size_bytes:
+        raise ValueError("Recovery point size mismatch")
+    _require_sqlite_ok(backup_path, "Recovery point")
+    return point
+
+
+def _require_timestamp(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty timestamp")
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"Invalid {label}: {value!r}") from exc
+    return value
+
+
+def mark_recovery_in_progress(point: RecoveryPoint, *, started_at: str) -> Path:
+    """Publish the crash marker only after the retained recovery verifies."""
+    if point.cycle_id is None:
+        raise ValueError("An in-progress recovery marker requires a cycle id")
+    verified = load_recovery_point(point.user_id, point.id)
+    if asdict(verified) != asdict(point):
+        raise ValueError("Recovery point does not match its protected manifest")
+    marker = {
+        "schema_version": 1,
+        "cycle_id": _safe_id(point.cycle_id, label="cycle"),
+        "recovery_point_id": _safe_id(point.id, label="recovery"),
+        "started_at": _require_timestamp(started_at, label="synthesis start"),
+    }
+    return _write_json_once(recovery_in_progress_path(point.user_id), marker)
+
+
+def load_recovery_in_progress(user_id: str) -> RecoveryInProgress | None:
+    path = recovery_in_progress_path(user_id)
+    if not path.is_file():
+        return None
+    value = _read_json_object(path, label="synthesis recovery marker")
+    if value.get("schema_version") != 1:
+        raise ValueError("Unsupported synthesis recovery marker version")
+    return RecoveryInProgress(
+        cycle_id=_safe_id(value.get("cycle_id"), label="cycle"),
+        recovery_point_id=_safe_id(value.get("recovery_point_id"), label="recovery"),
+        started_at=_require_timestamp(value.get("started_at"), label="synthesis start"),
+    )
+
+
+def clear_recovery_in_progress(user_id: str, *, cycle_id: str) -> bool:
+    expected_cycle = _safe_id(cycle_id, label="cycle")
+    marker = load_recovery_in_progress(user_id)
+    if marker is None:
+        return False
+    if marker.cycle_id != expected_cycle:
+        raise RuntimeError(
+            f"Cannot clear recovery marker for {marker.cycle_id!r} as {expected_cycle!r}"
+        )
+    path = recovery_in_progress_path(user_id)
+    path.unlink()
+    _fsync_directory(path.parent)
+    return True
+
+
+def publish_synthesis_recovery_fence(
+    db_path: str | Path,
+    *,
+    cycle_id: str,
+) -> Path:
+    """Block new database opens while an interrupted cycle is restored."""
+    path = maintenance_marker_path(db_path)
+    return _write_json_once(
+        path,
+        {
+            "schema_version": 1,
+            "kind": "synthesis_recovery",
+            "cycle_id": _safe_id(cycle_id, label="cycle"),
+        },
+    )
+
+
+def clear_synthesis_recovery_fence(
+    db_path: str | Path,
+    *,
+    cycle_id: str,
+) -> bool:
+    """Clear only the matching synthesis-recovery maintenance marker."""
+    path = maintenance_marker_path(db_path)
+    if not path.is_file():
+        return False
+    value = _read_json_object(path, label="database maintenance marker")
+    expected_cycle = _safe_id(cycle_id, label="cycle")
+    if value.get("kind") != "synthesis_recovery" or value.get("cycle_id") != expected_cycle:
+        raise RuntimeError(f"Refusing to clear an unrelated database maintenance marker: {path}")
+    path.unlink()
+    _fsync_directory(path.parent)
+    return True
+
+
+def _read_recovered_memex(db_path: Path, user_id: str) -> str | None:
+    uri = f"file:{db_path}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version != SCHEMA_VERSION:
+            raise ValueError(f"Cannot recover MEMEX from unsupported schema version {version}")
+        row = conn.execute(
+            "SELECT content FROM current_memex WHERE singleton = 1 AND user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return strip_memex_header(_text(row[0])) if row is not None else None
+
+
+def _write_recovered_memex(memex_path: Path, content: str | None) -> None:
+    memex_path = memex_path.expanduser().resolve()
+    memex_path.parent.mkdir(parents=True, exist_ok=True)
+    if content is None:
+        existed = memex_path.exists()
+        memex_path.unlink(missing_ok=True)
+        if existed:
+            _fsync_directory(memex_path.parent)
+        return
+
+    temporary = memex_path.with_name(f".{memex_path.name}.{os.getpid()}.tmp")
+    _unlink_if_exists(temporary)
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(format_memex_projection(content) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, memex_path)
+        _fsync_directory(memex_path.parent)
+    finally:
+        _unlink_if_exists(temporary)
+
+
+def reconcile_interrupted_synthesis(
+    user_id: str,
+    *,
+    memex_path: str | Path,
+    expected_db_path: str | Path | None = None,
+    completed_at_override: str | None = None,
+    exclusive_lease: DatabaseLease | None = None,
+) -> dict[str, Any]:
+    """Restore only a marked cycle that has no protected final receipt."""
+    marker = load_recovery_in_progress(user_id)
+    if marker is None:
+        return {"action": "none"}
+
+    control_dir = user_control_dir(user_id)
+    receipt = get_receipt(control_dir, marker.cycle_id)
+    if isinstance(receipt, dict) and receipt.get("status") in FINAL_RECEIPT_STATUSES:
+        clear_recovery_in_progress(user_id, cycle_id=marker.cycle_id)
+        return {"action": "finalized", "cycle_id": marker.cycle_id}
+
+    point = load_recovery_point(user_id, marker.recovery_point_id)
+    if point.cycle_id != marker.cycle_id:
+        raise ValueError("Recovery marker and recovery point identify different cycles")
+    if (
+        expected_db_path is not None
+        and Path(point.db_path).resolve() != Path(expected_db_path).expanduser().resolve()
+    ):
+        raise ValueError("Recovery point does not target the expected database")
+
+    learned_candidate = None
+    try:
+        learned_candidate = get_valid_learned_memory_from_path(point.db_path, user_id)
+    except Exception:
+        logger.warning(
+            "Could not preserve learned memory from interrupted synthesis %s",
+            marker.cycle_id,
+            exc_info=True,
+        )
+    restore_info = restore_recovery_point(
+        point,
+        exclusive_lease=exclusive_lease,
+        learned_snapshot=learned_candidate,
+    )
+    _write_recovered_memex(
+        Path(memex_path),
+        _read_recovered_memex(Path(point.db_path), user_id),
+    )
+    completed_at = _require_timestamp(
+        completed_at_override or datetime.now(UTC).isoformat(),
+        label="reconciliation completion",
+    )
+    final_receipt = {
+        "id": marker.cycle_id,
+        "started_at": marker.started_at,
+        "completed_at": completed_at,
+        "status": "incomplete",
+        "session_id": None,
+        "acknowledged_record_ids": [],
+        "memex_updated": False,
+        "recovery": {
+            "restored": True,
+            "recovery_point": point.id,
+            **(
+                {"learned_memory_preserved": True}
+                if restore_info.get("learned_memory_preserved")
+                else {}
+            ),
+        },
+        "error": "Recovered an interrupted synthesis before database use",
+    }
+    write_receipt(control_dir, final_receipt)
+    clear_recovery_in_progress(user_id, cycle_id=marker.cycle_id)
+    return {
+        "action": "restored",
+        "cycle_id": marker.cycle_id,
+        "recovery": restore_info,
+    }
+
+
+def try_reconcile_before_database_use(
+    user_id: str,
+    *,
+    memex_path: str | Path,
+    expected_db_path: str | Path | None = None,
+    completed_at_override: str | None = None,
+) -> dict[str, Any]:
+    """Reconcile a stale marker without mistaking a live synthesis for a crash."""
+    marker = load_recovery_in_progress(user_id)
+    if marker is None:
+        return {"action": "none"}
+
+    if expected_db_path is not None:
+        db_path = Path(expected_db_path).expanduser().resolve()
+    else:
+        point = load_recovery_point(user_id, marker.recovery_point_id)
+        db_path = Path(point.db_path).expanduser().resolve()
+
+    try:
+        lease = acquire_database_lease(db_path, exclusive=True, blocking=False)
+    except DatabaseLeaseUnavailable as lease_error:
+        try:
+            lock_handle, _ = acquire_synthesis_lock(user_id)
+        except SynthesisLockUnavailable:
+            return {"action": "active", "cycle_id": marker.cycle_id}
+        else:
+            release_synthesis_lock(lock_handle)
+            raise RuntimeError(
+                f"Cannot reconcile interrupted synthesis while database users are active: {db_path}"
+            ) from lease_error
+
+    try:
+        try:
+            lock_handle, _ = acquire_synthesis_lock(user_id)
+        except SynthesisLockUnavailable:
+            return {"action": "active", "cycle_id": marker.cycle_id}
+
+        try:
+            result = reconcile_interrupted_synthesis(
+                user_id,
+                memex_path=memex_path,
+                expected_db_path=db_path,
+                completed_at_override=completed_at_override,
+                exclusive_lease=lease,
+            )
+            if result.get("action") in {"finalized", "restored"}:
+                clear_synthesis_recovery_fence(db_path, cycle_id=marker.cycle_id)
+            return result
+        finally:
+            release_synthesis_lock(lock_handle)
+    finally:
+        lease.release()
 
 
 def _rebuild_search_index(db: Any) -> int:
@@ -449,75 +937,12 @@ def _rebuild_search_index(db: Any) -> int:
     db.conn.execute("DELETE FROM memories_fts")
     cursor = db.conn.execute(
         """INSERT INTO memories_fts(memory_id, content)
-           SELECT id, content FROM memories WHERE active = 1"""
+           SELECT id, content FROM memories"""
     )
     db.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+    if not getattr(db, "_in_transaction", False):
+        db.conn.commit()
     return int(cursor.rowcount or 0)
-
-
-def _normalize_active_memory_updates(
-    db: Any,
-    user_id: str,
-    baseline: StateBaseline,
-) -> list[str]:
-    """Preserve before-state for valid direct edits to active memories."""
-    if not baseline.active_memories:
-        return []
-
-    current_rows = db.conn.execute(
-        """SELECT id, content, source_event_ids, active, superseded_by, updated_at
-           FROM memories
-           WHERE user_id = ?
-             AND id IN ({})""".format(",".join("?" for _ in baseline.active_memories) or "NULL"),
-        (user_id, *baseline.active_memories.keys()),
-    ).fetchall()
-    current = {str(row["id"]): row for row in current_rows}
-    normalized_ids: list[str] = []
-
-    for memory_id, before in baseline.active_memories.items():
-        row = current.get(memory_id)
-        if row is None or int(row["active"] or 0) != 1:
-            continue
-        new_content = _text(row["content"])
-        if _hash_text(new_content) == before.content_hash:
-            continue
-
-        new_id = str(uuid7())
-        now = datetime.now(UTC).isoformat()
-        db.conn.execute(
-            """INSERT INTO memories
-               (id, user_id, content, source_event_ids,
-                created_at, updated_at, superseded_by, active)
-               VALUES (?, ?, ?, ?, ?, ?, NULL, 1)""",
-            (
-                new_id,
-                user_id,
-                new_content,
-                _text(row["source_event_ids"]) or "[]",
-                now,
-                _text(row["updated_at"]) or None,
-            ),
-        )
-        db.conn.execute(
-            """UPDATE memories
-               SET content = ?,
-                   source_event_ids = ?,
-                   updated_at = ?,
-                   superseded_by = ?,
-                   active = 0
-               WHERE user_id = ? AND id = ?""",
-            (
-                before.content,
-                before.source_event_ids,
-                before.updated_at,
-                new_id,
-                user_id,
-                memory_id,
-            ),
-        )
-        normalized_ids.append(memory_id)
-
-    return normalized_ids
 
 
 def validate_state_after_cycle(
@@ -526,180 +951,226 @@ def validate_state_after_cycle(
     baseline: StateBaseline,
     *,
     allow_empty_memex: bool = False,
-    memex_token_limit: int = 2000,
-    chars_per_token: int = 4,
 ) -> dict[str, Any]:
-    """Validate that agent writes did not collapse the semantic store."""
+    """Validate the v3 current graph after one agent attempt."""
     issues: list[str] = []
     stats: dict[str, Any] = {
-        "baseline_active_non_memex": baseline.active_non_memex_count,
-        "baseline_memex_count": baseline.memex_count,
+        "baseline_memories": len(baseline.memories),
+        "baseline_links": len(baseline.links),
+        "baseline_memex_count": int(baseline.current_memex is not None),
     }
 
-    table_rows = db.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    tables = {str(row["name"]) for row in table_rows}
+    try:
+        table_rows = db.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        tables = {str(row["name"]) for row in table_rows}
+    except sqlite3.Error as exc:
+        return {
+            "valid": False,
+            "issues": [f"database validation error: {exc}"],
+            "stats": stats,
+        }
+
     missing_tables = sorted(REQUIRED_TABLES - tables)
     stats["tables"] = sorted(tables)
+    stats["missing_tables"] = missing_tables
     if missing_tables:
         issues.append(f"missing required tables: {', '.join(missing_tables)}")
+        return {"valid": False, "issues": issues, "stats": stats}
 
     try:
+        _validate_current_schema(db.conn)
+        stats["schema_valid"] = True
+    except Exception as exc:
+        stats["schema_valid"] = False
+        issues.append(f"current graph schema changed: {exc}")
+
+    try:
+        foreign_key_rows = db.conn.execute("PRAGMA foreign_key_check").fetchall()
+        stats["foreign_key_violations"] = len(foreign_key_rows)
+        if foreign_key_rows:
+            issues.append(f"foreign key violations exist: {len(foreign_key_rows)}")
         checks, search_index_rebuilt, search_index_rebuilt_rows = _repair_search_index_if_needed(db)
         stats.update(checks)
         stats["search_index_rebuilt"] = search_index_rebuilt
         if search_index_rebuilt:
             stats["search_index_rebuilt_rows"] = search_index_rebuilt_rows
         _append_check_issues(issues, checks)
+        search_index_matches = _search_index_matches_graph(db)
+        stats["search_index_matches_graph"] = search_index_matches
+        if not search_index_matches:
+            issues.append("memories_fts does not match the current memories table")
     except sqlite3.Error as exc:
         issues.append(f"database validation error: {exc}")
         return {"valid": False, "issues": issues, "stats": stats}
 
-    if missing_tables:
+    identity_rows = db.conn.execute(
+        "SELECT singleton, user_id FROM syke_identity ORDER BY singleton"
+    ).fetchall()
+    stats["identity_rows"] = len(identity_rows)
+    stats["identity_user_id"] = (
+        str(identity_rows[0]["user_id"]) if len(identity_rows) == 1 else None
+    )
+    if baseline.identity_user_id is not None:
+        if len(identity_rows) != 1:
+            issues.append(f"single Syke identity missing or duplicated: {len(identity_rows)} rows")
+        elif str(identity_rows[0]["user_id"]) != baseline.identity_user_id:
+            issues.append(
+                "Syke identity changed: "
+                f"{baseline.identity_user_id!r} -> {identity_rows[0]['user_id']!r}"
+            )
+        rows_outside_identity = {
+            table: int(
+                db.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE user_id != ?",
+                    (baseline.identity_user_id,),
+                ).fetchone()[0]
+            )
+            for table in GRAPH_IDENTITY_TABLES
+        }
+        stats["rows_outside_identity"] = rows_outside_identity
+        if any(rows_outside_identity.values()):
+            issues.append(f"rows exist outside the single Syke identity: {rows_outside_identity}")
+
+    try:
+        memories = _capture_memories(db, user_id)
+        links = _capture_links(db, user_id)
+    except sqlite3.Error as exc:
+        issues.append(f"current graph read failed: {exc}")
         return {"valid": False, "issues": issues, "stats": stats}
 
-    normalized_active_updates = _normalize_active_memory_updates(db, user_id, baseline)
-    stats["normalized_active_memory_updates"] = len(normalized_active_updates)
-
-    active_count = int(
-        db.conn.execute(
-            """SELECT COUNT(*)
-               FROM memories
-               WHERE user_id = ?
-                 AND active = 1
-                 AND (source_event_ids IS NULL OR source_event_ids != ?)""",
-            (user_id, MEMEX_MARKER_SQL),
-        ).fetchone()[0]
+    baseline_memory_ids = set(baseline.memories)
+    memory_ids = set(memories)
+    created_memory_ids = sorted(memory_ids - baseline_memory_ids)
+    removed_memory_ids = sorted(baseline_memory_ids - memory_ids)
+    revised_memory_ids = sorted(
+        memory_id
+        for memory_id in baseline_memory_ids & memory_ids
+        if memories[memory_id].content_hash != baseline.memories[memory_id].content_hash
     )
-    stats["active_non_memex"] = active_count
-    allowed_drop = _collapse_tolerance(baseline.active_non_memex_count)
-    if active_count < baseline.active_non_memex_count - allowed_drop:
+    changed_memory_created_at_ids = sorted(
+        memory_id
+        for memory_id in baseline_memory_ids & memory_ids
+        if memories[memory_id].created_at != baseline.memories[memory_id].created_at
+    )
+    stats["memories_created"] = len(created_memory_ids)
+    stats["memories_updated"] = len(revised_memory_ids)
+    stats["memories_removed"] = len(removed_memory_ids)
+    stats["removed_memory_ids"] = removed_memory_ids
+    stats["changed_memory_created_at_ids"] = changed_memory_created_at_ids
+    if changed_memory_created_at_ids:
         issues.append(
-            "active non-MEMEX memories collapsed: "
-            f"{baseline.active_non_memex_count} -> {active_count}"
+            f"pre-existing memory created_at changed: {len(changed_memory_created_at_ids)}"
         )
 
-    current_rows = db.conn.execute(
-        """SELECT id, content, active, superseded_by, updated_at
-           FROM memories
-           WHERE user_id = ?
-             AND id IN ({})""".format(",".join("?" for _ in baseline.active_memories) or "NULL"),
-        (user_id, *baseline.active_memories.keys()),
-    ).fetchall()
-    current = {str(row["id"]): row for row in current_rows}
+    baseline_link_ids = set(baseline.links)
+    link_ids = set(links)
+    created_link_ids = sorted(link_ids - baseline_link_ids)
+    removed_link_ids = sorted(baseline_link_ids - link_ids)
+    revised_link_ids = sorted(
+        link_id
+        for link_id in baseline_link_ids & link_ids
+        if links[link_id] != baseline.links[link_id]
+    )
+    changed_link_created_at_ids = sorted(
+        link_id
+        for link_id in baseline_link_ids & link_ids
+        if links[link_id].created_at != baseline.links[link_id].created_at
+    )
+    stats["links_created"] = len(created_link_ids)
+    stats["links_updated"] = len(revised_link_ids)
+    stats["links_removed"] = len(removed_link_ids)
+    stats["changed_link_created_at_ids"] = changed_link_created_at_ids
+    if changed_link_created_at_ids:
+        issues.append(f"pre-existing link created_at changed: {len(changed_link_created_at_ids)}")
 
-    missing_ids: list[str] = []
-    superseded_ids: list[str] = []
-    deactivated_ids: list[str] = []
-    for memory_id in baseline.active_memories:
-        row = current.get(memory_id)
-        if row is None:
-            missing_ids.append(memory_id)
-            continue
-        row_active = int(row["active"] or 0)
-        if row_active == 0:
-            successor = _text(row["superseded_by"]) or None
-            if successor:
-                target = db.conn.execute(
-                    "SELECT 1 FROM memories WHERE user_id = ? AND id = ? LIMIT 1",
-                    (user_id, successor),
-                ).fetchone()
-                if target:
-                    superseded_ids.append(memory_id)
-                else:
-                    deactivated_ids.append(memory_id)
-            else:
-                deactivated_ids.append(memory_id)
-
-    stats["missing_baseline_active"] = len(missing_ids)
-    stats["superseded_baseline_active"] = len(superseded_ids)
-    stats["deactivated_baseline_active"] = len(deactivated_ids)
-    if missing_ids:
-        issues.append(f"pre-existing active memories deleted: {len(missing_ids)}")
-    if len(superseded_ids) > _bulk_change_tolerance(baseline.active_non_memex_count):
-        issues.append(f"too many pre-existing memories revised at once: {len(superseded_ids)}")
-    if len(deactivated_ids) > _plain_deactivation_tolerance(baseline.active_non_memex_count):
-        issues.append(
-            "too many pre-existing memories deactivated without replacement: "
-            f"{len(deactivated_ids)}"
-        )
-
-    baseline_memex_ids = list(baseline.memex_memories.keys())
-    if baseline_memex_ids:
-        current_memex_history_rows = db.conn.execute(
-            """SELECT id, content, source_event_ids
-               FROM memories
-               WHERE user_id = ?
-                 AND id IN ({})""".format(",".join("?" for _ in baseline_memex_ids)),
-            (user_id, *baseline_memex_ids),
+    broken_link_rows = [
+        {
+            "id": _text(row["id"]),
+            "source_id": _text(row["source_id"]),
+            "target_id": _text(row["target_id"]),
+        }
+        for row in db.conn.execute(
+            """SELECT link.id, link.source_id, link.target_id
+               FROM links AS link
+               LEFT JOIN memories AS source
+                 ON source.id = link.source_id AND source.user_id = link.user_id
+               LEFT JOIN memories AS target
+                 ON target.id = link.target_id AND target.user_id = link.user_id
+               WHERE link.user_id = ? AND (source.id IS NULL OR target.id IS NULL)
+               ORDER BY link.id""",
+            (user_id,),
         ).fetchall()
-        current_memex_history = {str(row["id"]): row for row in current_memex_history_rows}
+    ]
+    stats["broken_links"] = len(broken_link_rows)
+    stats["broken_link_rows"] = broken_link_rows
+    if broken_link_rows:
+        issues.append(f"links reference missing memories: {len(broken_link_rows)}")
 
-        missing_memex_ids: list[str] = []
-        rewritten_memex_ids: list[str] = []
-        retagged_memex_ids: list[str] = []
-        for memory_id, before in baseline.memex_memories.items():
-            row = current_memex_history.get(memory_id)
-            if row is None:
-                missing_memex_ids.append(memory_id)
-                continue
-            if _text(row["source_event_ids"]) != MEMEX_MARKER_SQL:
-                retagged_memex_ids.append(memory_id)
-                continue
-            content = _strip_memex_header(_text(row["content"]))
-            if _hash_text(content) != before.content_hash:
-                rewritten_memex_ids.append(memory_id)
-
-        stats["baseline_memex_rows"] = len(baseline.memex_memories)
-        stats["missing_baseline_memex"] = len(missing_memex_ids)
-        stats["rewritten_baseline_memex"] = len(rewritten_memex_ids)
-        stats["retagged_baseline_memex"] = len(retagged_memex_ids)
-        if missing_memex_ids:
-            issues.append(f"pre-existing MEMEX rows deleted: {len(missing_memex_ids)}")
-        if rewritten_memex_ids:
-            issues.append(f"pre-existing MEMEX rows rewritten: {len(rewritten_memex_ids)}")
-        if retagged_memex_ids:
-            issues.append(
-                f"pre-existing MEMEX rows lost canonical marker: {len(retagged_memex_ids)}"
-            )
+    stats["graph_change"] = {
+        "created_memory_ids": created_memory_ids,
+        "revised_memory_ids": revised_memory_ids,
+        "created_link_ids": created_link_ids,
+        "revised_link_ids": revised_link_ids,
+        "removed_link_ids": removed_link_ids,
+    }
 
     memex_rows = db.conn.execute(
-        """SELECT id, content
-           FROM memories
-           WHERE user_id = ? AND active = 1 AND source_event_ids = ?
-           ORDER BY datetime(created_at) DESC, id DESC""",
-        (user_id, MEMEX_MARKER_SQL),
+        """SELECT singleton, id, user_id, content, created_at, updated_at
+           FROM current_memex
+           WHERE user_id = ?
+           ORDER BY singleton""",
+        (user_id,),
     ).fetchall()
-    stats["active_memex_count"] = len(memex_rows)
-    if not allow_empty_memex:
-        if len(memex_rows) == 0:
-            issues.append("canonical MEMEX missing")
-        elif len(memex_rows) > 1:
-            issues.append(f"duplicate active canonical MEMEX rows: {len(memex_rows)}")
-    elif len(memex_rows) > 1:
-        issues.append(f"duplicate active canonical MEMEX rows: {len(memex_rows)}")
-    if memex_rows:
-        memex_body = _strip_memex_header(_text(memex_rows[0]["content"]))
-        token_estimate = len(memex_body) // chars_per_token
-        stats["memex_tokens"] = token_estimate
+    stats["current_memex_count"] = len(memex_rows)
+    memex_row = memex_rows[0] if len(memex_rows) == 1 else None
+    if len(memex_rows) > 1:
+        issues.append(f"duplicate current MEMEX rows: {len(memex_rows)}")
+
+    if baseline.current_memex is not None:
+        if memex_row is None:
+            issues.append("pre-existing current MEMEX missing")
+        else:
+            if str(memex_row["id"]) != baseline.current_memex.id:
+                issues.append(
+                    "current MEMEX identity changed: "
+                    f"{baseline.current_memex.id} -> {memex_row['id']}"
+                )
+            if _text(memex_row["created_at"]) != baseline.current_memex.created_at:
+                issues.append("current MEMEX created_at changed")
+    elif memex_row is not None:
+        stats["new_memex_rows"] = 1
+    else:
+        stats["new_memex_rows"] = 0
+
+    if memex_row is None:
+        if not allow_empty_memex:
+            issues.append("current MEMEX missing")
+    else:
+        memex_body = strip_memex_header(_text(memex_row["content"]))
+        measurement = measure_memex(memex_body)
+        stats["memex_tokens"] = measurement["tokens"]
+        stats["memex_token_limit"] = measurement["limit"]
+        stats["memex_token_encoding"] = measurement["encoding"]
+        stats["memex_over_budget"] = bool(measurement["over_budget"])
         if not memex_body.strip() and not allow_empty_memex:
-            issues.append("canonical MEMEX empty")
-        if token_estimate > memex_token_limit:
+            issues.append("current MEMEX empty")
+        if measurement["over_budget"]:
             issues.append(
-                f"canonical MEMEX over budget: {token_estimate}/{memex_token_limit} tokens"
+                f"current MEMEX over budget: {measurement['tokens']}/"
+                f"{measurement['limit']} tokens ({measurement['encoding']})"
             )
 
-    broken_links = int(
-        db.conn.execute(
-            """SELECT COUNT(*)
-               FROM links l
-               LEFT JOIN memories s ON s.user_id = l.user_id AND s.id = l.source_id
-               LEFT JOIN memories t ON t.user_id = l.user_id AND t.id = l.target_id
-               WHERE l.user_id = ? AND (s.id IS NULL OR t.id IS NULL)""",
-            (user_id,),
-        ).fetchone()[0]
-    )
-    stats["broken_links"] = broken_links
-    if broken_links:
-        issues.append(f"links reference missing memories: {broken_links}")
+    learned_row = get_learned_memory(db, user_id)
+    learned_content = str(learned_row.get("content") or "") if learned_row else ""
+    learned_measurement = measure_learned_projection(learned_content)
+    stats["learned_tokens"] = learned_measurement["tokens"]
+    stats["learned_token_limit"] = learned_measurement["limit"]
+    stats["learned_token_encoding"] = learned_measurement["encoding"]
+    stats["learned_over_budget"] = bool(learned_measurement["over_budget"])
+    if learned_measurement["over_budget"]:
+        issues.append(
+            f"learned memory over budget: {learned_measurement['tokens']}/"
+            f"{learned_measurement['limit']} tokens ({learned_measurement['encoding']})"
+        )
 
     return {"valid": not issues, "issues": issues, "stats": stats}

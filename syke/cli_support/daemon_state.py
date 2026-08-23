@@ -6,12 +6,7 @@ import platform
 import time
 from typing import cast
 
-from syke.daemon.daemon import (
-    cron_is_running,
-    daemon_process_state,
-    launchd_metadata,
-    systemd_metadata,
-)
+from syke.daemon.daemon import daemon_process_state, launchd_metadata, systemd_metadata
 from syke.daemon.ipc import daemon_ipc_status
 
 
@@ -58,11 +53,7 @@ def _daemon_registration_state(system: str) -> tuple[bool, dict[str, object] | N
         return bool(launchd.get("registered")), launchd
     if system == "Linux":
         systemd = systemd_metadata()
-        if systemd.get("registered"):
-            return True, systemd
-    registered, _ = cron_is_running()
-    if registered:
-        return True, {"manager": "cron", "registered": True}
+        return bool(systemd.get("registered")), systemd
     return False, None
 
 
@@ -87,8 +78,6 @@ def _daemon_lifecycle_state(
         return "running"
     if stale:
         return "stale"
-    if manager == "cron" and registered:
-        return "legacy_scheduled_sync"
     if registered:
         return "registered"
     return "stopped"
@@ -112,8 +101,6 @@ def _service_detail(
         return f"PID {pid}"
     if stale:
         return f"{manager} stale: " + "; ".join(stale_reasons)
-    if manager == "cron" and registered:
-        return "legacy scheduled sync registered; no background service"
     if registered and manager == "systemd":
         active = registration.get("active_state") if registration else None
         sub = registration.get("sub_state") if registration else None
@@ -166,7 +153,7 @@ def _build_daemon_payload(
         "manager": manager,
         "state": state,
         "registered": registered,
-        "scheduled_only": manager == "cron",
+        "scheduled_only": False,
         "running": running,
         "pid": pid,
         "process_source": process_source,
@@ -241,9 +228,9 @@ def daemon_readiness_snapshot(user_id: str) -> dict[str, object]:
 
 
 def wait_for_daemon_startup(user_id: str, *, timeout_seconds: float = 20.0) -> dict[str, object]:
-    deadline = time.monotonic() + timeout_seconds
+    deadline = time.time() + timeout_seconds
     snapshot = daemon_readiness_snapshot(user_id)
-    while time.monotonic() < deadline:
+    while time.time() < deadline:
         snapshot = daemon_readiness_snapshot(user_id)
         ipc = cast(dict[str, object], snapshot["ipc"])
         if snapshot.get("running") and ipc.get("ok"):
@@ -253,9 +240,9 @@ def wait_for_daemon_startup(user_id: str, *, timeout_seconds: float = 20.0) -> d
 
 
 def wait_for_daemon_shutdown(user_id: str, *, timeout_seconds: float = 10.0) -> dict[str, object]:
-    deadline = time.monotonic() + timeout_seconds
+    deadline = time.time() + timeout_seconds
     snapshot = daemon_readiness_snapshot(user_id)
-    while time.monotonic() < deadline:
+    while time.time() < deadline:
         snapshot = daemon_readiness_snapshot(user_id)
         if not snapshot.get("running") and not snapshot.get("registered"):
             break

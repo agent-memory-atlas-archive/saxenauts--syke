@@ -1,1455 +1,155 @@
 """Persistent Pi agent runtime.
 
 Syke treats Pi as the canonical agent runtime. This client manages a long-lived
-Pi RPC subprocess, prepares the workspace-local Pi settings, and turns Pi's RPC
-event stream into structured runtime results.
+Pi RPC subprocess, prepares its process environment, and turns Pi's RPC event
+stream into structured runtime results.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import shutil
-import stat
 import subprocess
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from syke.pi_state import build_pi_agent_env, get_default_model
-from syke.runtime.child_env import (
-    build_child_process_env,
-    temp_paths_from_env,
-)
+from syke.config import SYNC_THINKING_LEVEL
+from syke.llm import pi_catalog as _pi_catalog
+from syke.llm import pi_install as _pi_install
+from syke.llm import pi_rpc as _pi_rpc
+from syke.runtime.child_env import temp_paths_from_env
 from syke.runtime.pi_settings import configure_pi_workspace
 
 logger = logging.getLogger(__name__)
 
-_PI_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
-# Give Pi time to emit retry state after a retryable agent_end. Generous
-# enough to absorb network jitter on slow runners; the cost is at most this
-# much extra wall-time for cycles that hit a *terminal* retryable error
-# with no auto-retry coming (uncommon in production).
-_RETRY_SETTLEMENT_GRACE_SECONDS = 1.0
+# Compatibility surface for callers that historically imported installation
+# helpers from pi_client.
+PI_BIN = _pi_install.PI_BIN
+PI_CLI_JS = _pi_install.PI_CLI_JS
+PI_LOCAL_PREFIX = _pi_install.PI_LOCAL_PREFIX
+PI_NODE_BIN = _pi_install.PI_NODE_BIN
+PI_PACKAGE = _pi_install.PI_PACKAGE
+PI_PACKAGE_ROOT = _pi_install.PI_PACKAGE_ROOT
+PI_PACKAGE_SPEC = _pi_install.PI_PACKAGE_SPEC
+PI_PACKAGE_VERSION = _pi_install.PI_PACKAGE_VERSION
+PI_SCHEMA_PACKAGE = _pi_install.PI_SCHEMA_PACKAGE
+PI_SCHEMA_SPEC = _pi_install.PI_SCHEMA_SPEC
+PI_SCHEMA_VERSION = _pi_install.PI_SCHEMA_VERSION
+PI_TOOL_EXTENSION = _pi_install.PI_TOOL_EXTENSION
+PI_TOOL_EXTENSION_SOURCE = _pi_install.PI_TOOL_EXTENSION_SOURCE
+ensure_node_binary = _pi_install.ensure_node_binary
+ensure_pi_binary = _pi_install.ensure_pi_binary
+get_pi_version = _pi_install.get_pi_version
+resolve_pi_binary = _pi_install.resolve_pi_binary
+
+# Compatibility surface for provider/runtime callers that historically
+# imported catalog and auth helpers from pi_client.
+PiLaunchBinding = _pi_catalog.PiLaunchBinding
+PiProviderCatalogEntry = _pi_catalog.PiProviderCatalogEntry
+get_pi_provider_catalog = _pi_catalog.get_pi_provider_catalog
+probe_pi_provider_connection = _pi_catalog.probe_pi_provider_connection
+resolve_pi_launch_binding = _pi_catalog.resolve_pi_launch_binding
+run_pi_oauth_login = _pi_catalog.run_pi_oauth_login
+
+# Compatibility surface for callers that historically imported RPC types from
+# pi_client.
+PiCycleResult = _pi_rpc.PiCycleResult
+RpcEventStream = _pi_rpc.RpcEventStream
+
+
+def resolve_pi_model(model_override: str | None = None) -> str:
+    """Resolve through the compatibility binding seam retained by pi_client."""
+    return resolve_pi_launch_binding(model_override).model
+
+
 _RPC_STOP_STDIN_GRACE_SECONDS = 0.2
 _RPC_STOP_TERM_GRACE_SECONDS = 1.0
+_PI_BASH_SPILL_NAME = re.compile(r"pi-bash-[0-9a-f]{16}\.log")
 
 
-@dataclass(frozen=True)
-class PiLaunchBinding:
-    provider: str | None
-    model: str
-
-
-@dataclass(frozen=True)
-class PiProviderCatalogEntry:
-    id: str
-    models: tuple[str, ...]
-    available_models: tuple[str, ...]
-    default_model: str | None
-    oauth: bool
-    oauth_name: str | None = None
-    requires_base_url: bool = False
-
-
-def _get_active_provider_spec():
-    try:
-        from syke.llm.env import resolve_provider
-
-        return resolve_provider()
-    except Exception:
+def pi_bash_spill_path_from_event(event: dict[str, Any], temp_dir: Path) -> Path | None:
+    """Return a bash spill path only when this Pi event owns it."""
+    if event.get("toolName") != "bash":
+        return None
+    event_type = event.get("type")
+    if event_type == "tool_execution_update":
+        result_key = "partialResult"
+    elif event_type == "tool_execution_end":
+        result_key = "result"
+    else:
+        return None
+    result = event.get(result_key)
+    if not isinstance(result, dict):
+        return None
+    details = result.get("details")
+    raw_path = details.get("fullOutputPath") if isinstance(details, dict) else None
+    if not isinstance(raw_path, str) or not raw_path:
         return None
 
-
-def _raw_pi_model_request(model_override: str | None = None) -> tuple[str, bool]:
-    if model_override:
-        return model_override, True
-
-    provider = _get_active_provider_spec()
-    provider_name = _pi_provider_name(provider)
-
-    default_model = get_default_model()
-    if default_model:
-        return default_model, True
-
-    if provider_name:
-        provider_default = _load_pi_provider_default_model(provider_name)
-        if provider_default:
-            return provider_default, False
-    raise RuntimeError(
-        "No Pi model is configured. Set Pi defaultModel or choose a provider/model in `syke setup`."
-    )
-
-
-def _pi_provider_name(provider) -> str | None:
-    if provider is None:
+    candidate = Path(raw_path).expanduser().resolve()
+    owned_temp_dir = temp_dir.expanduser().resolve()
+    if candidate.parent != owned_temp_dir:
         return None
-    provider_id = getattr(provider, "id", None)
-    return provider_id if isinstance(provider_id, str) and provider_id else None
-
-
-def _looks_like_pi_alias(model_id: str) -> bool:
-    if model_id.endswith("-latest"):
-        return True
-    return not bool(re.search(r"-\d{8}$", model_id))
-
-
-def _split_thinking_suffix(pattern: str) -> tuple[str, str | None]:
-    last_colon = pattern.rfind(":")
-    if last_colon == -1:
-        return pattern, None
-    suffix = pattern[last_colon + 1 :]
-    if suffix in _PI_THINKING_LEVELS:
-        return pattern[:last_colon], suffix
-    return pattern, None
-
-
-def _match_pi_model_pattern(
-    provider_name: str, requested: str, model_ids: tuple[str, ...]
-) -> str | None:
-    lower_to_id = {model_id.lower(): model_id for model_id in model_ids}
-    candidate = requested.strip()
-
-    exact = lower_to_id.get(candidate.lower())
-    if exact:
-        return exact
-
-    provider_prefix = f"{provider_name}/"
-    if candidate.lower().startswith(provider_prefix.lower()):
-        stripped = candidate[len(provider_prefix) :].strip()
-        exact = lower_to_id.get(stripped.lower())
-        if exact:
-            return exact
-        candidate = stripped
-
-    base_candidate, thinking = _split_thinking_suffix(candidate)
-    exact = lower_to_id.get(base_candidate.lower())
-    if exact:
-        return f"{exact}:{thinking}" if thinking else exact
-
-    matches = [model_id for model_id in model_ids if base_candidate.lower() in model_id.lower()]
-    if not matches:
+    if _PI_BASH_SPILL_NAME.fullmatch(candidate.name) is None:
         return None
-
-    aliases = sorted(model_id for model_id in matches if _looks_like_pi_alias(model_id))
-    resolved = aliases[-1] if aliases else sorted(matches)[-1]
-    return f"{resolved}:{thinking}" if thinking else resolved
+    return candidate
 
 
-def _format_model_examples(model_ids: tuple[str, ...]) -> str:
-    examples = sorted(model_ids)[:3]
-    return ", ".join(repr(model_id) for model_id in examples)
-
-
-def _run_pi_node_script(
-    script: str,
-    *,
-    extra_env: dict[str, str] | None = None,
-    timeout: int = 10,
-) -> subprocess.CompletedProcess[str]:
-    node_bin = ensure_node_binary()
-    env = _build_subprocess_env(build_pi_agent_env(extra_env))
-    return subprocess.run(
-        [str(node_bin), "--input-type=module", "-e", script],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        cwd=str(PI_LOCAL_PREFIX),
-        env=env,
-    )
-
-
-def _benchmark_judge_rpc_script() -> str:
-    # The TS script below defines a single Pi tool `submit_judge_verdict`.
-    # Its parameter schema is derived dynamically at TS runtime from a
-    # JSON-schema file referenced by the env var
-    # `SYKE_RPC_RUBRIC_SPEC_PATH` (written by the sibling
-    # syke-replay-lab `benchmark_runner.py` when a rubric is active).
-    #
-    # If the env var is unset or points at a missing/unparseable file,
-    # the script falls back to the legacy hand-written v1 TypeBox block
-    # — preserving exact historic behaviour for any caller that has not
-    # been updated to use the rubric engine.
-    return """
-import { readFileSync } from "node:fs";
-import { Type } from "@sinclair/typebox";
-import {
-  createAgentSessionFromServices,
-  createAgentSessionRuntime,
-  createAgentSessionServices,
-  defineTool,
-  runRpcMode,
-  SessionManager,
-} from "@mariozechner/pi-coding-agent";
-
-const cwd = process.env.SYKE_RPC_CWD || process.cwd();
-const agentDir = process.env.PI_CODING_AGENT_DIR;
-const sessionDir = process.env.SYKE_RPC_SESSION_DIR || undefined;
-const provider = process.env.SYKE_RPC_PROVIDER || undefined;
-const modelSpec = process.env.SYKE_RPC_MODEL || undefined;
-const rubricSpecPath = process.env.SYKE_RPC_RUBRIC_SPEC_PATH || undefined;
-const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
-
-function splitModelSpec(spec) {
-  if (!spec) return { modelId: undefined, thinkingLevel: undefined };
-  const idx = spec.lastIndexOf(":");
-  if (idx === -1) return { modelId: spec, thinkingLevel: undefined };
-  const suffix = spec.slice(idx + 1);
-  if (!THINKING_LEVELS.has(suffix)) return { modelId: spec, thinkingLevel: undefined };
-  return { modelId: spec.slice(0, idx), thinkingLevel: suffix };
-}
-
-const { modelId, thinkingLevel } = splitModelSpec(modelSpec);
-
-// ── Build a TypeBox schema recursively from a JSON-schema dict. ──
-// Supports the subset emitted by rubric_engine.json_schema: objects with
-// ``properties``/``required``/``additionalProperties``, strings with
-// ``enum`` (→ Type.Union of Type.Literal) and ``minLength``. Any
-// unsupported shape falls back to Type.Any() — defensive, never
-// crashes.
-function buildTypeBoxFromJsonSchema(schema) {
-  if (!schema || typeof schema !== "object") return Type.Any();
-  if (schema.type === "string") {
-    if (Array.isArray(schema.enum) && schema.enum.length > 0) {
-      return Type.Union(schema.enum.map((v) => Type.Literal(v)));
-    }
-    const opts = {};
-    if (typeof schema.minLength === "number") opts.minLength = schema.minLength;
-    return Type.String(opts);
-  }
-  if (schema.type === "number") return Type.Number();
-  if (schema.type === "integer") return Type.Integer();
-  if (schema.type === "boolean") return Type.Boolean();
-  if (schema.type === "array") {
-    return Type.Array(buildTypeBoxFromJsonSchema(schema.items || {}));
-  }
-  if (schema.type === "object") {
-    const fields = {};
-    const props = schema.properties || {};
-    for (const [k, v] of Object.entries(props)) {
-      fields[k] = buildTypeBoxFromJsonSchema(v);
-    }
-    // Note: TypeBox doesn't distinguish required at the field level the
-    // same way JSON-schema does; Pi tool invocation expects the judge
-    // to supply every declared field, which matches JSON-schema's
-    // `required: [...all...]` contract the rubric engine emits.
-    return Type.Object(fields);
-  }
-  return Type.Any();
-}
-
-// ── Legacy v1 parameter block — fallback when no rubric spec is given. ──
-const legacyScoreDimension = Type.Object({
-  score: Type.Union([Type.Literal("strong"), Type.Literal("partial"), Type.Literal("missed")]),
-  reasoning: Type.String(),
-});
-const legacyParametersSchema = Type.Object({
-  factual_grounding: Type.Object({
-    score: Type.Union([Type.Literal("strong"), Type.Literal("partial"), Type.Literal("missed")]),
-    reasoning: Type.String(),
-    subcategories: Type.Object({
-      support: legacyScoreDimension,
-      boundedness: legacyScoreDimension,
-      uncertainty_calibration: legacyScoreDimension,
-    }),
-  }),
-  continuity: Type.Object({
-    score: Type.Union([Type.Literal("strong"), Type.Literal("partial"), Type.Literal("missed")]),
-    reasoning: Type.String(),
-    subcategories: Type.Object({
-      active_thread_selection: legacyScoreDimension,
-      salience_relevance: legacyScoreDimension,
-      state_transition_tracking: legacyScoreDimension,
-      forgetting_residue_control: legacyScoreDimension,
-      continuation_value: legacyScoreDimension,
-    }),
-  }),
-  coherence: Type.Object({
-    score: Type.Union([Type.Literal("strong"), Type.Literal("partial"), Type.Literal("missed")]),
-    reasoning: Type.String(),
-    subcategories: Type.Object({
-      cross_harness_braid: legacyScoreDimension,
-      cross_session_consistency: legacyScoreDimension,
-      artifact_routing_consistency: legacyScoreDimension,
-      contradiction_handling: legacyScoreDimension,
-    }),
-  }),
-  overall_verdict: Type.Union([
-    Type.Literal("pass"),
-    Type.Literal("partial"),
-    Type.Literal("fail"),
-  ]),
-  summary: Type.String({ minLength: 1 }),
-});
-
-function loadRubricParameters(path) {
-  if (!path) return null;
-  try {
-    const raw = readFileSync(path, "utf-8");
-    const schema = JSON.parse(raw);
-    return buildTypeBoxFromJsonSchema(schema);
-  } catch (err) {
-    // Be noisy in stderr but do not fail the judge — fall back to v1.
-    console.error(
-      `[submit_judge_verdict] failed to load rubric spec from ${path}: ${err.message}; `
-      + "falling back to legacy v1 schema."
-    );
-    return null;
-  }
-}
-
-const parametersSchema = loadRubricParameters(rubricSpecPath) || legacyParametersSchema;
-
-const verdictTool = defineTool({
-  name: "submit_judge_verdict",
-  label: "Submit Judge Verdict",
-  description: "Submit the final benchmark verdict in structured form.",
-  parameters: parametersSchema,
-  execute: async (_toolCallId, params) => ({
-    content: [{ type: "text", text: "judge verdict recorded" }],
-    details: params,
-  }),
-});
-
-const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
-  const services = await createAgentSessionServices({ cwd, agentDir });
-  const selectedModel = provider && modelId
-    ? services.modelRegistry.find(provider, modelId)
-    : undefined;
-  if (provider && modelId && !selectedModel) {
-    throw new Error(`Model not found in registry: ${provider}/${modelId}`);
-  }
-  return {
-    ...(await createAgentSessionFromServices({
-      services,
-      sessionManager,
-      sessionStartEvent,
-      model: selectedModel,
-      thinkingLevel,
-      customTools: [verdictTool],
-    })),
-    services,
-    diagnostics: services.diagnostics,
-  };
-};
-
-const runtime = await createAgentSessionRuntime(createRuntime, {
-  cwd,
-  agentDir,
-  sessionManager: SessionManager.create(cwd, sessionDir),
-});
-
-await runRpcMode(runtime);
-"""
+def remove_pi_bash_spills(paths: set[Path]) -> None:
+    """Remove spill files reported by one completed Syke operation."""
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to remove Pi bash spill %s: %s", path, exc)
 
 
 def _build_rpc_launch_command(
     *,
     provider: str | None,
     model: str,
-    runtime_profile: str | None,
+    thinking_level: str,
     session_dir: Path,
-    workspace_dir: Path,
+    self_learn_skill_path: Path,
+    tool_sandbox_profile: Path | None = None,
 ) -> tuple[list[str], dict[str, str]]:
-    if runtime_profile != "benchmark_judge":
-        cmd = [
-            resolve_pi_binary(),
-            "--mode",
-            "rpc",
+    syke_self_path = Path(__file__).parent.parent / "runtime" / "syke_self.md"
+    cmd = [resolve_pi_binary(), "--mode", "rpc"]
+    if provider:
+        cmd.extend(["--provider", provider])
+    cmd.extend(
+        [
+            "--model",
+            model,
+            "--thinking",
+            thinking_level,
+            "--session-dir",
+            str(session_dir),
+            "--system-prompt",
+            str(syke_self_path),
+            "--no-context-files",
+            "--no-skills",
+            "--skill",
+            str(self_learn_skill_path),
         ]
-        if provider:
-            cmd.extend(["--provider", provider])
+    )
+    extra_env: dict[str, str] = {}
+    if tool_sandbox_profile is not None:
+        extension = _pi_install._install_pi_tool_extension()
         cmd.extend(
             [
-                "--model",
-                model,
-                "--session-dir",
-                str(session_dir),
+                "--no-builtin-tools",
+                "--no-extensions",
+                "--extension",
+                str(extension),
             ]
         )
-        return cmd, {}
-
-    node_bin = ensure_node_binary()
-    extra_env = {
-        "SYKE_RPC_CWD": str(workspace_dir),
-        "SYKE_RPC_SESSION_DIR": str(session_dir),
-        "SYKE_RPC_MODEL": model,
-        "SYKE_PI_RUNTIME_PROFILE": "benchmark_judge",
-    }
-    if provider:
-        extra_env["SYKE_RPC_PROVIDER"] = provider
-    return [str(node_bin), "--input-type=module", "-e", _benchmark_judge_rpc_script()], extra_env
-
-
-def _load_pi_catalog() -> tuple[PiProviderCatalogEntry, ...]:
-    if not PI_PACKAGE_ROOT.exists():
-        return ()
-
-    script = """
-import { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
-import { getOAuthProviders } from "@mariozechner/pi-ai/oauth";
-import { defaultModelPerProvider } from
-  "./node_modules/@mariozechner/pi-coding-agent/dist/core/model-resolver.js";
-
-const authStorage = AuthStorage.create();
-const modelRegistry = ModelRegistry.create(authStorage);
-const allModels = modelRegistry.getAll();
-const availableModels = modelRegistry.getAvailable();
-const oauthProviders = getOAuthProviders();
-const oauthById = new Map(oauthProviders.map((provider) => [provider.id, provider]));
-const availableByProvider = new Map();
-for (const model of availableModels) {
-  const current = availableByProvider.get(model.provider) ?? [];
-  current.push(model.id);
-  availableByProvider.set(model.provider, current);
-}
-const grouped = new Map();
-for (const model of allModels) {
-  const current = grouped.get(model.provider) ?? [];
-  current.push(model.id);
-  grouped.set(model.provider, current);
-}
-const payload = Array.from(grouped.entries())
-  .sort((a, b) => a[0].localeCompare(b[0]))
-  .map(([provider, modelIds]) => {
-    const ids = [...new Set(modelIds)].sort();
-    const providerModels = allModels.filter((model) => model.provider === provider);
-    const preferred = defaultModelPerProvider[provider];
-    const defaultModel = preferred && ids.includes(preferred) ? preferred : (ids[0] ?? null);
-    const oauth = oauthById.get(provider);
-    return {
-      id: provider,
-      models: ids,
-      availableModels: [...new Set(availableByProvider.get(provider) ?? [])].sort(),
-      defaultModel,
-      oauth: Boolean(oauth),
-      oauthName: oauth?.name ?? null,
-      requiresBaseUrl: providerModels.some((model) => !String(model.baseUrl ?? "").trim())
-    };
-  });
-process.stdout.write(JSON.stringify(payload));
-"""
-    try:
-        result = _run_pi_node_script(script)
-    except Exception:
-        return ()
-
-    if result.returncode != 0:
-        logger.debug("Failed to query Pi catalog: %s", result.stderr.strip())
-        return ()
-
-    try:
-        raw = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return ()
-
-    if not isinstance(raw, list):
-        return ()
-
-    entries: list[PiProviderCatalogEntry] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        provider_id = item.get("id")
-        models = item.get("models")
-        available = item.get("availableModels")
-        if (
-            not isinstance(provider_id, str)
-            or not isinstance(models, list)
-            or not isinstance(available, list)
-        ):
-            continue
-        entries.append(
-            PiProviderCatalogEntry(
-                id=provider_id,
-                models=tuple(model for model in models if isinstance(model, str) and model),
-                available_models=tuple(
-                    model for model in available if isinstance(model, str) and model
-                ),
-                default_model=item.get("defaultModel")
-                if isinstance(item.get("defaultModel"), str)
-                else None,
-                oauth=bool(item.get("oauth")),
-                oauth_name=item.get("oauthName")
-                if isinstance(item.get("oauthName"), str)
-                else None,
-                requires_base_url=bool(item.get("requiresBaseUrl")),
-            )
-        )
-    return tuple(entries)
-
-
-def get_pi_provider_catalog() -> tuple[PiProviderCatalogEntry, ...]:
-    return _load_pi_catalog()
-
-
-def run_pi_oauth_login(provider_id: str, *, manual: bool = False) -> None:
-    """Run Pi's native OAuth login flow for a provider."""
-    script = """
-import readline from "node:readline/promises";
-import { stdin, stdout } from "node:process";
-import { AuthStorage } from "@mariozechner/pi-coding-agent";
-
-const provider = process.env.SYKE_PI_LOGIN_PROVIDER;
-const manual = process.env.SYKE_PI_LOGIN_MANUAL === "1";
-if (!provider) {
-  throw new Error("Missing SYKE_PI_LOGIN_PROVIDER");
-}
-
-const authStorage = AuthStorage.create();
-const rl = readline.createInterface({ input: stdin, output: stdout });
-
-try {
-  const callbacks = {
-    onAuth: (info) => {
-      console.log(`Open this URL to continue: ${info.url}`);
-      if (info.instructions) console.log(info.instructions);
-    },
-    onPrompt: async (prompt) => {
-      const placeholder = prompt.placeholder ? ` (${prompt.placeholder})` : "";
-      return await rl.question(`${prompt.message}${placeholder}: `);
-    },
-    onProgress: (message) => {
-      console.log(message);
-    }
-  };
-
-  if (manual) {
-    callbacks.onManualCodeInput = async () => {
-      return await rl.question("Paste the final redirect URL or authorization code: ");
-    };
-  }
-
-  await authStorage.login(provider, callbacks);
-} finally {
-  rl.close();
-}
-"""
-    result = subprocess.run(
-        [str(ensure_node_binary()), "--input-type=module", "-e", script],
-        text=True,
-        cwd=str(PI_LOCAL_PREFIX),
-        env=_build_subprocess_env(
-            build_pi_agent_env(
-                {
-                    "SYKE_PI_LOGIN_PROVIDER": provider_id,
-                    "SYKE_PI_LOGIN_MANUAL": "1" if manual else "0",
-                }
-            ),
-            provider=provider_id,
-        ),
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Pi login failed for {provider_id!r}")
-
-
-def probe_pi_provider_connection(
-    provider_id: str,
-    model_id: str,
-    *,
-    timeout_seconds: int = 45,
-    prompt: str = "Reply with only: ping",
-) -> tuple[bool, str]:
-    """Run a minimal non-tool Pi request to verify provider connectivity."""
-    try:
-        result = subprocess.run(
-            [
-                str(resolve_pi_binary()),
-                "--provider",
-                provider_id,
-                "--model",
-                model_id,
-                "--no-tools",
-                "-p",
-                prompt,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            cwd=str(PI_LOCAL_PREFIX),
-            env=_build_pi_process_env(provider=provider_id),
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"probe timed out after {timeout_seconds}s"
-    stdout = result.stdout.strip()
-    stderr = result.stderr.strip()
-    if result.returncode == 0 and stdout:
-        return True, stdout
-    detail = stderr or stdout or f"exit {result.returncode}"
-    return False, detail[:500]
-
-
-def _load_pi_provider_default_model(provider_name: str) -> str | None:
-    for entry in _load_pi_catalog():
-        if entry.id == provider_name:
-            return entry.default_model
-    return None
-
-
-def _load_pi_provider_model_ids(provider_name: str) -> tuple[str, ...]:
-    for entry in _load_pi_catalog():
-        if entry.id == provider_name:
-            return entry.models
-    return ()
-
-
-def _resolve_pi_launch_binding_for_request(
-    provider, requested_model: str, explicit_model: bool
-) -> PiLaunchBinding:
-    provider_name = _pi_provider_name(provider)
-
-    if provider_name is None:
-        return PiLaunchBinding(provider=None, model=requested_model)
-
-    known_model_ids = _load_pi_provider_model_ids(provider_name)
-    if not known_model_ids:
-        return PiLaunchBinding(provider=provider_name, model=requested_model)
-
-    resolved_model = _match_pi_model_pattern(provider_name, requested_model, known_model_ids)
-    if resolved_model:
-        return PiLaunchBinding(provider=provider_name, model=resolved_model)
-
-    if explicit_model:
-        return PiLaunchBinding(provider=provider_name, model=requested_model)
-
-    example_text = _format_model_examples(known_model_ids)
-    provider_id = getattr(provider, "id", provider_name)
-    raise RuntimeError(
-        f"Configured synthesis model {requested_model!r} is not a known Pi model for provider "
-        f"{provider_name!r}. Set Pi defaultModel for {provider_id!r} to an exact Pi model ID"
-        f" like {example_text}."
-    )
-
-
-def resolve_pi_launch_binding(model_override: str | None = None) -> PiLaunchBinding:
-    provider = _get_active_provider_spec()
-    requested_model, explicit_model = _raw_pi_model_request(model_override)
-    return _resolve_pi_launch_binding_for_request(provider, requested_model, explicit_model)
-
-
-def resolve_pi_model(model_override: str | None = None) -> str:
-    """Resolve the Pi model from override -> config -> exact provider-scoped model."""
-    return resolve_pi_launch_binding(model_override).model
-
-
-def resolve_pi_provider(model_override: str | None = None) -> str | None:
-    """Resolve the active Pi provider name for runtime launch."""
-    return resolve_pi_launch_binding(model_override).provider
-
-
-PI_PACKAGE = "@mariozechner/pi-coding-agent"
-PI_LOCAL_PREFIX = Path.home() / ".syke" / "pi"
-PI_BIN = Path.home() / ".syke" / "bin" / "pi"
-PI_NODE_BIN = Path.home() / ".syke" / "bin" / "node"
-PI_PACKAGE_ROOT = PI_LOCAL_PREFIX / "node_modules" / "@mariozechner" / "pi-coding-agent"
-PI_CLI_JS = PI_PACKAGE_ROOT / "dist" / "cli.js"
-
-_NODE_CANDIDATES = [
-    Path("/opt/homebrew/bin/node"),
-    Path("/usr/local/bin/node"),
-    Path("/usr/bin/node"),
-]
-_NPM_CANDIDATES = [
-    Path("/opt/homebrew/bin/npm"),
-    Path("/usr/local/bin/npm"),
-    Path("/usr/bin/npm"),
-]
-_NODE_REQUIREMENT = "Node.js 20+ with RegExp 'v' flag support (22 LTS recommended)"
-
-
-def _find_executable(name: str, candidates: list[Path]) -> Path | None:
-    resolved = shutil.which(name)
-    if resolved:
-        path = Path(resolved).expanduser().resolve()
-        if path.exists() and os.access(path, os.X_OK):
-            return path
-
-    for candidate in candidates:
-        if candidate.exists() and os.access(candidate, os.X_OK):
-            return candidate.resolve()
-    return None
-
-
-def _ensure_symlink(link_path: Path, target_path: Path) -> Path:
-    link_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if link_path.is_symlink():
-        try:
-            if link_path.resolve() == target_path.resolve() and os.access(link_path, os.X_OK):
-                return link_path
-        except OSError:
-            pass
-        link_path.unlink()
-    elif link_path.exists():
-        if link_path.resolve() == target_path.resolve() and os.access(link_path, os.X_OK):
-            return link_path
-        link_path.unlink()
-
-    link_path.symlink_to(target_path)
-    return link_path
-
-
-def _node_version_text(node: Path) -> str:
-    try:
-        result = subprocess.run(
-            [str(node), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        return "unknown version"
-    version = (result.stdout or result.stderr).strip()
-    return version or "unknown version"
-
-
-def _node_supports_pi_runtime(node: Path) -> tuple[bool, str]:
-    try:
-        result = subprocess.run(
-            [str(node), "-e", "new RegExp('', 'v');"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception as exc:
-        return False, str(exc)
-    if result.returncode == 0:
-        return True, _node_version_text(node)
-    detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
-    return False, f"{_node_version_text(node)}: {detail[:300]}"
-
-
-def _require_supported_node(node: Path) -> Path:
-    supported, detail = _node_supports_pi_runtime(node)
-    if not supported:
-        raise RuntimeError(f"Syke's Pi runtime requires {_NODE_REQUIREMENT}. Found {detail}")
-    return node
-
-
-def ensure_node_binary() -> Path:
-    """Return a stable absolute Node path Syke can use outside shell-managed PATH."""
-    if PI_NODE_BIN.exists() and os.access(PI_NODE_BIN, os.X_OK):
-        supported, detail = _node_supports_pi_runtime(PI_NODE_BIN)
-        if supported:
-            return PI_NODE_BIN
-        if PI_NODE_BIN.is_symlink():
-            PI_NODE_BIN.unlink()
-        else:
-            raise RuntimeError(f"Syke's Pi runtime requires {_NODE_REQUIREMENT}. Found {detail}")
-
-    node = _find_executable("node", _NODE_CANDIDATES)
-    if node is None:
-        raise RuntimeError(
-            f"Syke's Pi runtime requires {_NODE_REQUIREMENT}. Install from https://nodejs.org"
-        )
-    return _ensure_symlink(PI_NODE_BIN, _require_supported_node(node))
-
-
-def _resolve_npm_binary() -> str:
-    npm = _find_executable("npm", _NPM_CANDIDATES)
-    if npm is None:
-        raise RuntimeError(
-            "Syke's Pi runtime requires npm to install Pi locally. Install Node.js from "
-            "https://nodejs.org"
-        )
-    return str(npm)
-
-
-def _write_pi_launcher(node_bin: Path) -> Path:
-    """Write the stable Pi launcher Syke uses for shell and daemon paths."""
-    if not PI_CLI_JS.exists():
-        raise RuntimeError(f"Pi CLI entrypoint not found at {PI_CLI_JS}")
-
-    PI_BIN.parent.mkdir(parents=True, exist_ok=True)
-    if PI_BIN.is_symlink():
-        PI_BIN.unlink()
-    elif PI_BIN.exists() and not PI_BIN.is_file():
-        PI_BIN.unlink()
-    launcher = f'#!/bin/sh\nexec "{node_bin}" "{PI_CLI_JS}" "$@"\n'
-    PI_BIN.write_text(launcher, encoding="utf-8")
-    PI_BIN.chmod(PI_BIN.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return PI_BIN
-
-
-def ensure_pi_binary() -> str:
-    """Install Pi locally under ~/.syke/ and return a stable launcher path."""
-    node_bin = ensure_node_binary()
-
-    if PI_BIN.exists() and os.access(PI_BIN, os.X_OK) and PI_CLI_JS.exists():
-        _write_pi_launcher(node_bin)
-        return str(PI_BIN)
-
-    if PI_CLI_JS.exists():
-        _write_pi_launcher(node_bin)
-        return str(PI_BIN)
-
-    npm = _resolve_npm_binary()
-
-    logger.info("Installing Pi runtime to %s", PI_LOCAL_PREFIX)
-    PI_LOCAL_PREFIX.mkdir(parents=True, exist_ok=True)
-
-    result = subprocess.run(
-        [npm, "install", "--prefix", str(PI_LOCAL_PREFIX), PI_PACKAGE],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to install Pi runtime: {result.stderr.strip()[:500]}")
-
-    if not PI_CLI_JS.exists():
-        raise RuntimeError(f"Pi CLI entrypoint not found after install at {PI_CLI_JS}")
-
-    _write_pi_launcher(node_bin)
-    logger.info("Pi runtime installed: %s -> node=%s cli=%s", PI_BIN, node_bin, PI_CLI_JS)
-    return str(PI_BIN)
-
-
-def resolve_pi_binary() -> str:
-    """Find or install the Pi binary at ~/.syke/bin/pi."""
-    return ensure_pi_binary()
-
-
-def get_pi_version(*, install: bool = False, minimal_env: bool = False, timeout: int = 10) -> str:
-    """Return Pi version through Syke's stable launcher.
-
-    When ``minimal_env`` is true, simulate a launchd-style cold environment with
-    a stripped PATH to catch shell-dependent runtime failures.
-    """
-    launcher = Path(ensure_pi_binary() if install else PI_BIN)
-    if not launcher.exists():
-        raise FileNotFoundError(f"Pi launcher not found at {launcher}")
-
-    env: dict[str, str] | None = None
-    if minimal_env:
-        env = {
-            "HOME": str(Path.home()),
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-        }
-
-    result = subprocess.run(
-        [str(launcher), "--version"],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-        raise RuntimeError(detail[:500])
-    return result.stdout.strip() or result.stderr.strip() or "unknown"
-
-
-def _build_subprocess_env(
-    runtime_env: dict[str, str],
-    *,
-    provider: str | None = None,
-) -> dict[str, str]:
-    """Build a bounded child env for Pi instead of inheriting the full host shell."""
-    return build_child_process_env(runtime_env, provider=provider)
-
-
-def _build_pi_process_env(
-    runtime_env: dict[str, str] | None = None,
-    *,
-    provider: str | None = None,
-) -> dict[str, str]:
-    """Build the exact Pi child-process env used by both probe and runtime launch."""
-    resolved_provider = provider or _pi_provider_name(_get_active_provider_spec())
-    return _build_subprocess_env(
-        runtime_env or build_pi_agent_env(),
-        provider=resolved_provider,
-    )
-
-
-def _extract_assistant_message(event: dict[str, Any]) -> dict[str, Any] | None:
-    event_type = event.get("type")
-    if event_type in {"message", "message_start", "message_end", "turn_end"}:
-        message = event.get("message")
-        if isinstance(message, dict) and message.get("role") == "assistant":
-            return message
-        return None
-
-    if event_type == "agent_end":
-        messages = event.get("messages")
-        if isinstance(messages, list):
-            for candidate in reversed(messages):
-                if isinstance(candidate, dict) and candidate.get("role") == "assistant":
-                    return candidate
-        return None
-
-    if event_type != "message_update":
-        return None
-
-    message = event.get("message")
-    if isinstance(message, dict) and message.get("role") == "assistant":
-        return message
-
-    inner = _extract_message_update_event(event)
-    if not isinstance(inner, dict):
-        return None
-    for key in ("message", "partial"):
-        candidate = inner.get(key)
-        if isinstance(candidate, dict) and candidate.get("role") == "assistant":
-            return candidate
-    return None
-
-
-def _extract_message_update_event(event: dict[str, Any]) -> dict[str, Any] | None:
-    if event.get("type") != "message_update":
-        return None
-    for key in ("assistantMessageEvent", "event"):
-        inner = event.get(key)
-        if isinstance(inner, dict):
-            return inner
-    return None
-
-
-def _extract_message_text(message: dict[str, Any]) -> str:
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-
-    chunks: list[str] = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        block_type = block.get("type")
-        if block_type == "text" and isinstance(block.get("text"), str):
-            chunks.append(block["text"])
-        elif block_type in {"thinking", "reasoning"} and isinstance(block.get("text"), str):
-            chunks.append(block["text"])
-    return "".join(chunks)
-
-
-def _extract_usage_int(usage: dict[str, Any], *keys: str) -> int | None:
-    for key in keys:
-        value = usage.get(key)
-        if isinstance(value, int):
-            return value
-    return None
-
-
-def _is_retryable_pi_error(error_message: str) -> bool:
-    return bool(
-        re.search(
-            r"overloaded|provider.?returned.?error|rate.?limit"
-            r"|too many requests|429|500|502|503|504"
-            r"|service.?unavailable|server.?error|internal.?error"
-            r"|network.?error|connection.?error|connection.?refused"
-            r"|other side closed|fetch failed|upstream.?connect"
-            r"|reset before headers|socket hang up"
-            r"|timed? out|timeout|terminated|retry delay",
-            error_message,
-            re.IGNORECASE,
-        )
-    )
-
-
-def _extract_tool_invocation(event: dict[str, Any]) -> dict[str, Any] | None:
-    event_type = event.get("type")
-    if event_type in {"tool_execution_start", "tool_call"}:
-        tool = event.get("toolExecution")
-        if not isinstance(tool, dict):
-            tool = event.get("toolCall")
-        if not isinstance(tool, dict):
-            return None
-        name = tool.get("name") or tool.get("toolName") or "tool"
-        return {
-            "name": str(name),
-            "input": tool.get("input"),
-            "id": tool.get("id"),
-        }
-
-    inner = _extract_message_update_event(event)
-    if not isinstance(inner, dict) or inner.get("type") != "toolcall_start":
-        return None
-
-    tool = inner.get("toolCall")
-    if not isinstance(tool, dict):
-        return None
-    name = tool.get("toolName") or tool.get("name") or "tool"
-    return {
-        "name": str(name),
-        "input": tool.get("input") or tool.get("arguments"),
-        "id": tool.get("id"),
-    }
-
-
-def _extract_tool_invocations_from_message(message: dict[str, Any]) -> list[dict[str, Any]]:
-    if message.get("role") != "assistant":
-        return []
-
-    content = message.get("content")
-    if not isinstance(content, list):
-        return []
-
-    invocations: list[dict[str, Any]] = []
-    for block in content:
-        if not isinstance(block, dict) or block.get("type") != "toolCall":
-            continue
-        name = block.get("name") or block.get("toolName") or "tool"
-        invocations.append(
-            {
-                "name": str(name),
-                "input": block.get("arguments") or block.get("input"),
-                "id": block.get("id"),
-            }
-        )
-    return invocations
-
-
-def _dedupe_tool_invocations(invocations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for invocation in invocations:
-        key = str(invocation.get("id") or json.dumps(invocation, sort_keys=True))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(invocation)
-    return deduped
-
-
-def _message_content_to_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-
-    parts: list[str] = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") == "text" and isinstance(block.get("text"), str):
-            parts.append(block["text"])
-    return "".join(parts)
-
-
-def build_transcript(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    transcript: list[dict[str, Any]] = []
-
-    for event in events:
-        if event.get("type") != "message":
-            continue
-
-        message = event.get("message")
-        if not isinstance(message, dict):
-            continue
-
-        role = message.get("role")
-        if role == "assistant":
-            blocks: list[dict[str, Any]] = []
-            content = message.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    block_type = block.get("type")
-                    if block_type in {"thinking", "reasoning"}:
-                        thinking_text = block.get("text") or block.get("thinking")
-                        if isinstance(thinking_text, str) and thinking_text:
-                            blocks.append({"type": "thinking", "text": thinking_text})
-                    elif block_type == "text":
-                        text = block.get("text")
-                        if isinstance(text, str) and text:
-                            blocks.append({"type": "text", "text": text})
-                    elif block_type == "toolCall":
-                        raw_input = block.get("arguments") or block.get("input") or {}
-                        tool_input = raw_input if isinstance(raw_input, dict) else {}
-                        blocks.append(
-                            {
-                                "type": "tool_use",
-                                "name": str(block.get("name") or block.get("toolName") or "tool"),
-                                "input": dict(tool_input),
-                            }
-                        )
-            if blocks:
-                transcript.append({"role": "assistant", "blocks": blocks})
-            continue
-
-        if role == "toolResult":
-            tool_name = message.get("toolName")
-            content_text = _message_content_to_text(message.get("content"))
-            transcript.append(
-                {
-                    "role": "user",
-                    "blocks": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": message.get("toolCallId"),
-                            "tool_name": str(tool_name) if tool_name is not None else None,
-                            "content": content_text,
-                            "is_error": bool(message.get("isError", False)),
-                        }
-                    ],
-                }
-            )
-            continue
-
-        if role == "user":
-            text = _message_content_to_text(message.get("content"))
-            if text:
-                transcript.append({"role": "user", "blocks": [{"type": "text", "text": text}]})
-
-    return transcript
-
-
-def build_transcript_from_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return build_transcript(
-        [
-            {"type": "message", "message": message}
-            for message in messages
-            if isinstance(message, dict)
-        ]
-    )
-
-
-class RpcEventStream:
-    """Threaded reader for Pi's JSONL RPC stream."""
-
-    def __init__(self, stdout):
-        self._stdout = stdout
-        self._events: list[dict[str, Any]] = []
-        self._lock = threading.Lock()
-        self._done = threading.Event()
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._error: str | None = None
-        self._last_reset_at = time.monotonic()
-        self._callback: Callable[[dict[str, Any]], None] | None = None
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def set_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
-        with self._lock:
-            self._callback = callback
-
-    def _read_loop(self) -> None:
-        try:
-            for line in self._stdout:
-                received_at = time.monotonic()
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.debug("Non-JSON line from Pi: %s", line[:200])
-                    continue
-
-                callback: Callable[[dict[str, Any]], None] | None = None
-                with self._lock:
-                    if received_at < self._last_reset_at:
-                        continue
-                    self._events.append(event)
-                    callback = self._callback
-
-                    event_type = event.get("type", "")
-                    if event_type == "agent_end":
-                        self._done.set()
-                    elif event_type == "error":
-                        self._error = event.get("message", "Unknown Pi error")
-                    elif event_type == "response" and event.get("success") is False:
-                        self._error = event.get("error", "Pi command failed")
-
-                if callback is not None:
-                    try:
-                        callback(event)
-                    except Exception:
-                        logger.debug("Pi event callback failed", exc_info=True)
-        except Exception as exc:
-            self._error = str(exc)
-            self._done.set()
-
-    def wait(self, timeout: float | None = None) -> bool:
-        return self._done.wait(timeout=timeout)
-
-    def reset(self) -> None:
-        time.sleep(0.1)
-        with self._lock:
-            self._events.clear()
-            self._done.clear()
-            self._error = None
-            self._last_reset_at = time.monotonic()
-
-    @property
-    def events(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return list(self._events)
-
-    @property
-    def error(self) -> str | None:
-        return self._error
-
-    def get_output(self) -> str:
-        text_deltas: list[str] = []
-        final_text: str | None = None
-
-        for event in self.events:
-            if event.get("type") == "text":
-                content = event.get("content")
-                if isinstance(content, str):
-                    text_deltas.append(content)
-                continue
-
-            inner = _extract_message_update_event(event)
-            if not isinstance(inner, dict):
-                continue
-
-            if inner.get("type") == "text_delta":
-                delta = inner.get("delta")
-                if isinstance(delta, str):
-                    text_deltas.append(delta)
-
-            message = _extract_assistant_message(event)
-            if not isinstance(message, dict):
-                continue
-            message_text = _extract_message_text(message)
-            if message_text:
-                final_text = message_text
-
-        if final_text:
-            return final_text.strip()
-        if text_deltas:
-            return "".join(text_deltas).strip()
-        return ""
-
-    def get_thinking_chunks(self) -> list[str]:
-        chunks: list[str] = []
-        for event in self.events:
-            inner = _extract_message_update_event(event)
-            if not isinstance(inner, dict):
-                continue
-            if inner.get("type") == "thinking_delta":
-                delta = inner.get("delta")
-                if isinstance(delta, str) and delta:
-                    chunks.append(delta)
-        return chunks
-
-    def get_tool_calls(self) -> list[dict[str, Any]]:
-        calls: list[dict[str, Any]] = []
-        for event in self.events:
-            event_type = event.get("type")
-            if event_type in {"tool_call", "tool_execution_start"}:
-                calls.append(event)
-                continue
-            if event_type == "message":
-                message = event.get("message")
-                if isinstance(message, dict):
-                    for invocation in _extract_tool_invocations_from_message(message):
-                        calls.append(
-                            {
-                                "type": "tool_call",
-                                "toolCall": {
-                                    "id": invocation.get("id"),
-                                    "name": invocation.get("name"),
-                                    "input": invocation.get("input"),
-                                },
-                            }
-                        )
-                continue
-            inner = _extract_message_update_event(event)
-            if not isinstance(inner, dict):
-                continue
-            if inner.get("type") in {"toolcall_start", "toolcall_end"}:
-                calls.append(event)
-        return calls
-
-    def get_tool_invocations(self) -> list[dict[str, Any]]:
-        invocations: list[dict[str, Any]] = []
-        for event in self.events:
-            if event.get("type") == "message":
-                message = event.get("message")
-                if isinstance(message, dict):
-                    invocations.extend(_extract_tool_invocations_from_message(message))
-            invocation = _extract_tool_invocation(event)
-            if invocation is not None:
-                invocations.append(invocation)
-        return _dedupe_tool_invocations(invocations)
-
-    def get_usage(self) -> dict[str, int | float | None]:
-        latest_message: dict[str, Any] | None = None
-        for event in self.events:
-            message = _extract_assistant_message(event)
-            if isinstance(message, dict):
-                latest_message = message
-
-        if latest_message is None:
-            return {
-                "input_tokens": None,
-                "output_tokens": None,
-                "cache_read_tokens": None,
-                "cache_write_tokens": None,
-                "cost_usd": None,
-            }
-
-        usage = latest_message.get("usage")
-        if not isinstance(usage, dict):
-            usage = {}
-        cost = latest_message.get("cost")
-        if not isinstance(cost, dict):
-            cost = usage.get("cost") if isinstance(usage.get("cost"), dict) else {}
-
-        return {
-            "input_tokens": _extract_usage_int(usage, "input_tokens", "input"),
-            "output_tokens": _extract_usage_int(usage, "output_tokens", "output"),
-            "cache_read_tokens": _extract_usage_int(usage, "cache_read_tokens", "cacheRead"),
-            "cache_write_tokens": _extract_usage_int(usage, "cache_write_tokens", "cacheWrite"),
-            "cost_usd": cost.get("total") if isinstance(cost.get("total"), (int, float)) else None,
-        }
-
-    def get_assistant_error(self) -> str | None:
-        latest_message: dict[str, Any] | None = None
-        for event in self.events:
-            message = _extract_assistant_message(event)
-            if isinstance(message, dict):
-                latest_message = message
-        if latest_message is None:
-            return None
-        if latest_message.get("stopReason") == "error":
-            error_message = latest_message.get("errorMessage")
-            if isinstance(error_message, str) and error_message:
-                return error_message
-            return "Pi assistant message ended with stopReason=error"
-        return None
-
-    def get_message_metadata(self) -> dict[str, str | None]:
-        latest_message: dict[str, Any] | None = None
-        for event in self.events:
-            message = _extract_assistant_message(event)
-            if isinstance(message, dict):
-                latest_message = message
-
-        if latest_message is None:
-            return {"provider": None, "model": None, "response_id": None, "stop_reason": None}
-
-        provider = latest_message.get("provider")
-        model = latest_message.get("model")
-        response_id = latest_message.get("responseId")
-        stop_reason = latest_message.get("stopReason")
-        return {
-            "provider": provider if isinstance(provider, str) else None,
-            "model": model if isinstance(model, str) else None,
-            "response_id": response_id if isinstance(response_id, str) else None,
-            "stop_reason": stop_reason if isinstance(stop_reason, str) else None,
-        }
-
-    def has_retry_in_progress(self) -> bool:
-        last_retry_start = -1
-        last_retry_end = -1
-        for index, event in enumerate(self.events):
-            event_type = event.get("type")
-            if event_type == "auto_retry_start":
-                last_retry_start = index
-            elif event_type == "auto_retry_end":
-                last_retry_end = index
-        return last_retry_start > last_retry_end
-
-    def latest_retry_terminal_error(self) -> str | None:
-        last_retry_end: dict[str, Any] | None = None
-        for event in self.events:
-            if event.get("type") == "auto_retry_end":
-                last_retry_end = event
-        if last_retry_end is None:
-            return None
-        if last_retry_end.get("success") is True:
-            return None
-        final_error = last_retry_end.get("finalError")
-        if isinstance(final_error, str) and final_error:
-            return final_error
-        return "Pi auto-retry failed"
-
-    def latest_agent_end_is_retryable_error(self) -> bool:
-        last_agent_end: dict[str, Any] | None = None
-        for event in self.events:
-            if event.get("type") == "agent_end":
-                last_agent_end = event
-        if last_agent_end is None:
-            return False
-        messages = last_agent_end.get("messages")
-        if not isinstance(messages, list):
-            return False
-        last_assistant: dict[str, Any] | None = None
-        for message in messages:
-            if isinstance(message, dict) and message.get("role") == "assistant":
-                last_assistant = message
-        if last_assistant is None:
-            return False
-        if last_assistant.get("stopReason") != "error":
-            return False
-        error_message = last_assistant.get("errorMessage")
-        if not isinstance(error_message, str) or not error_message:
-            return False
-        return _is_retryable_pi_error(error_message)
-
-    def wait_for_terminal_state(self, timeout: float | None = None) -> bool:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            remaining = None if deadline is None else max(deadline - time.monotonic(), 0.0)
-            if remaining == 0.0:
-                return False
-            completed = self.wait(timeout=remaining)
-            if not completed:
-                return False
-            if self.latest_retry_terminal_error() is not None:
-                return True
-            if self.has_retry_in_progress():
-                self._done.clear()
-                continue
-            if self.latest_agent_end_is_retryable_error():
-                grace = _RETRY_SETTLEMENT_GRACE_SECONDS
-                if deadline is not None:
-                    grace = min(grace, max(deadline - time.monotonic(), 0.0))
-                if grace > 0:
-                    time.sleep(grace)
-                if self.latest_retry_terminal_error() is not None:
-                    return True
-                if self.has_retry_in_progress():
-                    self._done.clear()
-                    continue
-                return True
-            return True
-
-
-class _StderrDrain:
-    """Threaded stderr reader to prevent Pi from blocking on a full pipe."""
-
-    def __init__(self, stderr):
-        self._stderr = stderr
-        self._lines: list[str] = []
-        self._lock = threading.Lock()
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def _read_loop(self) -> None:
-        try:
-            for line in self._stderr:
-                line = line.rstrip()
-                if not line:
-                    continue
-                with self._lock:
-                    self._lines.append(line)
-                logger.debug("Pi stderr: %s", line)
-        except Exception as exc:
-            logger.debug("Pi stderr drain stopped: %s", exc)
-
-    def get_output(self) -> str:
-        with self._lock:
-            return "\n".join(self._lines)
+        extra_env["SYKE_TOOL_SANDBOX_PROFILE"] = str(tool_sandbox_profile)
+    return cmd, extra_env
 
 
 class PiRuntime:
@@ -1458,30 +158,30 @@ class PiRuntime:
     def __init__(
         self,
         workspace_dir: str | Path,
-        session_dir: str | Path | None = None,
+        session_dir: str | Path,
         model: str | None = None,
-        runtime_profile: str | None = None,
-        selected_sources: tuple[str, ...] | None = None,
     ):
-        self.workspace_dir = Path(workspace_dir)
-        self.session_dir = Path(session_dir) if session_dir else self.workspace_dir / "sessions"
+        self.workspace_dir = Path(workspace_dir).expanduser().resolve()
+        self.session_dir = Path(session_dir).expanduser().resolve()
+        if self.session_dir == self.workspace_dir or self.session_dir.is_relative_to(
+            self.workspace_dir
+        ):
+            raise ValueError("Pi session history must be outside the controller workspace")
         self._model_override = model
-        self.runtime_profile = runtime_profile
-        self.selected_sources = selected_sources
         self._binding_error: str | None = None
         try:
             binding = resolve_pi_launch_binding(model)
         except RuntimeError as exc:
             self._binding_error = str(exc)
-            provider = _get_active_provider_spec()
-            self.provider = _pi_provider_name(provider)
-            self.model = _raw_pi_model_request(model)[0]
+            provider = _pi_catalog._get_active_provider_spec()
+            self.provider = _pi_catalog._pi_provider_name(provider)
+            self.model = _pi_catalog._raw_pi_model_request(model)[0]
         else:
             self.provider = binding.provider
             self.model = binding.model
         self._process: subprocess.Popen[str] | None = None
         self._stream: RpcEventStream | None = None
-        self._stderr_drain: _StderrDrain | None = None
+        self._stderr_drain: _pi_rpc._StderrDrain | None = None
         self._sandbox_profile_path: Path | None = None
         self._started_at: float | None = None
         self._last_start_duration_ms: int | None = None
@@ -1505,51 +205,58 @@ class PiRuntime:
         self._binding_error = None
         self.provider = binding.provider
         self.model = binding.model
+        _pi_catalog._prepare_host_oauth_for_runtime(self.provider)
         runtime_env = configure_pi_workspace(
             self.workspace_dir,
             session_dir=self.session_dir,
-            model_override=self.model,
         )
-
-        cmd, extra_env = _build_rpc_launch_command(
-            provider=self.provider,
-            model=self.model,
-            runtime_profile=self.runtime_profile,
-            session_dir=self.session_dir,
-            workspace_dir=self.workspace_dir,
+        self_learn_skill_path = (
+            Path(runtime_env["PI_CODING_AGENT_DIR"]) / "skills" / "self-learn" / "SKILL.md"
         )
+        control_root = self.session_dir.parent
+        runtime_root = control_root / "runtime"
 
-        logger.info(
-            "Starting runtime: %s/%s%s",
-            self.provider or "auto",
-            self.model,
-            f" [{self.runtime_profile}]" if self.runtime_profile else "",
-        )
-
-        env = _build_pi_process_env({**runtime_env, **extra_env}, provider=self.provider)
-
-        # Wrap with OS sandbox if available
-        from syke.runtime.sandbox import sandbox_available, wrap_command, write_sandbox_profile
+        from syke.runtime.sandbox import sandbox_enabled, write_sandbox_profile
 
         sandbox_profile = None
-        if sandbox_available() and not os.environ.get("SYKE_DISABLE_SANDBOX"):
+        if sandbox_enabled():
+            preview_env = _pi_catalog._build_pi_process_env(runtime_env, provider=self.provider)
             sandbox_profile = write_sandbox_profile(
                 self.workspace_dir,
-                selected_sources=self.selected_sources,
-                extra_temp_dirs=temp_paths_from_env(env),
+                control_root=control_root,
+                runtime_root=runtime_root,
+                extra_temp_dirs=temp_paths_from_env(preview_env),
             )
             if sandbox_profile:
                 self._sandbox_profile_path = sandbox_profile
-                cmd = wrap_command(cmd, sandbox_profile)
-                logger.info("Pi launching inside OS sandbox")
+
+        try:
+            cmd, extra_env = _build_rpc_launch_command(
+                provider=self.provider,
+                model=self.model,
+                thinking_level=SYNC_THINKING_LEVEL,
+                session_dir=self.session_dir,
+                self_learn_skill_path=self_learn_skill_path,
+                tool_sandbox_profile=sandbox_profile,
+            )
+        except Exception:
+            self._cleanup_sandbox_profile()
+            raise
+
+        logger.info(
+            "Starting runtime: %s/%s",
+            self.provider or "auto",
+            self.model,
+        )
+
+        env = _pi_catalog._build_pi_process_env(
+            {**runtime_env, **extra_env}, provider=self.provider
+        )
+
+        if sandbox_profile:
+            logger.info("Pi host is unsandboxed; model tools use the OS sandbox")
 
         logger.debug("Pi runtime command: %s", " ".join(cmd))
-
-        launch_cwd = (
-            str(PI_LOCAL_PREFIX)
-            if self.runtime_profile == "benchmark_judge"
-            else str(self.workspace_dir)
-        )
 
         try:
             self._process = subprocess.Popen(
@@ -1557,7 +264,7 @@ class PiRuntime:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                cwd=launch_cwd,
+                cwd=str(self.workspace_dir),
                 env=env,
                 bufsize=1,
                 text=True,
@@ -1567,7 +274,7 @@ class PiRuntime:
                 raise RuntimeError("Pi failed to expose stdio pipes")
 
             self._stream = RpcEventStream(self._process.stdout)
-            self._stderr_drain = _StderrDrain(self._process.stderr)
+            self._stderr_drain = _pi_rpc._StderrDrain(self._process.stderr)
             self._stream.start()
             self._stderr_drain.start()
             self._started_at = time.time()
@@ -1655,13 +362,14 @@ class PiRuntime:
         response = self._send_request({"type": "get_session_stats"}, timeout=timeout)
         return response if isinstance(response, dict) else {}
 
-    def get_messages(self, *, timeout: float = 10.0) -> list[dict[str, Any]]:
-        """Fetch all messages for the current Pi session."""
-        response = self._send_request({"type": "get_messages"}, timeout=timeout)
-        messages = response.get("messages")
-        if not isinstance(messages, list):
-            return []
-        return [message for message in messages if isinstance(message, dict)]
+    def get_state(self, *, timeout: float = 10.0) -> dict[str, Any]:
+        """Fetch Pi's current native session identity and runtime state."""
+        response = self._send_request({"type": "get_state"}, timeout=timeout)
+        return response if isinstance(response, dict) else {}
+
+    def set_session_name(self, name: str, *, timeout: float = 10.0) -> None:
+        """Write a correlation name into Pi's native session."""
+        self._send_request({"type": "set_session_name", "name": name}, timeout=timeout)
 
     def prompt(
         self,
@@ -1670,27 +378,28 @@ class PiRuntime:
         timeout: float | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         new_session: bool = False,
+        session_name: str | None = None,
     ) -> PiCycleResult:
         """Send a prompt to Pi and wait for completion."""
         with self._prompt_lock:
             if not self.is_alive or self._stream is None:
                 raise RuntimeError("Pi runtime is not running")
 
+            session_state: dict[str, Any] = {}
             if new_session:
                 self._stream.set_callback(None)
                 self._stream.reset()
                 self.new_session(timeout=min(timeout or 30.0, 30.0))
+                if session_name:
+                    self.set_session_name(session_name, timeout=min(timeout or 10.0, 10.0))
+                session_state = self.get_state(timeout=min(timeout or 10.0, 10.0))
 
             self._stream.set_callback(on_event)
             self._stream.reset()
 
             self._send({"type": "prompt", "message": text})
             start = time.time()
-            wait_for_terminal_state = getattr(self._stream, "wait_for_terminal_state", None)
-            if callable(wait_for_terminal_state):
-                completed = wait_for_terminal_state(timeout=timeout)
-            else:
-                completed = self._stream.wait(timeout=timeout)
+            completed = self._stream.wait(timeout=timeout)
             duration_ms = int((time.time() - start) * 1000)
 
             events = self._stream.events
@@ -1711,9 +420,10 @@ class PiRuntime:
                     status="timeout",
                     output=self._stream.get_output(),
                     thinking=self._stream.get_thinking_chunks(),
-                    tool_calls=_dedupe_tool_invocations(self._stream.get_tool_invocations()),
+                    tool_calls=_pi_rpc._dedupe_tool_invocations(
+                        self._stream.get_tool_invocations()
+                    ),
                     events=events,
-                    transcript=[],
                     num_turns=0,
                     duration_ms=duration_ms,
                     input_tokens=usage["input_tokens"],
@@ -1725,6 +435,9 @@ class PiRuntime:
                     response_model=response_model,
                     response_id=response_id,
                     stop_reason=stop_reason,
+                    session_id=session_state.get("sessionId"),
+                    session_file=session_state.get("sessionFile"),
+                    session_name=session_state.get("sessionName"),
                     error=timeout_error,
                 )
                 self._stream.set_callback(None)
@@ -1732,19 +445,9 @@ class PiRuntime:
                 return result
 
             session_stats = self.get_session_stats(timeout=min(timeout or 10.0, 10.0))
-            session_messages = self.get_messages(timeout=min(timeout or 10.0, 10.0))
-            transcript = build_transcript_from_messages(session_messages)
-            tool_calls: list[dict[str, Any]] = []
-            for message in session_messages:
-                tool_calls.extend(_extract_tool_invocations_from_message(message))
-            tool_calls.extend(self._stream.get_tool_invocations())
-            tool_calls = _dedupe_tool_invocations(tool_calls)
+            tool_calls = _pi_rpc._dedupe_tool_invocations(self._stream.get_tool_invocations())
             assistant_messages = session_stats.get("assistantMessages")
-            transcript_turns = sum(1 for item in transcript if item.get("role") == "assistant")
-            if isinstance(assistant_messages, int) and assistant_messages > 0:
-                num_turns = assistant_messages
-            else:
-                num_turns = transcript_turns
+            num_turns = assistant_messages if isinstance(assistant_messages, int) else 0
             result = PiCycleResult(
                 status="completed"
                 if completed and not self._stream.error and not assistant_error
@@ -1753,7 +456,6 @@ class PiRuntime:
                 thinking=self._stream.get_thinking_chunks(),
                 tool_calls=tool_calls,
                 events=events,
-                transcript=transcript,
                 num_turns=num_turns,
                 duration_ms=duration_ms,
                 input_tokens=usage["input_tokens"],
@@ -1765,6 +467,9 @@ class PiRuntime:
                 response_model=response_model,
                 response_id=response_id,
                 stop_reason=stop_reason,
+                session_id=session_state.get("sessionId"),
+                session_file=session_state.get("sessionFile"),
+                session_name=session_state.get("sessionName"),
                 error=self._stream.error or assistant_error,
             )
             self._stream.set_callback(None)
@@ -1790,9 +495,11 @@ class PiRuntime:
 
         self._send({**command, "id": request_id})
 
-        deadline = time.monotonic() + max(timeout, 0.1)
+        # Liveness waits use wall time: monotonic clocks freeze during
+        # system sleep, which stretches deadlines by the sleep duration.
+        deadline = time.time() + max(timeout, 0.1)
         scanned = 0
-        while time.monotonic() < deadline:
+        while time.time() < deadline:
             events = self._stream.events
             for event in events[scanned:]:
                 if event.get("type") != "response" or event.get("id") != request_id:
@@ -1832,60 +539,3 @@ class PiRuntime:
             "start_count": self._start_count,
             "session_count": session_count,
         }
-
-
-class PiCycleResult:
-    """Result of a single Pi prompt/response cycle."""
-
-    def __init__(
-        self,
-        status: str,
-        output: str,
-        thinking: list[str],
-        tool_calls: list[dict[str, Any]],
-        events: list[dict[str, Any]],
-        transcript: list[dict[str, Any]],
-        num_turns: int,
-        duration_ms: int,
-        input_tokens: int | None,
-        output_tokens: int | None,
-        cache_read_tokens: int | None,
-        cache_write_tokens: int | None,
-        cost_usd: float | None,
-        provider: str | None,
-        response_model: str | None,
-        response_id: str | None,
-        stop_reason: str | None,
-        error: str | None = None,
-    ):
-        self.status = status
-        self.output = output
-        self.thinking = thinking
-        self.tool_calls = tool_calls
-        self.events = events
-        self.transcript = transcript
-        self.num_turns = num_turns
-        self.duration_ms = duration_ms
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-        self.cache_read_tokens = cache_read_tokens
-        self.cache_write_tokens = cache_write_tokens
-        self.cost_usd = cost_usd
-        self.provider = provider
-        self.response_model = response_model
-        self.response_id = response_id
-        self.stop_reason = stop_reason
-        self.error = error
-
-    @property
-    def ok(self) -> bool:
-        return self.status == "completed"
-
-    def __repr__(self) -> str:
-        return (
-            f"PiCycleResult(status={self.status!r}, output_len={len(self.output)}, "
-            f"tool_calls={len(self.tool_calls)}, duration_ms={self.duration_ms})"
-        )
-
-
-PiClient = PiRuntime

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import json
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from syke.daemon.ask_workers import DaemonAskCapacityExceeded, DaemonAskWorkerSupervisor
+from syke.daemon.ask_worker_child import run_child
+from syke.daemon.ask_workers import (
+    DaemonAskCapacityExceeded,
+    DaemonAskWorkerError,
+    DaemonAskWorkerSupervisor,
+)
 
 
 def test_daemon_ask_worker_supervisor_streams_events_and_result(tmp_path) -> None:
@@ -38,7 +46,6 @@ print(json.dumps({
         syke_db_path=str(tmp_path / "syke.db"),
         question="what changed",
         on_event=lambda event: seen.append(f"{event.type}:{event.content}"),
-        timeout=5.0,
         transport_details={"daemon_pid": 123, "routing_reason": "warm_runtime_busy"},
     )
 
@@ -65,29 +72,10 @@ def test_daemon_ask_worker_supervisor_enforces_capacity() -> None:
                 syke_db_path="/tmp/syke.db",
                 question="what changed",
                 on_event=None,
-                timeout=5.0,
                 transport_details={},
             )
     finally:
         supervisor._semaphore.release()
-
-
-def test_daemon_ask_worker_supervisor_times_out_child() -> None:
-    script = "import time; time.sleep(30)"
-    supervisor = DaemonAskWorkerSupervisor(
-        max_workers=1,
-        command=[sys.executable, "-c", script],
-    )
-
-    with pytest.raises(RuntimeError, match="timed out"):
-        supervisor.ask(
-            user_id="test",
-            syke_db_path="/tmp/syke.db",
-            question="what changed",
-            on_event=None,
-            timeout=0.1,
-            transport_details={},
-        )
 
 
 def test_daemon_ask_worker_env_is_bounded_and_normalizes_temp(
@@ -123,3 +111,99 @@ def test_daemon_ask_worker_env_is_bounded_and_normalizes_temp(
     assert env["TMPDIR"] == str(child_tmp)
     assert env["TMP"] == str(child_tmp)
     assert env["TEMP"] == str(child_tmp)
+
+
+def test_ask_worker_opens_the_validated_user_database(monkeypatch, tmp_path, capsys) -> None:
+    db_path = tmp_path / "syke.db"
+    opened: list[str] = []
+
+    class FakeDB:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+    monkeypatch.setattr("syke.config.user_syke_db_path", lambda _user: db_path)
+    monkeypatch.setattr(
+        "syke.cli_support.context.get_db",
+        lambda user: opened.append(user) or FakeDB(),
+    )
+    monkeypatch.setattr(
+        "syke.llm.backends.pi_ask.pi_ask",
+        lambda _db, _user, _question, **_kwargs: (
+            "answer",
+            {"backend": "pi", "transport": "daemon_worker"},
+        ),
+    )
+
+    assert (
+        run_child(
+            {
+                "user_id": "person",
+                "syke_db_path": str(db_path),
+                "question": "what changed",
+                "transport_details": {},
+            }
+        )
+        == 0
+    )
+    assert opened == ["person"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["type"] == "result"
+    assert payload["answer"] == "answer"
+
+
+def test_ask_worker_rejects_a_database_outside_user_scope(monkeypatch, tmp_path) -> None:
+    expected = tmp_path / "expected.db"
+    monkeypatch.setattr("syke.config.user_syke_db_path", lambda _user: expected)
+    monkeypatch.setattr(
+        "syke.cli_support.context.get_db",
+        lambda _user: pytest.fail("database must not open before path validation"),
+    )
+
+    with pytest.raises(ValueError, match="outside user scope"):
+        run_child(
+            {
+                "user_id": "person",
+                "syke_db_path": str(tmp_path / "other.db"),
+                "question": "what changed",
+                "transport_details": {},
+            }
+        )
+
+
+def test_ask_worker_timeout_uses_wall_clock(monkeypatch, tmp_path) -> None:
+    """Worker timeout must expire on wall time, not frozen monotonic time.
+
+    Simulates system sleep during an ask: the wall clock advances in large
+    steps (each selector wakeup = 10 minutes of wall time) while a hung
+    child keeps its pipes open. The old monotonic deadline would never
+    fire while the machine slept; the wall deadline must fire within a
+    few wakeups.
+    """
+    script = "import sys, time; sys.stdin.read(); time.sleep(300)"
+    supervisor = DaemonAskWorkerSupervisor(
+        max_workers=1,
+        command=[sys.executable, "-c", script],
+    )
+
+    t = {"now": 1_000_000.0}
+
+    def fake_time() -> float:
+        t["now"] += 600.0  # every selector wakeup = 10 minutes of wall time
+        return t["now"]
+
+    monkeypatch.setattr(
+        "syke.daemon.ask_workers.time",
+        SimpleNamespace(time=fake_time, monotonic=time.monotonic),
+    )
+
+    with pytest.raises(DaemonAskWorkerError, match="timed out"):
+        supervisor.ask(
+            user_id="test",
+            syke_db_path=str(tmp_path / "syke.db"),
+            question="hang",
+            on_event=None,
+            transport_details={},
+        )

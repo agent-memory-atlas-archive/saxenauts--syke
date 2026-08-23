@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 from syke.cli_support.render import render_provider_summary as _render_provider_summary
-from syke.llm.env import evaluate_provider_readiness
+from syke.llm.env import evaluate_provider_readiness, provider_endpoint_configured
 
 
 def provider_payload(cli_provider: str | None = None) -> dict[str, object]:
@@ -151,13 +151,3 @@ def resolve_source(cli_provider: str | None) -> str:
     if get_default_provider():
         return "Pi settings"
     return "unknown"
-
-
-def provider_endpoint_configured(provider_id: str) -> bool:
-    from syke.pi_state import get_provider_base_url
-
-    if get_provider_base_url(provider_id):
-        return True
-    if provider_id == "azure-openai-responses":
-        return bool(os.getenv("AZURE_OPENAI_BASE_URL") or os.getenv("AZURE_OPENAI_RESOURCE_NAME"))
-    return False

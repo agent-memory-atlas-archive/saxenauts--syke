@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import click
 
-EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
 EXIT_AUTH = 3
 EXIT_RUNTIME = 4
-EXIT_TRUST = 5
 EXIT_DATA = 6
 
 
@@ -29,11 +27,6 @@ class SykeAuthException(SykeClickException):
 class SykeRuntimeException(SykeClickException):
     def __init__(self, message: str) -> None:
         super().__init__(message, exit_code=EXIT_RUNTIME)
-
-
-class SykeTrustException(SykeClickException):
-    def __init__(self, message: str) -> None:
-        super().__init__(message, exit_code=EXIT_TRUST)
 
 
 class SykeDataException(SykeClickException):

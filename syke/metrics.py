@@ -1,13 +1,15 @@
-"""Metrics and logging facade over rollout traces and runtime state."""
+"""Metrics and logging over native Pi sessions and host receipts."""
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from pathlib import Path
 
-from syke.config import user_data_dir, user_syke_db_path
+from syke.config import user_control_dir, user_data_dir
+from syke.control import list_receipts, receipt_rollup
+from syke.runtime import workspace as workspace_module
+from syke.runtime.pi_sessions import list_sessions, session_history_status
 
 # Structured logger
 logger = logging.getLogger("syke")
@@ -35,22 +37,13 @@ def runtime_metrics_status(user_id: str) -> dict[str, dict[str, object]]:
             "detail": f"File logging disabled: {_LAST_FILE_LOGGING_ERROR}",
         }
 
-    trace_store = _writability_status(user_syke_db_path(user_id), label="Trace store")
-    if _LAST_METRICS_PERSIST_ERROR is not None:
-        trace_store = {
-            **trace_store,
-            "ok": False,
-            "detail": f"Trace store disabled: {_LAST_METRICS_PERSIST_ERROR}",
-        }
-
     return {
         "file_logging": file_logging,
-        "trace_store": trace_store,
+        "session_history": session_history_status(workspace_module.SESSIONS_DIR),
     }
 
 
 _LAST_FILE_LOGGING_ERROR: str | None = None
-_LAST_METRICS_PERSIST_ERROR: str | None = None
 
 
 def _ensure_private_file(path: Path) -> None:
@@ -58,8 +51,13 @@ def _ensure_private_file(path: Path) -> None:
     os.chmod(path, 0o600)
 
 
-def setup_logging(user_id: str, verbose: bool = False) -> None:
-    """Configure logging with file and console handlers."""
+def setup_logging(
+    user_id: str,
+    verbose: bool = False,
+    *,
+    file_logging: bool = True,
+) -> None:
+    """Configure console logging and, when requested, the durable log file."""
     global _LAST_FILE_LOGGING_ERROR
     level = logging.DEBUG if verbose else logging.INFO
 
@@ -72,6 +70,10 @@ def setup_logging(user_id: str, verbose: bool = False) -> None:
     logger.handlers.clear()
     logger.addHandler(console)
     logger.propagate = False
+
+    if not file_logging:
+        _LAST_FILE_LOGGING_ERROR = None
+        return
 
     try:
         log_dir = user_data_dir(user_id)
@@ -94,7 +96,7 @@ def setup_logging(user_id: str, verbose: bool = False) -> None:
 
 
 class MetricsTracker:
-    """Reads operational summaries from the canonical rollout trace store."""
+    """Reads operational summaries from Pi's native protected sessions."""
 
     def __init__(self, user_id: str):
         self.user_id = user_id
@@ -102,7 +104,7 @@ class MetricsTracker:
     def get_summary(self) -> dict:
         """Load all metrics and produce a summary."""
         runs = self._load_all()
-        cycle_summary = self._load_cycle_summary()
+        cycle_summary = self._load_receipt_summary(runs)
 
         total_cost = sum(r.get("cost_usd", 0) for r in runs)
         total_tokens = sum(
@@ -137,54 +139,31 @@ class MetricsTracker:
         }
 
     def _load_all(self) -> list[dict]:
-        """Load all rollout summaries from syke.db."""
+        """Load native Pi session summaries in chronological order."""
         try:
-            from syke.db import SykeDB
-
-            with SykeDB(user_syke_db_path(self.user_id)) as db:
-                rows = db.conn.execute(
-                    """
-                    SELECT *
-                    FROM rollout_traces
-                    WHERE user_id = ?
-                    ORDER BY completed_at ASC
-                    """,
-                    (self.user_id,),
-                ).fetchall()
+            sessions = list_sessions(workspace_module.SESSIONS_DIR, limit=None)
         except Exception as exc:
-            logger.debug("Failed to load rollout traces: %s", exc, exc_info=True)
+            logger.debug("Failed to read native Pi sessions: %s", exc, exc_info=True)
             return []
 
         runs = []
-        for row in rows:
-            entry = dict(row)
-            try:
-                tool_name_counts = json.loads(entry.get("tool_name_counts") or "{}")
-            except (json.JSONDecodeError, TypeError):
-                tool_name_counts = {}
-            try:
-                extras = json.loads(entry.get("extras") or "{}")
-            except (json.JSONDecodeError, TypeError):
-                extras = {}
+        for entry in reversed(sessions):
             details = {
                 "tool_calls": int(entry.get("tool_calls_count") or 0),
                 "num_turns": int(entry.get("num_turns") or 0),
-                "tool_name_counts": tool_name_counts,
+                "tool_name_counts": entry.get("tool_name_counts") or {},
                 "status": entry.get("status"),
                 "provider": entry.get("provider"),
                 "model": entry.get("model"),
                 "response_id": entry.get("response_id"),
                 "stop_reason": entry.get("stop_reason"),
-                "runtime_reused": bool(entry.get("runtime_reused"))
-                if entry.get("runtime_reused") is not None
-                else None,
-                "transport": entry.get("transport"),
-                "trace_id": entry.get("id"),
-                **extras,
+                "session_id": entry.get("id"),
+                "session_path": entry.get("path"),
             }
             runs.append(
                 {
                     "operation": entry.get("kind"),
+                    "operation_id": entry.get("operation_id"),
                     "user_id": entry.get("user_id"),
                     "started_at": entry.get("started_at"),
                     "completed_at": entry.get("completed_at"),
@@ -202,7 +181,7 @@ class MetricsTracker:
             )
         return runs
 
-    def _load_cycle_summary(self) -> dict:
+    def _load_receipt_summary(self, runs: list[dict]) -> dict:
         summary = {
             "total_cycles": 0,
             "completed_cycles": 0,
@@ -212,67 +191,39 @@ class MetricsTracker:
             "last_cycle": None,
         }
         try:
-            from syke.config import user_syke_db_path
-            from syke.db import SykeDB
-
-            with SykeDB(user_syke_db_path(self.user_id)) as db:
-                rollup = db.conn.execute(
-                    """
-                    SELECT
-                        COALESCE(
-                            SUM(CASE WHEN status != 'running' THEN 1 ELSE 0 END),
-                            0
-                        ) AS total_cycles,
-                        COALESCE(
-                            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END),
-                            0
-                        ) AS completed_cycles,
-                        COALESCE(
-                            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END),
-                            0
-                        ) AS failed_cycles,
-                        COALESCE(
-                            SUM(CASE WHEN status = 'incomplete' THEN 1 ELSE 0 END),
-                            0
-                        ) AS incomplete_cycles,
-                        COALESCE(
-                            SUM(CASE WHEN status != 'running' THEN cost_usd ELSE 0 END),
-                            0
-                        ) AS total_cost_usd
-                    FROM cycle_records
-                    WHERE user_id = ?
-                    """,
-                    (self.user_id,),
-                ).fetchone()
-                if rollup:
-                    summary.update(
-                        {
-                            "total_cycles": int(rollup["total_cycles"] or 0),
-                            "completed_cycles": int(rollup["completed_cycles"] or 0),
-                            "failed_cycles": int(rollup["failed_cycles"] or 0),
-                            "incomplete_cycles": int(rollup["incomplete_cycles"] or 0),
-                            "total_cost_usd": round(float(rollup["total_cost_usd"] or 0.0), 4),
-                        }
-                    )
-
-                last_row = db.conn.execute(
-                    """
-                    SELECT status, started_at, completed_at, cost_usd
-                    FROM cycle_records
-                    WHERE user_id = ? AND status != 'running'
-                    ORDER BY started_at DESC
-                    LIMIT 1
-                    """,
-                    (self.user_id,),
-                ).fetchone()
-                if last_row:
-                    summary["last_cycle"] = {
-                        "operation": "synthesis_cycle",
-                        "status": last_row["status"],
-                        "completed_at": last_row["completed_at"] or last_row["started_at"],
-                        "cost_usd": round(float(last_row["cost_usd"] or 0.0), 4),
-                        "success": last_row["status"] == "completed",
-                    }
+            control_dir = user_control_dir(self.user_id)
+            rollup = receipt_rollup(control_dir)
+            synthesis_runs = [run for run in runs if run.get("operation") == "synthesis"]
+            summary.update(
+                {
+                    "total_cycles": rollup["total"],
+                    "completed_cycles": rollup["completed"],
+                    "failed_cycles": rollup["failed"],
+                    "incomplete_cycles": rollup["incomplete"],
+                    "total_cost_usd": round(
+                        sum(float(run.get("cost_usd") or 0) for run in synthesis_runs),
+                        4,
+                    ),
+                }
+            )
+            receipts = list_receipts(control_dir, limit=1)
+            if receipts:
+                last = receipts[0]
+                native = next(
+                    (
+                        run
+                        for run in reversed(synthesis_runs)
+                        if run.get("operation_id") == last.get("id")
+                    ),
+                    None,
+                )
+                summary["last_cycle"] = {
+                    "operation": "synthesis_cycle",
+                    "status": last.get("status"),
+                    "completed_at": last.get("completed_at") or last.get("started_at"),
+                    "cost_usd": round(float(native.get("cost_usd") or 0), 4) if native else 0.0,
+                    "success": last.get("status") == "completed",
+                }
         except Exception:
             return summary
         return summary

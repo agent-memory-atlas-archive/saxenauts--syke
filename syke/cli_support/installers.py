@@ -24,7 +24,7 @@ def detect_install_method() -> str:
     try:
         runtime = resolve_syke_runtime()
         target = runtime.target_path or Path(runtime.syke_command[0])
-    except Exception:
+    except (OSError, RuntimeError, ValueError):
         target = None
 
     target_str = str(target) if target is not None else ""
@@ -56,7 +56,11 @@ def detect_install_method() -> str:
             timeout=5,
             check=False,
         )
-        if result.returncode == 0 and "syke" in result.stdout:
+        if result.returncode == 0 and any(
+            line.split(maxsplit=1)[0] == "syke"
+            for line in result.stdout.splitlines()
+            if line.split()
+        ):
             return "pipx"
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
@@ -127,9 +131,24 @@ def run_managed_checkout_install(
         text=True,
     )
     if result.returncode != 0:
-        # Show output only on failure so the user can diagnose
         if result.stdout:
             console.print(f"  [dim]{result.stdout.strip()}[/dim]")
+        if was_running and restart_daemon:
+            try:
+                install_and_start(user_id)
+                readiness = wait_for_daemon_startup(user_id)
+                ipc = cast(dict[str, object], readiness.get("ipc") or {})
+                if readiness.get("running") and ipc.get("ok"):
+                    raise click.ClickException("Install failed. Previous daemon restored.")
+            except click.ClickException:
+                raise
+            except Exception as exc:
+                raise click.ClickException(
+                    f"Install failed and the previous daemon could not be restored: {exc}"
+                ) from exc
+            raise click.ClickException(
+                "Install failed and the previous daemon did not become healthy again."
+            )
         raise click.ClickException("Install failed.")
 
     console.print("[green]✓[/green] Managed install refreshed.")

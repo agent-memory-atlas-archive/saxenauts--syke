@@ -46,8 +46,7 @@ def _ensure_auth_runtime() -> None:
         ensure_pi_binary()
     except (OSError, RuntimeError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
         raise SykeRuntimeException(
-            "Pi runtime is unavailable. Install Node.js "
-            "(>= 20; 22 LTS recommended) and rerun `syke setup`."
+            "Pi runtime is unavailable. Install Node.js 22.19 or newer and rerun `syke setup`."
         ) from exc
 
 
@@ -177,8 +176,7 @@ def auth_set(
     from syke.llm.pi_client import get_pi_provider_catalog
     from syke.pi_state import (
         set_api_key,
-        set_default_model,
-        set_default_provider,
+        set_default_provider_and_model,
         upsert_provider_override,
     )
 
@@ -225,8 +223,7 @@ def auth_set(
                 raise SykeAuthException(f"Stored partial config for {provider}. {status.detail}")
         selected_model = resolve_activation_model(provider, explicit_model=model)
         verify_provider_activation(provider, selected_model)
-        set_default_model(selected_model)
-        set_default_provider(provider)
+        set_default_provider_and_model(provider, selected_model)
         console.print(
             f"[green]✓[/green] Config stored and [bold]{provider}[/bold] set as active provider."
         )
@@ -246,13 +243,15 @@ def auth_set(
 @click.pass_context
 def auth_login(ctx: click.Context, provider: str, set_active: bool) -> None:
     from syke.llm.pi_client import get_pi_provider_catalog, run_pi_oauth_login
-    from syke.pi_state import set_default_model, set_default_provider
+    from syke.pi_state import set_default_provider_and_model
 
     catalog = {entry.id: entry for entry in get_pi_provider_catalog()}
     entry = catalog.get(provider)
+    if entry is None and provider in _KNOWN_PI_PROVIDER_IDS:
+        _ensure_auth_runtime()
+        catalog = {item.id: item for item in get_pi_provider_catalog()}
+        entry = catalog.get(provider)
     if entry is None:
-        if provider in _KNOWN_PI_PROVIDER_IDS:
-            _ensure_auth_runtime()
         valid = ", ".join(sorted(catalog))
         raise click.UsageError(f"Unknown provider '{provider}'. Valid: {valid}")
     if not entry.oauth:
@@ -276,8 +275,7 @@ def auth_login(ctx: click.Context, provider: str, set_active: bool) -> None:
     if set_active:
         selected_model = resolve_activation_model(provider)
         verify_provider_activation(provider, selected_model)
-        set_default_model(selected_model)
-        set_default_provider(provider)
+        set_default_provider_and_model(provider, selected_model)
     console.print(f"[green]✓[/green] Pi login completed for [bold]{provider}[/bold].")
 
 
@@ -287,7 +285,7 @@ def auth_login(ctx: click.Context, provider: str, set_active: bool) -> None:
 def auth_use(ctx: click.Context, provider: str) -> None:
     """Set the active LLM provider."""
     from syke.llm.pi_client import get_pi_provider_catalog
-    from syke.pi_state import set_default_model, set_default_provider
+    from syke.pi_state import set_default_provider_and_model
 
     catalog = {entry.id: entry for entry in get_pi_provider_catalog()}
     if provider not in catalog and provider not in _KNOWN_PI_PROVIDER_IDS:
@@ -302,8 +300,7 @@ def auth_use(ctx: click.Context, provider: str) -> None:
 
     selected_model = resolve_activation_model(provider)
     verify_provider_activation(provider, selected_model)
-    set_default_model(selected_model)
-    set_default_provider(provider)
+    set_default_provider_and_model(provider, selected_model)
     console.print(f"[green]✓[/green] Active provider set to [bold]{provider}[/bold].")
 
 
@@ -316,17 +313,14 @@ def auth_unset(ctx: click.Context, provider: str) -> None:
         get_default_provider,
         remove_credential,
         remove_provider_override,
-        set_default_model,
-        set_default_provider,
+        set_default_provider_and_model,
     )
 
+    active_cleared = get_default_provider() == provider
     removed_credential = remove_credential(provider)
     removed_override = remove_provider_override(provider)
-    active_cleared = False
-    if get_default_provider() == provider:
-        set_default_provider(None)
-        set_default_model(None)
-        active_cleared = True
+    if active_cleared:
+        set_default_provider_and_model(None, None)
 
     removed_any = removed_credential or removed_override
     if removed_any and active_cleared:

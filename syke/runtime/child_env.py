@@ -26,14 +26,7 @@ TEMP_ENV_KEYS = ("TMPDIR", "TMP", "TEMP")
 PI_PASSTHROUGH_ENV_VAR = "SYKE_PI_PASSTHROUGH_ENV"
 PI_TMPDIR_ENV_VAR = "SYKE_PI_TMPDIR"
 
-ALWAYS_ALLOWED_HOST_ENV_KEYS = frozenset(
-    {
-        "PI_CODING_AGENT_DIR",
-        # Benchmark/replay callers can pass an explicit rubric schema path into
-        # the Pi RPC script. It is inert outside benchmark judge mode.
-        "SYKE_RPC_RUBRIC_SPEC_PATH",
-    }
-)
+ALWAYS_ALLOWED_HOST_ENV_KEYS = frozenset({"PI_CODING_AGENT_DIR"})
 
 PROVIDER_HOST_ENV_ALLOWLIST: dict[str, frozenset[str]] = {
     "anthropic": frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"}),
@@ -181,5 +174,6 @@ def build_child_process_env(
             env[key] = value
     if runtime_env:
         env.update(runtime_env)
-    env.update(normalized_temp_env(source))
+    temp_source = {**source, **(runtime_env or {})}
+    env.update(normalized_temp_env(temp_source))
     return env

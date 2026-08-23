@@ -6,9 +6,9 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
-from syke.db import SykeDB
 from syke.llm.backends import AskEvent
 
 
@@ -32,7 +32,6 @@ def run_child(request: dict[str, Any]) -> int:
     user_id = request.get("user_id")
     syke_db_path = request.get("syke_db_path")
     question = request.get("question")
-    timeout = request.get("timeout")
     transport_details = request.get("transport_details")
 
     if not isinstance(user_id, str) or not user_id:
@@ -47,15 +46,21 @@ def run_child(request: dict[str, Any]) -> int:
     details = dict(transport_details)
     details["worker_pid"] = os.getpid()
 
+    from syke.cli_support.context import get_db
+    from syke.config import user_syke_db_path
     from syke.llm.backends.pi_ask import pi_ask
 
-    with SykeDB(syke_db_path) as db:
+    expected_db = Path(user_syke_db_path(user_id)).expanduser().resolve(strict=False)
+    requested_db = Path(syke_db_path).expanduser().resolve(strict=False)
+    if requested_db != expected_db:
+        raise ValueError(f"worker rejected syke_db_path outside user scope: {requested_db}")
+
+    with get_db(user_id) as db:
         answer, metadata = pi_ask(
             db,
             user_id,
             question,
             on_event=lambda event: _emit(_event_to_payload(event)),
-            timeout=timeout if isinstance(timeout, (int, float)) and timeout > 0 else None,
             transport="daemon_worker",
             transport_details=details,
         )

@@ -1,85 +1,56 @@
 from __future__ import annotations
 
 import json
-import tomllib
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import syke
+from syke.config import PROJECT_ROOT, user_control_dir, user_syke_db_path
+from syke.control import list_records
+from syke.db import SykeDB
 from syke.entrypoint import cli
-from syke.llm.pi_client import PiProviderCatalogEntry
-from syke.onboarding import read_onboarding_state
+from syke.onboarding import read_onboarding_state, write_onboarding_state
+from syke.source_selection import get_selected_sources, set_selected_sources
 
 
-def test_help_groups_primary_and_advanced_commands(cli_runner) -> None:
-    result = cli_runner.invoke(cli, ["--help"])
+def test_setup_json_is_inspect_only(tmp_path: Path) -> None:
+    home = tmp_path / "clean-home"
+    home.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_DATA_HOME": str(home / ".local" / "share"),
+            "XDG_CACHE_HOME": str(home / ".cache"),
+            "PYTHONPATH": str(PROJECT_ROOT),
+        }
+    )
+    for name in (
+        "SYKE_CONTROL_ROOT",
+        "SYKE_WORKSPACE_ROOT",
+        "SYKE_PI_AGENT_DIR",
+        "SYKE_PI_STATE_AUDIT_PATH",
+    ):
+        env.pop(name, None)
 
-    assert result.exit_code == 0
-    assert "Primary Commands" in result.output
-    assert "Advanced Commands" in result.output
-    assert "setup" in result.output
-    assert "ask" in result.output
-    assert "record" in result.output
-    assert "daemon" in result.output
-    assert "self-update" in result.output
-    assert "install-current" in result.output
-    assert "ingest" not in result.output
+    result = subprocess.run(
+        [sys.executable, "-m", "syke", "--user", "test", "setup", "--json"],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
-
-def test_ingest_command_is_not_registered() -> None:
-    assert cli.get_command(None, "ingest") is None
-
-
-def test_runtime_version_matches_project_metadata() -> None:
-    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    project_version = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))["project"][
-        "version"
-    ]
-
-    assert syke.__version__ == project_version
-
-
-def test_auth_command_routes_to_extracted_group() -> None:
-    auth_cmd = cli.get_command(None, "auth")
-
-    assert auth_cmd is not None
-    assert auth_cmd.callback.__module__ == "syke.cli_commands.auth"
-
-    for subcommand in ("status", "set", "login", "use", "unset"):
-        nested = auth_cmd.get_command(None, subcommand)
-        assert nested is not None
-        assert nested.callback.__module__ == "syke.cli_commands.auth"
-
-
-def test_setup_json_is_inspect_only(cli_runner) -> None:
-    payload = {
-        "ok": True,
-        "schema_version": 1,
-        "mode": "inspect",
-        "user": "test",
-        "provider": {"configured": False},
-        "provider_choices": [{"id": "openai"}],
-        "sources": [],
-        "trust": {"sources": [], "targets": []},
-        "setup_targets": [],
-        "runtime": {"ready": False},
-        "daemon": {"platform": "Darwin", "installable": True, "running": False},
-        "proposed_actions": [],
-        "consent_points": [],
-        "next_commands": ["syke status --json"],
-    }
-
-    with patch("syke.cli_commands.setup.build_setup_inspect_payload", return_value=payload):
-        result = cli_runner.invoke(cli, ["--user", "test", "setup", "--json"])
-
-    assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed["ok"] is True
+    assert result.returncode == 0, result.stderr
+    parsed = json.loads(result.stdout)
     assert parsed["mode"] == "inspect"
     assert parsed["user"] == "test"
-    assert "daemon" in parsed
-    assert "runtime" in parsed
+    assert not (home / ".syke").exists()
 
 
 def test_setup_noninteractive_without_provider_returns_auth_exit(cli_runner) -> None:
@@ -111,7 +82,9 @@ def test_setup_runtime_failure_uses_runtime_exit_code(cli_runner) -> None:
 
     payload = {
         "provider": {"configured": True, "id": "openrouter"},
-        "sources": [],
+        "sources": [
+            {"source": "codex", "roots": [], "files_found": 1, "detected": True},
+        ],
         "trust": {"sources": [], "targets": []},
         "setup_targets": [],
         "daemon": {"platform": "Darwin", "installable": False, "running": False},
@@ -126,29 +99,31 @@ def test_setup_runtime_failure_uses_runtime_exit_code(cli_runner) -> None:
             side_effect=SykeRuntimeException("Pi runtime unavailable."),
         ),
     ):
-        result = cli_runner.invoke(cli, ["--user", "test", "setup", "--yes"])
+        result = cli_runner.invoke(
+            cli,
+            ["--user", "test", "setup", "--yes", "--source", "codex"],
+        )
 
     assert result.exit_code == 4
     assert "Pi runtime unavailable." in result.output
+    assert get_selected_sources("test") is None
 
 
-def test_setup_agent_needs_provider_returns_auth_exit_code(cli_runner) -> None:
-    payload = {
-        "provider": {"configured": False},
-        "sources": [],
-    }
-
+def test_setup_agent_does_not_mislabel_programming_errors_as_missing_runtime(cli_runner) -> None:
+    payload = {"provider": {"configured": False}, "sources": []}
     with (
         patch("syke.cli_commands.setup.build_setup_inspect_payload", return_value=payload),
-        patch("syke.llm.pi_client.ensure_pi_binary", return_value="/tmp/pi"),
-        patch("syke.llm.pi_client.get_pi_version", return_value="1.0.0"),
+        patch(
+            "syke.llm.pi_client.ensure_pi_binary",
+            side_effect=ValueError("broken invariant"),
+        ),
     ):
         result = cli_runner.invoke(cli, ["--user", "test", "setup", "--agent"])
 
-    assert result.exit_code == 3
     parsed = json.loads(result.output)
-    assert parsed["status"] == "needs_provider"
-    assert parsed["exit_code"] == 3
+    assert result.exit_code == 1
+    assert parsed["status"] == "failed"
+    assert "broken invariant" in parsed["error"]
 
 
 def test_setup_agent_rechecks_provider_after_installing_pi_runtime(cli_runner) -> None:
@@ -186,23 +161,62 @@ def test_setup_agent_rechecks_provider_after_installing_pi_runtime(cli_runner) -
 
     assert result.exit_code == 0
     parsed = json.loads(result.output)
-    assert parsed["status"] == "complete"
-    assert parsed["provider"] == {"id": "openai-codex", "model": "gpt-5.4"}
-    assert parsed["daemon"] == "skipped"
-    assert "daemon_persistence" in parsed
-    assert parsed["monitor"] is None
-    assert parsed["onboarding"]["mode"] == "manual"
-    assert parsed["onboarding"]["monitor"] is None
-    assert "background service start was skipped" in parsed["instructions"].lower()
-    assert "estimated around 3 minutes" in parsed["instructions"]
-    assert parsed["next_steps"][0] == "syke sync"
-    assert parsed["next_steps"][1] == "syke status --json"
+    assert {
+        "status": parsed["status"],
+        "provider": parsed["provider"],
+        "daemon": parsed["daemon"],
+        "onboarding_mode": parsed["onboarding"]["mode"],
+    } == {
+        "status": "complete",
+        "provider": {"id": "openai-codex", "model": "gpt-5.4"},
+        "daemon": "skipped",
+        "onboarding_mode": "manual",
+    }
     assert inspect_payload.call_count == 2
     launch_onboarding.assert_not_called()
     onboarding = read_onboarding_state("test")
     assert onboarding is not None
     assert onboarding["mode"] == "manual"
-    assert onboarding["monitor"] is None
+
+
+def test_setup_agent_rolls_back_to_manual_state_when_background_launch_fails(
+    cli_runner,
+) -> None:
+    payload = {
+        "provider": {"configured": True, "id": "openai-codex", "model": "gpt-5.4"},
+        "sources": [],
+        "daemon": {
+            "platform": "Linux",
+            "installable": True,
+            "running": False,
+            "persistence": {"manager": "systemd"},
+        },
+    }
+    with (
+        patch("syke.cli_commands.setup.build_setup_inspect_payload", return_value=payload),
+        patch("syke.llm.pi_client.ensure_pi_binary", return_value="/tmp/pi"),
+        patch("syke.llm.pi_client.get_pi_version", return_value="1.0.0"),
+        patch(
+            "syke.cli_commands.setup.verify_setup_provider_connection",
+            return_value="syke loaded",
+        ),
+        patch("syke.daemon.daemon.LOG_PATH", Path("/tmp/onboarding.log")),
+        patch(
+            "syke.cli_commands.setup._launch_background_onboarding",
+            side_effect=OSError("cannot spawn"),
+        ),
+    ):
+        result = cli_runner.invoke(cli, ["--user", "test", "setup", "--agent"])
+
+    parsed = json.loads(result.output)
+    assert result.exit_code == 1
+    assert parsed["status"] == "failed"
+    assert "cannot spawn" in parsed["error"]
+    assert parsed["onboarding"]["mode"] == "manual"
+    assert parsed["onboarding"]["monitor"] is None
+    onboarding = read_onboarding_state("test")
+    assert onboarding is not None
+    assert onboarding["mode"] == "manual"
 
 
 def test_setup_agent_source_flag_limits_ingestion(cli_runner) -> None:
@@ -274,164 +288,56 @@ def test_setup_agent_source_flag_rejects_undetected_source(cli_runner) -> None:
     assert "not detected" in parsed["error"]
 
 
-def test_status_json_returns_structured_payload(cli_runner) -> None:
-    payload = {
-        "ok": True,
-        "user": "test",
-        "provider": {"id": "openai", "configured": True},
-        "daemon": {"running": False, "registered": False},
-        "daemon_runtime": {"reachable": False, "alive": False, "detail": "socket missing"},
-        "initialized": True,
-        "cycle_count": 12,
-        "memex": {"present": True, "created_at": "2026-04-02T00:01:00+00:00", "memory_count": 2},
-        "runtime_signals": {"daemon_ipc": {"ok": False, "detail": "socket missing"}},
-        "trust": {"sources": [], "targets": []},
-    }
+def test_status_rejects_a_second_identity_without_traceback(cli_runner) -> None:
+    with SykeDB(user_syke_db_path("canonical"), user_id="canonical"):
+        pass
 
-    with (
-        patch("syke.cli_commands.status.get_db", return_value=MagicMock()),
-        patch("syke.cli_commands.status.build_status_payload", return_value=payload),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "status", "--json"])
+    result = cli_runner.invoke(cli, ["--user", "other", "status", "--json"])
+
+    assert result.exit_code == 6
+    assert "Syke store is bound to 'canonical', not 'other'" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_status_json_reports_persisted_operator_state(cli_runner) -> None:
+    set_selected_sources("test", ("codex",))
+    write_onboarding_state(
+        "test",
+        selected_sources=("codex",),
+        total_files=4,
+        estimated_minutes=2,
+        estimate_method="test",
+        mode="manual",
+    )
+
+    result = cli_runner.invoke(cli, ["--user", "test", "status", "--json"])
 
     assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed["ok"] is True
-    assert parsed["user"] == "test"
-    assert parsed["provider"]["id"] == "openai"
-    assert parsed["daemon"]["running"] is False
-
-
-def test_build_status_payload_includes_sources_and_onboarding() -> None:
-    from syke.cli_commands.status import build_status_payload
-
-    execute_result = MagicMock()
-    execute_result.fetchone.return_value = (2,)
-    fake_db = MagicMock()
-    fake_db.get_memex.return_value = None
-    fake_db.count_memories.return_value = 0
-    fake_db.conn.execute.return_value = execute_result
-
-    with (
-        patch("syke.cli_commands.status.provider_payload", return_value={"configured": False}),
-        patch("syke.cli_commands.status.daemon_payload", return_value={"running": False}),
-        patch("syke.daemon.ipc.daemon_runtime_status", return_value={"reachable": False}),
-        patch("syke.trace_store.trace_store_status", return_value={"ok": True}),
-        patch("syke.daemon.ipc.daemon_ipc_status", return_value={"ok": True}),
-        patch("syke.metrics.runtime_metrics_status", return_value={}),
-        patch("syke.cli_commands.status.get_selected_sources", return_value=("codex",)),
-        patch(
-            "syke.cli_commands.status.read_onboarding_state",
-            return_value={"status": "running", "estimated_minutes": 4},
-        ),
-    ):
-        payload = build_status_payload(fake_db, user_id="test", cli_provider=None)
-
+    payload = json.loads(result.output)
     assert payload["selected_sources"] == ["codex"]
     assert payload["selection_mode"] == "explicit"
-    assert payload["onboarding"] == {"status": "running", "estimated_minutes": 4}
+    assert payload["onboarding"]["selected_sources"] == ["codex"]
+    assert payload["memex"]["present"] is False
 
 
-def test_status_shows_daemon_warm_runtime_when_it_differs_from_config(cli_runner) -> None:
-    payload = {
-        "ok": True,
-        "user": "test",
-        "provider": {
-            "id": "anthropic",
-            "configured": True,
-            "source": "Pi settings",
-            "auth_source": "/tmp/auth.json",
-            "model": "claude-sonnet-4-6",
-            "model_source": "Pi settings defaultModel",
-            "endpoint": "provider default",
-            "endpoint_source": "Pi built-in/default",
-        },
-        "daemon": {"running": True, "registered": True},
-        "daemon_runtime": {
-            "ok": True,
-            "reachable": True,
-            "alive": True,
-            "provider": "kimi-coding",
-            "model": "k2p5",
-            "runtime_pid": 777,
-            "daemon_pid": 888,
-            "detail": "kimi-coding / k2p5",
-        },
-        "initialized": False,
-        "cycle_count": 0,
-        "memex": {"present": False, "created_at": None, "memory_count": 0},
-        "runtime_signals": {"daemon_ipc": {"ok": True, "detail": "socket present"}},
-        "trust": {"sources": [], "targets": []},
-    }
+def test_memex_json_forms_return_the_same_machine_payload(cli_runner) -> None:
+    for output_args in (["--json"], ["--format", "json"]):
+        fake_db = MagicMock()
+        with (
+            patch("syke.cli_commands.status.get_db", return_value=fake_db),
+            patch(
+                "syke.memory.memex.get_memex_for_injection",
+                return_value="# Memex\n- current focus",
+            ),
+        ):
+            result = cli_runner.invoke(cli, ["--user", "test", "memex", *output_args])
 
-    with (
-        patch("syke.cli_commands.status.get_db", return_value=MagicMock()),
-        patch("syke.cli_commands.status.build_status_payload", return_value=payload),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "status"])
-
-    assert result.exit_code == 0
-    assert "provider: anthropic" in result.output
-    assert "daemon warm runtime: kimi-coding / k2p5" in result.output
-    assert "routing note: daemon runtime differs from current config" in result.output
-
-
-def test_doctor_json_returns_structured_payload(cli_runner) -> None:
-    payload = {
-        "ok": False,
-        "user": "test",
-        "checks": {
-            "provider": {"label": "Provider", "ok": False, "detail": "missing"},
-            "daemon": {"label": "Daemon", "ok": False, "detail": "not running"},
-        },
-        "events": None,
-        "memory_health": None,
-        "network": None,
-    }
-
-    with patch("syke.cli_commands.status.build_doctor_payload", return_value=payload):
-        result = cli_runner.invoke(cli, ["--user", "test", "doctor", "--json"])
-
-    assert result.exit_code == 1
-    parsed = json.loads(result.output)
-    assert parsed["user"] == "test"
-    assert parsed["checks"]["provider"]["detail"] == "missing"
-
-
-def test_memex_json_flag_returns_machine_payload(cli_runner) -> None:
-    fake_db = MagicMock()
-
-    with (
-        patch("syke.cli_commands.status.get_db", return_value=fake_db),
-        patch(
-            "syke.memory.memex.get_memex_for_injection",
-            return_value="# Memex\n- current focus",
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "memex", "--json"])
-
-    assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed == {"memex": "# Memex\n- current focus", "user": "test"}
-    fake_db.close.assert_called_once()
-
-
-def test_memex_format_json_returns_machine_payload(cli_runner) -> None:
-    fake_db = MagicMock()
-
-    with (
-        patch("syke.cli_commands.status.get_db", return_value=fake_db),
-        patch(
-            "syke.memory.memex.get_memex_for_injection",
-            return_value="# Memex\n- current focus",
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "memex", "--format", "json"])
-
-    assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed == {"memex": "# Memex\n- current focus", "user": "test"}
-    fake_db.close.assert_called_once()
+        assert result.exit_code == 0
+        assert json.loads(result.output) == {
+            "memex": "# Memex\n- current focus",
+            "user": "test",
+        }
+        fake_db.close.assert_called_once()
 
 
 def test_ask_json_returns_structured_result(cli_runner) -> None:
@@ -514,505 +420,101 @@ def test_ask_jsonl_streams_status_events_and_result(cli_runner) -> None:
     fake_db.close.assert_called_once()
 
 
-def test_ask_json_returns_nonzero_when_backend_reports_error_in_metadata(cli_runner) -> None:
-    fake_db = MagicMock()
-
-    with (
-        patch("syke.cli_commands.ask.get_db", return_value=fake_db),
-        patch(
-            "syke.llm.env.resolve_provider",
-            return_value=SimpleNamespace(id="openai"),
-        ),
-        patch(
-            "syke.llm.pi_runtime.run_ask",
-            return_value=(
-                "backend failed",
-                {
-                    "provider": "openai",
-                    "duration_ms": 123,
-                    "error": "runtime down",
-                },
+def test_ask_machine_formats_report_backend_failure(cli_runner) -> None:
+    for output_arg in ("--json", "--jsonl"):
+        fake_db = MagicMock()
+        with (
+            patch("syke.cli_commands.ask.get_db", return_value=fake_db),
+            patch(
+                "syke.llm.env.resolve_provider",
+                return_value=SimpleNamespace(id="openai"),
             ),
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "ask", "what changed?", "--json"])
-
-    assert result.exit_code == 1
-    parsed = json.loads(result.output)
-    assert parsed["ok"] is False
-    assert parsed["answer"] is None
-    assert parsed["error"] == "runtime down"
-    fake_db.close.assert_called_once()
-
-
-def test_ask_json_returns_nonzero_when_backend_reports_setup_blocker(cli_runner) -> None:
-    fake_db = MagicMock()
-
-    with (
-        patch("syke.cli_commands.ask.get_db", return_value=fake_db),
-        patch(
-            "syke.llm.env.resolve_provider",
-            return_value=SimpleNamespace(id="openai"),
-        ),
-        patch(
-            "syke.llm.pi_runtime.run_ask",
-            return_value=(
-                "Workspace not initialized. Run `syke setup`.",
-                {
-                    "backend": "pi",
-                    "provider": "openai",
-                    "error": "Workspace not initialized. Run `syke setup`.",
-                },
+            patch(
+                "syke.llm.pi_runtime.run_ask",
+                return_value=(
+                    "backend failed",
+                    {"provider": "openai", "duration_ms": 123, "error": "runtime down"},
+                ),
             ),
+        ):
+            result = cli_runner.invoke(
+                cli,
+                ["--user", "test", "ask", "what changed?", output_arg],
+            )
+
+        assert result.exit_code == 1
+        payload = [json.loads(line) for line in result.output.strip().splitlines()]
+        error = payload[-1]
+        if output_arg == "--json":
+            assert error["ok"] is False
+        else:
+            assert error["type"] == "error"
+        assert error["error"] == "runtime down"
+        fake_db.close.assert_called_once()
+
+
+def test_ask_machine_errors_keep_auth_and_usage_exit_codes(cli_runner) -> None:
+    cases = (
+        (RuntimeError("No provider configured. Run `syke setup`."), [], 3, "No provider"),
+        (
+            ValueError("Unknown provider 'bad'. Valid providers: openai"),
+            ["--provider", "bad"],
+            2,
+            "Unknown provider",
         ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "ask", "what changed?", "--json"])
+    )
+    for error, provider_args, expected_exit, expected_message in cases:
+        fake_db = MagicMock()
+        with (
+            patch("syke.cli_commands.ask.get_db", return_value=fake_db),
+            patch("syke.llm.env.resolve_provider", side_effect=error),
+        ):
+            result = cli_runner.invoke(
+                cli,
+                ["--user", "test", *provider_args, "ask", "what changed?", "--json"],
+            )
 
-    assert result.exit_code == 1
-    parsed = json.loads(result.output)
-    assert parsed["ok"] is False
-    assert parsed["answer"] is None
-    assert "Workspace not initialized" in parsed["error"]
-    fake_db.close.assert_called_once()
-
-
-def test_ask_jsonl_emits_error_and_nonzero_when_backend_reports_error_metadata(cli_runner) -> None:
-    fake_db = MagicMock()
-
-    with (
-        patch("syke.cli_commands.ask.get_db", return_value=fake_db),
-        patch(
-            "syke.llm.env.resolve_provider",
-            return_value=SimpleNamespace(id="openai"),
-        ),
-        patch(
-            "syke.llm.pi_runtime.run_ask",
-            return_value=(
-                "backend failed",
-                {
-                    "provider": "openai",
-                    "duration_ms": 123,
-                    "error": "runtime down",
-                },
-            ),
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "ask", "what changed?", "--jsonl"])
-
-    assert result.exit_code == 1
-    lines = [json.loads(line) for line in result.output.strip().splitlines()]
-    assert lines[0] == {"type": "status", "phase": "starting", "provider": "openai"}
-    assert lines[-1]["type"] == "error"
-    assert lines[-1]["error"] == "runtime down"
-    fake_db.close.assert_called_once()
+        assert result.exit_code == expected_exit
+        parsed = json.loads(result.output)
+        assert parsed["ok"] is False
+        assert expected_message in parsed["error"]
+        fake_db.close.assert_called_once()
 
 
-def test_ask_json_missing_provider_returns_auth_exit_code(cli_runner) -> None:
-    fake_db = MagicMock()
-
-    with (
-        patch("syke.cli_commands.ask.get_db", return_value=fake_db),
-        patch(
-            "syke.llm.env.resolve_provider",
-            side_effect=RuntimeError("No provider configured. Run `syke setup`."),
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "ask", "what changed?", "--json"])
-
-    assert result.exit_code == 3
-    parsed = json.loads(result.output)
-    assert parsed["ok"] is False
-    assert "No provider configured" in parsed["error"]
-    fake_db.close.assert_called_once()
-
-
-def test_ask_json_invalid_provider_returns_usage_exit_code(cli_runner) -> None:
-    fake_db = MagicMock()
-
-    with (
-        patch("syke.cli_commands.ask.get_db", return_value=fake_db),
-        patch(
-            "syke.llm.env.resolve_provider",
-            side_effect=ValueError("Unknown provider 'bad'. Valid providers: openai"),
-        ),
-    ):
-        result = cli_runner.invoke(
-            cli,
-            ["--user", "test", "--provider", "bad", "ask", "what changed?", "--json"],
-        )
-
-    assert result.exit_code == 2
-    parsed = json.loads(result.output)
-    assert parsed["ok"] is False
-    assert "Unknown provider" in parsed["error"]
-    fake_db.close.assert_called_once()
-
-
-def test_observe_json_returns_structured_payload(cli_runner) -> None:
-    fake_db = MagicMock()
-    payload = {"ok": True, "summary": {"events": 4}}
-
-    with (
-        patch("syke.cli_commands.status.get_db", return_value=fake_db),
-        patch("syke.health.full_observe", return_value=payload),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "observe", "--json"])
+def test_observe_json_reports_window_and_rejects_watch(cli_runner) -> None:
+    result = cli_runner.invoke(
+        cli,
+        ["--user", "test", "observe", "--json", "--days", "30"],
+    )
 
     assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed["summary"]["events"] == 4
-    fake_db.close.assert_called_once()
+    assert json.loads(result.output)["evolution"]["days"] == 30
 
-
-def test_observe_json_and_watch_are_mutually_exclusive(cli_runner) -> None:
-    result = cli_runner.invoke(cli, ["--user", "test", "observe", "--json", "--watch"])
-
-    assert result.exit_code != 0
-    assert "--json and --watch are mutually exclusive." in result.output
-
-
-def test_observe_text_renders_without_legacy_ingestion_payload(cli_runner) -> None:
-    fake_db = MagicMock()
-    payload = {
-        "user_id": "test",
-        "memory": {
-            "active": 1,
-            "retired": 0,
-            "links": 0,
-            "density": 0.0,
-            "assessment": "healthy",
-            "hubs": [],
-            "supersession_max_depth": 0,
-            "supersession_avg_depth": 0.0,
-            "chains_with_history": 0,
-            "orphan_count": 0,
-            "orphan_pct": 0.0,
-        },
-        "synthesis": {
-            "assessment": "never_run",
-            "last_run_ago": "never",
-            "created": 0,
-            "superseded": 0,
-            "linked": 0,
-            "deactivated": 0,
-            "duration_ms": 0,
-            "cost_usd": 0.0,
-            "memex_updated": False,
-            "total_cost_usd": 0.0,
-        },
-        "runtime": {
-            "recent_runs": 0,
-            "last_run_ago": "never",
-            "last_operation": None,
-            "last_provider": None,
-            "last_model": None,
-            "avg_ask_ms": None,
-            "avg_synthesis_ms": None,
-            "total_tool_calls": 0,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-            "warm_reuse_runs": 0,
-            "cold_start_runs": 0,
-            "daemon_ipc_runs": 0,
-            "daemon_worker_runs": 0,
-            "direct_runs": 0,
-            "session_count": 0,
-            "scripts_count": 0,
-            "top_tools": [],
-        },
-        "memex": {
-            "exists": False,
-            "lines": 0,
-            "chars": 0,
-            "updated_ago": "never",
-            "active_memories": 0,
-        },
-        "evolution": {
-            "days": 7,
-            "created": 0,
-            "superseded": 0,
-            "deactivated": 0,
-            "net": 0,
-            "links_per_day": 0.0,
-            "supersession_rate": 0.0,
-            "assessment": "dormant",
-        },
-        "signals": [],
-    }
-
-    with (
-        patch("syke.cli_commands.status.get_db", return_value=fake_db),
-        patch("syke.health.full_observe", return_value=payload),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "observe"])
-
-    assert result.exit_code == 0
-    assert "Syke — test" in result.output
-    fake_db.close.assert_called_once()
-
-
-def test_observe_days_option_threads_window_into_full_observe(cli_runner) -> None:
-    fake_db = MagicMock()
-    payload = {
-        "user_id": "test",
-        "memory": {
-            "active": 0,
-            "retired": 0,
-            "links": 0,
-            "density": 0.0,
-            "assessment": "healthy",
-            "hubs": [],
-            "supersession_max_depth": 0,
-            "supersession_avg_depth": 0.0,
-            "chains_with_history": 0,
-            "orphan_count": 0,
-            "orphan_pct": 0.0,
-        },
-        "synthesis": {
-            "assessment": "never_run",
-            "last_run_ago": "never",
-            "created": 0,
-            "superseded": 0,
-            "linked": 0,
-            "deactivated": 0,
-            "duration_ms": 0,
-            "cost_usd": 0.0,
-            "memex_updated": False,
-            "total_cost_usd": 0.0,
-        },
-        "runtime": {
-            "recent_runs": 0,
-            "last_run_ago": "never",
-            "last_operation": None,
-            "last_provider": None,
-            "last_model": None,
-            "avg_ask_ms": None,
-            "avg_synthesis_ms": None,
-            "total_tool_calls": 0,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-            "warm_reuse_runs": 0,
-            "cold_start_runs": 0,
-            "daemon_ipc_runs": 0,
-            "daemon_worker_runs": 0,
-            "direct_runs": 0,
-            "session_count": 0,
-            "scripts_count": 0,
-            "top_tools": [],
-        },
-        "memex": {
-            "exists": False,
-            "lines": 0,
-            "chars": 0,
-            "updated_ago": "never",
-            "active_memories": 0,
-        },
-        "evolution": {
-            "days": 30,
-            "created": 0,
-            "superseded": 0,
-            "deactivated": 0,
-            "net": 0,
-            "links_per_day": 0.0,
-            "supersession_rate": 0.0,
-            "assessment": "dormant",
-        },
-        "signals": [],
-    }
-    observe_fn = MagicMock(return_value=payload)
-
-    with (
-        patch("syke.cli_commands.status.get_db", return_value=fake_db),
-        patch("syke.health.full_observe", observe_fn),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "observe", "--json", "--days", "30"])
-
-    assert result.exit_code == 0
-    observe_fn.assert_called_once_with(fake_db, "test", days=30)
-    fake_db.close.assert_called_once()
-
-
-def test_daemon_status_json_returns_structured_payload(cli_runner) -> None:
-    metrics = MagicMock()
-    metrics.get_summary.return_value = {
-        "last_cycle": None,
-        "last_run": {
-            "completed_at": "2026-04-02T00:02:00+00:00",
-            "success": True,
-        },
-    }
-
-    with (
-        patch("syke.cli_support.daemon_state.platform.system", return_value="Darwin"),
-        patch(
-            "syke.cli_support.daemon_state.daemon_process_state",
-            return_value={"running": True, "pid": 321, "source": "pidfile"},
-        ),
-        patch(
-            "syke.cli_support.daemon_state.launchd_metadata",
-            return_value={"registered": True, "stale": False, "last_exit_status": 0},
-        ),
-        patch("syke.metrics.MetricsTracker", return_value=metrics),
-        patch("syke.runtime.locator.resolve_syke_runtime", return_value=SimpleNamespace()),
-        patch("syke.runtime.locator.describe_runtime_target", return_value="runtime-target"),
-        patch(
-            "syke.runtime.locator.resolve_background_syke_runtime", return_value=SimpleNamespace()
-        ),
-        patch(
-            "syke.daemon.ipc.daemon_runtime_status",
-            return_value={"reachable": False, "alive": False, "detail": "socket missing"},
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "daemon", "status", "--json"])
-
-    assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed["ok"] is True
-    assert parsed["running"] is True
-    assert parsed["pid"] == 321
-    assert parsed["state"] == "running"
-    assert "launchd" not in parsed
-    assert parsed["service"]["manager"] == "launchd"
-    assert parsed["service"]["state"] == "running"
-    assert parsed["service"]["scheduled_only"] is False
-    assert parsed["launcher_target"] == "runtime-target"
-
-
-def test_daemon_status_json_uses_same_service_contract_on_linux(cli_runner) -> None:
-    metrics = MagicMock()
-    metrics.get_summary.return_value = {"last_run": None, "last_cycle": None}
-
-    with (
-        patch("syke.cli_support.daemon_state.platform.system", return_value="Linux"),
-        patch(
-            "syke.cli_support.daemon_state.daemon_process_state",
-            return_value={"running": False, "pid": None, "source": "none"},
-        ),
-        patch(
-            "syke.cli_support.daemon_state.systemd_metadata",
-            return_value={
-                "manager": "systemd",
-                "registered": True,
-                "stale": False,
-                "active_state": "inactive",
-                "sub_state": "dead",
-                "unit_path": "/tmp/syke-daemon.service",
-            },
-        ),
-        patch("syke.cli_support.daemon_state.cron_is_running", return_value=(False, None)),
-        patch("syke.metrics.MetricsTracker", return_value=metrics),
-        patch("syke.runtime.locator.resolve_syke_runtime", return_value=SimpleNamespace()),
-        patch("syke.runtime.locator.describe_runtime_target", return_value="runtime-target"),
-        patch(
-            "syke.runtime.locator.resolve_background_syke_runtime", return_value=SimpleNamespace()
-        ),
-        patch(
-            "syke.daemon.ipc.daemon_runtime_status",
-            return_value={"reachable": False, "alive": False, "detail": "socket missing"},
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "daemon", "status", "--json"])
-
-    assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed["state"] == "registered"
-    assert parsed["service"]["manager"] == "systemd"
-    assert parsed["service"]["unit_path"] == "/tmp/syke-daemon.service"
-    assert parsed["service"]["scheduled_only"] is False
-    assert parsed["persistence"]["requires_linger_for_boot"] is True
-
-
-def test_daemon_status_json_includes_warm_runtime(cli_runner) -> None:
-    metrics = MagicMock()
-    metrics.get_summary.return_value = {"last_run": None, "last_cycle": None}
-
-    with (
-        patch(
-            "syke.cli_support.daemon_state.daemon_process_state",
-            return_value={"running": True, "pid": 321, "source": "pidfile"},
-        ),
-        patch("syke.cli_support.daemon_state.launchd_metadata", return_value={"registered": True}),
-        patch("syke.metrics.MetricsTracker", return_value=metrics),
-        patch("syke.runtime.locator.resolve_syke_runtime", return_value=SimpleNamespace()),
-        patch("syke.runtime.locator.describe_runtime_target", return_value="runtime-target"),
-        patch(
-            "syke.runtime.locator.resolve_background_syke_runtime", return_value=SimpleNamespace()
-        ),
-        patch(
-            "syke.daemon.ipc.daemon_runtime_status",
-            return_value={
-                "ok": True,
-                "reachable": True,
-                "alive": True,
-                "provider": "kimi-coding",
-                "model": "k2p5",
-                "runtime_pid": 777,
-                "daemon_pid": 321,
-                "detail": "kimi-coding / k2p5",
-            },
-        ),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "daemon", "status", "--json"])
-
-    assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed["warm_runtime"]["provider"] == "kimi-coding"
-    assert parsed["warm_runtime"]["model"] == "k2p5"
-
-
-def test_daemon_status_json_reports_selected_sources(cli_runner) -> None:
-    metrics = MagicMock()
-    metrics.get_summary.return_value = {"last_run": None, "last_cycle": None}
-
-    with (
-        patch(
-            "syke.cli_support.daemon_state.daemon_process_state",
-            return_value={"running": True, "pid": 321, "source": "pidfile"},
-        ),
-        patch("syke.cli_support.daemon_state.launchd_metadata", return_value={"registered": True}),
-        patch("syke.metrics.MetricsTracker", return_value=metrics),
-        patch("syke.runtime.locator.resolve_syke_runtime", return_value=SimpleNamespace()),
-        patch("syke.runtime.locator.describe_runtime_target", return_value="runtime-target"),
-        patch(
-            "syke.runtime.locator.resolve_background_syke_runtime", return_value=SimpleNamespace()
-        ),
-        patch(
-            "syke.daemon.ipc.daemon_runtime_status",
-            return_value={"reachable": False, "alive": False, "detail": "socket missing"},
-        ),
-        patch("syke.source_selection.get_selected_sources", return_value=("codex", "claude-code")),
-    ):
-        result = cli_runner.invoke(cli, ["--user", "test", "daemon", "status", "--json"])
-
-    assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed["selection_mode"] == "explicit"
-    assert parsed["selected_sources"] == ["codex", "claude-code"]
+    incompatible = cli_runner.invoke(
+        cli,
+        ["--user", "test", "observe", "--json", "--watch"],
+    )
+    assert incompatible.exit_code == 2
 
 
 def test_daemon_status_json_prefers_last_cycle_truth_over_last_run(cli_runner) -> None:
-    metrics = MagicMock()
-    metrics.get_summary.return_value = {
-        "last_run": {
-            "completed_at": "2026-04-03T04:00:45+00:00",
-            "success": True,
-        },
-        "last_cycle": {
-            "operation": "synthesis_cycle",
-            "status": "failed",
-            "completed_at": "2026-04-03T04:00:45+00:00",
-            "cost_usd": 0.0,
-            "success": False,
-        },
-    }
-
     with (
         patch(
             "syke.cli_support.daemon_state.daemon_process_state",
             return_value={"running": True, "pid": 321, "source": "launchd"},
         ),
         patch("syke.cli_support.daemon_state.launchd_metadata", return_value={"registered": True}),
-        patch("syke.metrics.MetricsTracker", return_value=metrics),
+        patch(
+            "syke.control.list_receipts",
+            return_value=[
+                {
+                    "id": "cycle-failed",
+                    "status": "failed",
+                    "completed_at": "2026-04-03T04:00:45+00:00",
+                }
+            ],
+        ),
+        patch("syke.runtime.pi_sessions.list_sessions") as list_sessions,
         patch("syke.runtime.locator.resolve_syke_runtime", return_value=SimpleNamespace()),
         patch("syke.runtime.locator.describe_runtime_target", return_value="runtime-target"),
         patch(
@@ -1029,117 +531,79 @@ def test_daemon_status_json_prefers_last_cycle_truth_over_last_run(cli_runner) -
     parsed = json.loads(result.output)
     assert parsed["last_run"]["success"] is False
     assert parsed["last_run"]["status"] == "failed"
+    list_sessions.assert_not_called()
 
 
-def test_daemon_logs_json_returns_line_payload(cli_runner, tmp_path: Path) -> None:
+def test_cost_days_uses_the_bounded_native_session_window(cli_runner) -> None:
+    recent_run = {
+        "kind": "ask",
+        "started_at": "2026-04-03T04:00:00+00:00",
+        "status": "completed",
+        "cost_usd": 0.01,
+        "input_tokens": 10,
+        "output_tokens": 5,
+    }
+    unnamed_run = {
+        "kind": "session",
+        "started_at": "2026-04-03T03:00:00+00:00",
+        "status": "completed",
+        "cost_usd": 0.0,
+        "input_tokens": 3,
+        "output_tokens": 2,
+    }
+
+    with (
+        patch(
+            "syke.runtime.pi_sessions.list_sessions_between",
+            return_value=[recent_run, unnamed_run],
+        ) as list_between,
+        patch("syke.runtime.pi_sessions.list_sessions") as list_sessions,
+    ):
+        result = cli_runner.invoke(cli, ["cost", "--days", "1", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["total_runs"] == 2
+    assert payload["total_tokens"] == 20
+    assert payload["by_operation"]["session"]["count"] == 1
+    list_between.assert_called_once()
+    list_sessions.assert_not_called()
+
+
+def test_daemon_logs_json_returns_bounded_lines(cli_runner, tmp_path: Path) -> None:
     log_path = tmp_path / "daemon.log"
     log_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
 
     with patch("syke.daemon.daemon.LOG_PATH", log_path):
-        result = cli_runner.invoke(cli, ["--user", "test", "daemon", "logs", "--json", "-n", "2"])
+        result = cli_runner.invoke(cli, ["daemon", "logs", "--json", "--lines", "2"])
 
     assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed["ok"] is True
-    assert parsed["path"] == str(log_path)
-    assert parsed["lines"] == ["two", "three"]
+    payload = json.loads(result.output)
+    assert payload["requested_lines"] == 2
+    assert payload["lines"] == ["two", "three"]
 
 
-def test_config_show_reports_only_live_truthful_knobs(cli_runner, monkeypatch) -> None:
-    monkeypatch.setattr("syke.config.SYNC_THINKING_LEVEL", "medium")
-    monkeypatch.setattr("syke.config.SYNC_TIMEOUT", 600)
-    monkeypatch.setattr("syke.config.FIRST_RUN_SYNC_TIMEOUT", 1500)
-    monkeypatch.setattr("syke.config.ASK_TIMEOUT", 600)
-    monkeypatch.setattr("syke.config.DAEMON_INTERVAL", 900)
-    monkeypatch.setattr("syke.config.DEFAULT_USER", "test")
-    monkeypatch.setattr("syke.config.SYKE_HOME", Path("/tmp/syke-data"))
-    monkeypatch.setattr(
-        "syke.cli_commands.config._resolve_provider_display",
-        lambda: (None, "", {}),
-    )
-    monkeypatch.setattr("syke.time.resolve_user_tz", lambda: "America/Los_Angeles")
+def test_record_json_preserves_the_complete_payload(cli_runner) -> None:
+    raw = '{"kind":"correction","details":{"text":"keep all fields"}}'
 
-    result = cli_runner.invoke(cli, ["config", "show"])
+    result = cli_runner.invoke(cli, ["--user", "test", "record", "--json", raw])
 
     assert result.exit_code == 0
-    assert "thinking level: medium" in result.output
-    assert "first run timeout: 1500s" in result.output
-    assert "max_turns" not in result.output
-    assert "25 turns" not in result.output
-    assert "8192 tokens" not in result.output
+    assert [record["payload"] for record in list_records(user_control_dir("test"))] == [raw]
 
 
-def test_auth_status_reports_missing_auth_for_catalog_only_provider(
-    cli_runner, monkeypatch
-) -> None:
-    payload = {
-        "configured": False,
-        "id": "anthropic",
-        "source": "Pi settings",
-        "runtime_provider": "anthropic",
-        "auth_source": "catalog only (not daemon-safe)",
-        "auth_configured": False,
-        "model": "claude-sonnet-4-6",
-        "model_source": "Pi settings defaultModel",
-        "endpoint": "provider default",
-        "endpoint_source": "Pi built-in/default",
-        "error": "Run `syke auth login anthropic` or use Pi's `/login` flow.",
-    }
+def test_record_jsonl_accepts_each_record_in_order(cli_runner) -> None:
+    raw = '{"kind":"first","value":1}\n{"kind":"second","value":2}\n'
 
-    monkeypatch.setattr("syke.cli_commands.auth.run_setup_stage", lambda _label, fn: fn())
-    monkeypatch.setattr("syke.cli_commands.auth.provider_payload", lambda _provider: payload)
-    monkeypatch.setattr(
-        "syke.cli_commands.auth.describe_provider", lambda *_args, **_kwargs: payload
-    )
-    monkeypatch.setattr("syke.pi_state.get_default_provider", lambda: "anthropic")
-    monkeypatch.setattr("syke.pi_state.list_credential_providers", lambda: [])
-    monkeypatch.setattr("syke.pi_state.load_pi_models", lambda: {})
-    monkeypatch.setattr(
-        "syke.llm.pi_client.get_pi_provider_catalog",
-        lambda: [
-            PiProviderCatalogEntry(
-                "anthropic",
-                ("claude-sonnet-4-6",),
-                ("claude-sonnet-4-6",),
-                "claude-sonnet-4-6",
-                True,
-                "Anthropic (Claude Pro/Max)",
-            )
-        ],
+    result = cli_runner.invoke(
+        cli,
+        ["--user", "test", "record", "--jsonl"],
+        input=raw,
     )
 
-    result = cli_runner.invoke(cli, ["auth", "status", "--json"])
-
     assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed["selected_provider"]["auth_source"] == "catalog only (not daemon-safe)"
-    assert parsed["selected_provider"]["configured"] is False
-
-
-def test_record_creates_memory(cli_runner) -> None:
-    fake_db = MagicMock()
-    fake_db.insert_memory.return_value = "mem-12345678"
-
-    with patch("syke.cli_commands.record.get_db", return_value=fake_db):
-        result = cli_runner.invoke(cli, ["--user", "test", "record", "hello world"])
-
-    assert result.exit_code == 0
-    fake_db.insert_memory.assert_called_once()
-    mem = fake_db.insert_memory.call_args[0][0]
-    assert mem.content == "hello world"
-    assert mem.user_id == "test"
-
-
-def test_config_pi_state_audit_prints_recent_lines(cli_runner, monkeypatch, tmp_path: Path) -> None:
-    audit_path = tmp_path / "pi-state-audit.log"
-    audit_path.write_text(
-        '{"event":"set_default_provider","after":{"defaultProvider":"openai-codex"}}\n',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("SYKE_PI_STATE_AUDIT_PATH", str(audit_path))
-
-    result = cli_runner.invoke(cli, ["config", "pi-state-audit", "-n", "5"])
-
-    assert result.exit_code == 0
-    assert "set_default_provider" in result.output
-    assert "openai-codex" in result.output
+    assert "Accepted 2 records" in result.output
+    assert [record["payload"] for record in list_records(user_control_dir("test"))] == [
+        '{"kind":"first","value":1}',
+        '{"kind":"second","value":2}',
+    ]

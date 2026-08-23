@@ -6,10 +6,8 @@ import pytest
 
 from syke.runtime.locator import (
     SykeRuntimeDescriptor,
-    describe_runtime_target,
     ensure_syke_launcher,
     resolve_background_syke_runtime,
-    resolve_syke_runtime,
 )
 
 
@@ -49,25 +47,6 @@ def test_ensure_syke_launcher_writes_exec_script(tmp_path: Path, monkeypatch) ->
     text = launcher_path.read_text(encoding="utf-8")
     assert text.startswith("#!/bin/sh\n")
     assert 'exec /usr/local/bin/syke "$@"' in text
-
-
-def test_resolve_syke_runtime_prefers_current_script(monkeypatch) -> None:
-    first = Path("/tmp/venv/bin/syke")
-    second = Path("/usr/local/bin/syke")
-
-    monkeypatch.setattr(
-        "syke.runtime.locator._candidate_console_scripts",
-        lambda: [first, second],
-    )
-    monkeypatch.setattr(
-        "syke.runtime.locator._describe_console_script",
-        lambda path: _descriptor_for(path),
-    )
-
-    runtime = resolve_syke_runtime()
-
-    assert runtime.syke_command == (str(first),)
-    assert runtime.target_path == first
 
 
 def test_resolve_background_runtime_prefers_matching_safe_install(monkeypatch) -> None:
@@ -128,46 +107,6 @@ def test_resolve_background_runtime_rejects_only_tcc_protected_target(monkeypatc
         resolve_background_syke_runtime()
 
     assert "Cannot install daemon for this source checkout" in str(excinfo.value)
-
-
-def test_resolve_background_runtime_reports_safe_candidates(monkeypatch) -> None:
-    protected = Path("/Users/me/Documents/syke/.venv/bin/syke")
-    safe = Path("/Users/me/.local/bin/syke")
-
-    runtime_descr = _descriptor_for(
-        protected,
-        mode="source_dev",
-        matches_current_checkout=True,
-    )
-    safe_descr = _descriptor_for(
-        safe,
-        mode="external_cli",
-        matches_current_checkout=False,
-        install_origin=Path("/Users/me/.local/share/uv/tools/syke"),
-    )
-
-    descriptor_lookup = {protected: runtime_descr, safe: safe_descr}
-
-    monkeypatch.setattr("sys.platform", "darwin")
-    monkeypatch.setattr(
-        "syke.runtime.locator._candidate_console_scripts",
-        lambda: [protected, safe],
-    )
-    monkeypatch.setattr(
-        "syke.runtime.locator._describe_console_script",
-        lambda path: descriptor_lookup[path],
-    )
-    monkeypatch.setattr(
-        "syke.runtime.locator.is_tcc_protected",
-        lambda path: path == protected,
-    )
-
-    with pytest.raises(RuntimeError) as excinfo:
-        resolve_background_syke_runtime()
-
-    msg = str(excinfo.value)
-    assert describe_runtime_target(safe_descr) in msg
-    assert "Safe installed candidates found:" in msg
 
 
 def test_resolve_background_runtime_rejects_editable_install_from_protected_checkout(

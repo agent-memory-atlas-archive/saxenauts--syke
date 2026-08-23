@@ -18,30 +18,6 @@ class DistributionRefreshResult:
     skill_paths: list[Path] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
-    def status_lines(self) -> list[tuple[str, str, str | None]]:
-        lines: list[tuple[str, str, str | None]] = []
-        if self.memex_path is not None:
-            lines.append(("memex", "exported", str(self.memex_path)))
-        else:
-            lines.append(("memex", "pending", "no memex available yet"))
-
-        if self.skill_paths:
-            count = len(self.skill_paths)
-            lines.append(
-                (
-                    "capabilities",
-                    "registered",
-                    f"{count} file{'s' if count != 1 else ''}",
-                )
-            )
-        else:
-            lines.append(("capabilities", "none", "no capability surfaces detected"))
-
-        for warning in self.warnings:
-            lines.append(("distribution", "warning", warning))
-
-        return lines
-
 
 def refresh_distribution(
     db: SykeDB, user_id: str, *, memex_updated: bool = True

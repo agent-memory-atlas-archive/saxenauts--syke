@@ -3,17 +3,40 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from syke.config import user_data_dir
+from syke import config
 
 ONBOARDING_STATE_FILE = "onboarding.json"
 
 
+def _write_state(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def onboarding_state_path(user_id: str) -> Path:
-    return user_data_dir(user_id) / ONBOARDING_STATE_FILE
+    _ = user_id
+    return config.SYKE_HOME / ONBOARDING_STATE_FILE
 
 
 def write_onboarding_state(
@@ -41,19 +64,11 @@ def write_onboarding_state(
         "monitor": monitor,
         "persistence": persistence or {},
     }
-    path = onboarding_state_path(user_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp.rename(path)
+    _write_state(onboarding_state_path(user_id), payload)
     return payload
 
 
-def mark_first_synthesis_complete(
-    user_id: str,
-    *,
-    trace_id: str | None = None,
-) -> dict[str, Any] | None:
+def mark_first_synthesis_complete(user_id: str) -> dict[str, Any] | None:
     payload = read_onboarding_state(user_id)
     if not payload:
         return None
@@ -63,14 +78,8 @@ def mark_first_synthesis_complete(
     updated = dict(payload)
     updated["status"] = "first_synthesis_completed"
     updated["updated_at"] = datetime.now(UTC).isoformat()
-    if trace_id:
-        updated["first_synthesis_trace_id"] = trace_id
 
-    path = onboarding_state_path(user_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(updated, indent=2), encoding="utf-8")
-    tmp.rename(path)
+    _write_state(onboarding_state_path(user_id), updated)
     return updated
 
 

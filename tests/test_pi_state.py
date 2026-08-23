@@ -1,229 +1,105 @@
 from __future__ import annotations
 
 import json
-import os
 import stat
 from pathlib import Path
+
+import pytest
 
 from syke import pi_state
 
 
-def test_pi_agent_dir_respects_env_override(monkeypatch, tmp_path: Path) -> None:
-    target = tmp_path / "pi-agent"
-    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(target))
+def test_pi_state_paths_follow_override_and_current_default(monkeypatch, tmp_path: Path) -> None:
+    override = tmp_path / "override"
+    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(override))
 
-    assert pi_state.get_pi_agent_dir() == target.resolve()
-    assert pi_state.get_pi_auth_path() == target.resolve() / "auth.json"
-    assert pi_state.get_pi_settings_path() == target.resolve() / "settings.json"
-    assert pi_state.get_pi_models_path() == target.resolve() / "models.json"
+    assert pi_state.get_pi_agent_dir() == override.resolve()
+    assert pi_state.get_pi_auth_path() == override.resolve() / "auth.json"
+    assert pi_state.get_pi_settings_path() == override.resolve() / "settings.json"
+    assert pi_state.get_pi_models_path() == override.resolve() / "models.json"
 
-
-def test_pi_agent_dir_defaults_to_syke_owned_pi_agent(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("SYKE_PI_AGENT_DIR", raising=False)
+    monkeypatch.delenv("SYKE_PI_AGENT_DIR")
     monkeypatch.setattr(pi_state.config, "SYKE_HOME", tmp_path / ".syke")
-
     assert pi_state.get_pi_agent_dir() == (tmp_path / ".syke" / "pi-agent").resolve()
 
 
-def test_set_api_key_writes_pi_auth_json_schema(monkeypatch, tmp_path: Path) -> None:
+def test_api_key_state_is_private_and_audit_redacted(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
+    monkeypatch.setenv("SYKE_PI_STATE_AUDIT_PATH", str(tmp_path / "pi-state-audit.log"))
+    monkeypatch.setattr(
+        pi_state.sys,
+        "argv",
+        ["syke", "auth", "set", "openrouter", "--api-key", "sk-or-test"],
+    )
 
     pi_state.set_api_key("openrouter", "sk-or-test")
 
-    data = json.loads(pi_state.get_pi_auth_path().read_text(encoding="utf-8"))
-    assert data == {"openrouter": {"type": "api_key", "key": "sk-or-test"}}
+    auth_path = pi_state.get_pi_auth_path()
+    assert json.loads(auth_path.read_text(encoding="utf-8")) == {
+        "openrouter": {"type": "api_key", "key": "sk-or-test"}
+    }
+    assert stat.S_IMODE(auth_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(auth_path.parent.stat().st_mode) == 0o700
 
-    mode = oct(stat.S_IMODE(os.stat(pi_state.get_pi_auth_path()).st_mode))
-    assert mode == "0o600"
+    audit_path = tmp_path / "pi-state-audit.log"
+    payload = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert payload["event"] == "set_api_key"
+    assert payload["after"]["openrouter"]["key"] == "[REDACTED]"
+    assert payload["argv"][-1] == "[REDACTED]"
+    assert stat.S_IMODE(audit_path.stat().st_mode) == 0o600
 
 
-def test_default_provider_and_model_are_stored_in_pi_settings(monkeypatch, tmp_path: Path) -> None:
+def test_provider_and_model_defaults_commit_as_one_transition(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
+    monkeypatch.setenv("SYKE_PI_STATE_AUDIT_PATH", str(tmp_path / "pi-state-audit.log"))
 
-    pi_state.set_default_provider("openai")
-    pi_state.set_default_model("gpt-5.4")
+    pi_state.set_default_provider_and_model("openai", "gpt-5.4")
 
-    settings = json.loads(pi_state.get_pi_settings_path().read_text(encoding="utf-8"))
-    assert settings["defaultProvider"] == "openai"
-    assert settings["defaultModel"] == "gpt-5.4"
+    assert pi_state.get_default_provider() == "openai"
+    assert pi_state.get_default_model() == "gpt-5.4"
+    audit = [
+        json.loads(line)
+        for line in (tmp_path / "pi-state-audit.log").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [entry["event"] for entry in audit] == ["set_default_provider_and_model"]
+    assert audit[0]["after"] == {
+        "defaultModel": "gpt-5.4",
+        "defaultProvider": "openai",
+    }
+
+    with pytest.raises(ValueError, match="changed together"):
+        pi_state.set_default_provider_and_model("anthropic", None)
     assert pi_state.get_default_provider() == "openai"
     assert pi_state.get_default_model() == "gpt-5.4"
 
 
-def test_remove_credential_clears_active_provider_and_model_when_active(
+def test_failed_default_publication_preserves_previous_pair(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
+    pi_state.set_default_provider_and_model("openai", "gpt-5.4")
+    monkeypatch.setattr(pi_state.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError()))
+
+    with pytest.raises(OSError):
+        pi_state.set_default_provider_and_model("anthropic", "claude-sonnet-4-6")
+
+    assert pi_state.get_default_provider() == "openai"
+    assert pi_state.get_default_model() == "gpt-5.4"
+    assert not list((tmp_path / "pi-agent").glob("*.tmp"))
+
+
+def test_credential_removal_does_not_implicitly_change_defaults(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
-
     pi_state.set_api_key("anthropic", "sk-ant-test")
-    pi_state.set_default_provider("anthropic")
-    pi_state.set_default_model("claude-sonnet-4-6")
+    pi_state.set_default_provider_and_model("anthropic", "claude-sonnet-4-6")
 
-    removed = pi_state.remove_credential("anthropic")
-
-    assert removed is True
-    settings = json.loads(pi_state.get_pi_settings_path().read_text(encoding="utf-8"))
-    assert "defaultProvider" not in settings
-    assert "defaultModel" not in settings
+    assert pi_state.remove_credential("anthropic") is True
+    assert pi_state.get_credential("anthropic") is None
+    assert pi_state.get_default_provider() == "anthropic"
+    assert pi_state.get_default_model() == "claude-sonnet-4-6"
 
 
-def test_remove_credential_leaves_other_active_provider_intact(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
-
-    pi_state.set_api_key("anthropic", "sk-ant-test")
-    pi_state.set_default_provider("openai-codex")
-    pi_state.set_default_model("gpt-5.4")
-
-    removed = pi_state.remove_credential("anthropic")
-
-    assert removed is True
-    settings = json.loads(pi_state.get_pi_settings_path().read_text(encoding="utf-8"))
-    assert settings["defaultProvider"] == "openai-codex"
-    assert settings["defaultModel"] == "gpt-5.4"
-
-
-def test_upsert_provider_override_writes_pi_models_json(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
-
-    pi_state.upsert_provider_override(
-        "azure-openai-responses", base_url="https://azure.example.com"
-    )
-
-    models = json.loads(pi_state.get_pi_models_path().read_text(encoding="utf-8"))
-    assert models == {
-        "providers": {
-            "azure-openai-responses": {
-                "baseUrl": "https://azure.example.com",
-            }
-        }
-    }
-
-
-def test_build_pi_agent_env_uses_override_when_explicitly_set(monkeypatch, tmp_path: Path) -> None:
-    root = tmp_path / "pi-agent"
-    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(root))
-
-    env = pi_state.build_pi_agent_env()
-
-    assert env["PI_CODING_AGENT_DIR"] == str(root.resolve())
-
-
-def test_build_pi_agent_env_points_pi_at_syke_owned_state(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("SYKE_PI_AGENT_DIR", raising=False)
-    monkeypatch.setattr(pi_state.config, "SYKE_HOME", tmp_path / ".syke")
-
-    env = pi_state.build_pi_agent_env()
-
-    assert env["PI_CODING_AGENT_DIR"] == str((tmp_path / ".syke" / "pi-agent").resolve())
-
-
-def test_loads_legacy_native_pi_state_once_when_syke_state_missing(
-    monkeypatch, tmp_path: Path
-) -> None:
-    monkeypatch.delenv("SYKE_PI_AGENT_DIR", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("SYKE_PI_STATE_AUDIT_PATH", str(tmp_path / "pi-state-audit.log"))
-    monkeypatch.setattr(pi_state.config, "SYKE_HOME", tmp_path / ".syke")
-
-    legacy_root = tmp_path / ".pi" / "agent"
-    legacy_root.mkdir(parents=True, exist_ok=True)
-    (legacy_root / "settings.json").write_text(
-        json.dumps({"defaultProvider": "kimi-coding", "defaultModel": "k2p5"}) + "\n",
-        encoding="utf-8",
-    )
-
-    assert pi_state.get_default_provider() == "kimi-coding"
-    assert pi_state.get_default_model() == "k2p5"
-
-    target = tmp_path / ".syke" / "pi-agent" / "settings.json"
-    assert target.exists()
-    migrated = json.loads(target.read_text(encoding="utf-8"))
-    assert migrated["defaultProvider"] == "kimi-coding"
-    assert migrated["defaultModel"] == "k2p5"
-
-    audit_lines = (tmp_path / "pi-state-audit.log").read_text(encoding="utf-8").splitlines()
-    payload = json.loads(audit_lines[-1])
-    assert payload["event"] == "migrate_legacy_pi_state"
-
-
-def test_legacy_migration_hardens_permissions_to_owner_only(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("SYKE_PI_AGENT_DIR", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(pi_state.config, "SYKE_HOME", tmp_path / ".syke")
-
-    legacy_root = tmp_path / ".pi" / "agent"
-    legacy_root.mkdir(parents=True, exist_ok=True)
-    for name in ("auth.json", "settings.json", "models.json"):
-        file_path = legacy_root / name
-        file_path.write_text("{}", encoding="utf-8")
-        os.chmod(file_path, 0o644)
-
-    pi_state.ensure_pi_agent_dir()
-
-    target_root = tmp_path / ".syke" / "pi-agent"
-    for name in ("auth.json", "settings.json", "models.json"):
-        migrated = target_root / name
-        assert migrated.exists()
-        assert stat.S_IMODE(migrated.stat().st_mode) == 0o600
-    assert stat.S_IMODE(target_root.stat().st_mode) == 0o700
-
-
-def test_setting_default_provider_writes_audit_entry(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
-    monkeypatch.setenv("SYKE_PI_STATE_AUDIT_PATH", str(tmp_path / "pi-state-audit.log"))
-
-    pi_state.set_default_provider("openai-codex")
-
-    audit_lines = (tmp_path / "pi-state-audit.log").read_text(encoding="utf-8").splitlines()
-    assert audit_lines
-    payload = json.loads(audit_lines[-1])
-    assert payload["event"] == "set_default_provider"
-    assert payload["after"]["defaultProvider"] == "openai-codex"
-    assert payload["path"].endswith("settings.json")
-    assert payload["stack"]
-
-
-def test_setting_api_key_writes_audit_entry(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
-    monkeypatch.setenv("SYKE_PI_STATE_AUDIT_PATH", str(tmp_path / "pi-state-audit.log"))
-    monkeypatch.setattr(
-        os.sys,
-        "argv",
-        [
-            "syke",
-            "auth",
-            "set",
-            "openrouter",
-            "--api-key",
-            "sk-or-test",
-            "--model=openai/gpt-5.1-codex",
-        ],
-    )
-
-    pi_state.set_api_key("openrouter", "sk-or-test")
-
-    audit_lines = (tmp_path / "pi-state-audit.log").read_text(encoding="utf-8").splitlines()
-    assert audit_lines
-    payload = json.loads(audit_lines[-1])
-    assert payload["event"] == "set_api_key"
-    assert payload["after"]["openrouter"]["type"] == "api_key"
-    assert payload["after"]["openrouter"]["key"] == "[REDACTED]"
-    assert payload["argv"] == [
-        "syke",
-        "auth",
-        "set",
-        "openrouter",
-        "--api-key",
-        "[REDACTED]",
-        "--model=openai/gpt-5.1-codex",
-    ]
-    assert payload["before"] == {}
-    assert payload["path"].endswith("auth.json")
-    mode = oct(stat.S_IMODE(os.stat(tmp_path / "pi-state-audit.log").st_mode))
-    assert mode == "0o600"
-
-
-def test_upsert_provider_override_redacts_api_key_in_audit(monkeypatch, tmp_path: Path) -> None:
+def test_provider_override_write_and_removal_are_audited(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
     monkeypatch.setenv("SYKE_PI_STATE_AUDIT_PATH", str(tmp_path / "pi-state-audit.log"))
 
@@ -232,9 +108,25 @@ def test_upsert_provider_override_redacts_api_key_in_audit(monkeypatch, tmp_path
         base_url="https://example.com",
         api_key="super-secret",
     )
+    assert pi_state.remove_provider_override("custom-provider") is True
 
-    audit_lines = (tmp_path / "pi-state-audit.log").read_text(encoding="utf-8").splitlines()
-    payload = json.loads(audit_lines[-1])
-    provider = payload["after"]["providers"]["custom-provider"]
-    assert provider["baseUrl"] == "https://example.com"
-    assert provider["apiKey"] == "[REDACTED]"
+    assert pi_state.load_pi_models() == {"providers": {}}
+    audit = [
+        json.loads(line)
+        for line in (tmp_path / "pi-state-audit.log").read_text(encoding="utf-8").splitlines()
+    ]
+    assert audit[0]["after"]["providers"]["custom-provider"]["apiKey"] == "[REDACTED]"
+    assert audit[-1]["event"] == "remove_provider_override"
+    assert audit[-1]["after"] == {"providers": {}}
+
+
+def test_pi_agent_env_uses_current_state_root(monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "pi-agent"
+    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(root))
+    assert pi_state.build_pi_agent_env() == {"PI_CODING_AGENT_DIR": str(root.resolve())}
+
+    monkeypatch.delenv("SYKE_PI_AGENT_DIR")
+    monkeypatch.setattr(pi_state.config, "SYKE_HOME", tmp_path / ".syke")
+    assert pi_state.build_pi_agent_env() == {
+        "PI_CODING_AGENT_DIR": str((tmp_path / ".syke" / "pi-agent").resolve())
+    }

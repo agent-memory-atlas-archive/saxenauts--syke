@@ -10,13 +10,12 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO, cast
-
-from uuid_extensions import uuid7
 
 from syke.config import DAEMON_INTERVAL
 
@@ -34,7 +33,7 @@ LOCKFILE = Path(os.path.expanduser("~/.config/syke/daemon.lock"))
 _TAG_MAP: dict[str, str] = {
     "syke.sync": "SYNC",
     "syke.runtime.workspace": "WKSP",
-    "syke.runtime.psyche_md": "WKSP",
+    "syke.runtime.prompt_context": "WKSP",
     "syke.runtime": "PI",
     "syke.llm.pi_client": "PI",
     "syke.llm.pi_runtime": "PI",
@@ -115,11 +114,9 @@ class SykeDaemon:
         )
 
         try:
-            from syke.config import user_syke_db_path
-            from syke.db import SykeDB
+            from syke.cli_support.context import get_db
 
-            self._db = SykeDB(user_syke_db_path(self.user_id))
-            self._db.initialize()
+            self._db = get_db(self.user_id)
 
             # Start Pi runtime if configured
             self._start_pi_runtime()
@@ -161,94 +158,13 @@ class SykeDaemon:
         self._stop_event.set()
 
     def _daemon_cycle(self, db) -> None:
-        run_id = str(uuid7())
-        started_at = datetime.now(UTC)
-        health: dict[str, object] | None = None
-        total_new = 0
-        synced: list[str] = []
-        synthesis_result: dict[str, object] | None = None
-        cycle_error: str | None = None
-        trace_status = "completed"
+        self._health_check()
+        synthesis_result = self._synthesize(db)
+        self._distribute(db, synthesis_result)
+        if synthesis_result.get("status") == "completed":
+            from syke.onboarding import mark_first_synthesis_complete
 
-        try:
-            health = self._health_check()
-            self._heal(health)
-            total_new, synced = 0, []
-            synthesis_result = self._synthesize(db, total_new)
-            if isinstance(synthesis_result, dict):
-                synthesis_status = str(synthesis_result.get("status") or "unknown")
-                if synthesis_status == "failed":
-                    trace_status = "failed"
-                    cycle_error = str(synthesis_result.get("error") or "synthesis failed")
-                elif synthesis_status == "blocked":
-                    trace_status = "blocked"
-                    cycle_error = str(synthesis_result.get("error") or "synthesis blocked")
-            if trace_status != "failed":
-                self._distribute(db, synthesis_result)
-            if isinstance(synthesis_result, dict) and synthesis_result.get("status") == "completed":
-                from syke.onboarding import mark_first_synthesis_complete
-
-                trace_id = synthesis_result.get("trace_id")
-                mark_first_synthesis_complete(
-                    self.user_id,
-                    trace_id=str(trace_id) if trace_id else None,
-                )
-        except Exception as exc:
-            cycle_error = str(exc) or exc.__class__.__name__
-            trace_status = "failed"
-            raise
-        finally:
-            try:
-                from syke.trace_store import persist_rollout_trace
-
-                persist_rollout_trace(
-                    db=db,
-                    user_id=self.user_id,
-                    run_id=run_id,
-                    kind="daemon_cycle",
-                    started_at=started_at,
-                    completed_at=datetime.now(UTC),
-                    status=trace_status,
-                    error=cycle_error,
-                    output_text="",
-                    thinking=[],
-                    transcript=[],
-                    tool_calls=[],
-                    metrics={
-                        "duration_ms": int((datetime.now(UTC) - started_at).total_seconds() * 1000),
-                        "cost_usd": 0.0,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cache_read_tokens": 0,
-                        "cache_write_tokens": 0,
-                    },
-                    runtime={
-                        "provider": None,
-                        "model": None,
-                        "response_id": None,
-                        "stop_reason": None,
-                        "num_turns": 0,
-                        "runtime_reused": None,
-                        "transport": "daemon",
-                    },
-                    extras={
-                        "healthy": bool(health.get("healthy", False))
-                        if isinstance(health, dict)
-                        else None,
-                        "sources": synced,
-                        "synthesis_status": synthesis_result.get("status")
-                        if isinstance(synthesis_result, dict)
-                        else None,
-                        "synthesis_error": synthesis_result.get("error")
-                        if isinstance(synthesis_result, dict)
-                        else None,
-                        "memex_updated": synthesis_result.get("memex_updated")
-                        if isinstance(synthesis_result, dict)
-                        else None,
-                    },
-                )
-            except Exception:
-                logger.debug("Failed to persist daemon cycle trace", exc_info=True)
+            mark_first_synthesis_complete(self.user_id)
 
     def _health_check(self) -> dict[str, object]:
         from syke.daemon.metrics import run_health_check
@@ -258,12 +174,7 @@ class SykeDaemon:
             logger.warning("degraded", extra={"tag": "HEALTH"})
         return health
 
-    def _heal(self, health: dict[str, object]) -> None:
-        if health.get("healthy", False):
-            return
-        logger.info("attempted soft recovery", extra={"tag": "HEAL"})
-
-    def _synthesize(self, db, total_new: int) -> dict[str, object]:
+    def _synthesize(self, db) -> dict[str, object]:
         from syke.llm.backends.pi_synthesis import pi_synthesize
         from syke.source_selection import get_selected_sources
 
@@ -286,7 +197,7 @@ class SykeDaemon:
             self._runtime_lock.release()
         status = result.get("status", "unknown")
         if status == "completed":
-            logger.info("completed (+%d)", total_new, extra={"tag": "SYNTH"})
+            logger.info("completed", extra={"tag": "SYNTH"})
         elif status == "skipped":
             logger.info("skipped", extra={"tag": "SYNTH"})
         elif status == "blocked":
@@ -336,7 +247,6 @@ class SykeDaemon:
             self._pi_runtime = start_pi_runtime(
                 workspace_dir=WORKSPACE_ROOT,
                 session_dir=SESSIONS_DIR,
-                selected_sources=selected_sources,
             )
             logger.info(
                 "runtime started (pid=%s)",
@@ -365,17 +275,20 @@ class SykeDaemon:
         try:
             from syke.daemon.ipc import DaemonIpcServer, socket_path_for_user
 
-            self._ipc_server = DaemonIpcServer(
+            server = DaemonIpcServer(
                 self.user_id,
                 self._handle_ipc_ask,
                 self._handle_ipc_runtime_status,
             )
-            if self._ipc_server.start():
+            if server.start():
+                self._ipc_server = server
                 logger.info(
                     "ask server listening at %s",
                     socket_path_for_user(self.user_id),
                     extra={"tag": "IPC"},
                 )
+            else:
+                self._ipc_server = None
         except Exception as e:
             logger.error("IPC server failed to start: %s", e, extra={"tag": "ERROR"})
             self._ipc_server = None
@@ -406,10 +319,22 @@ class SykeDaemon:
             self._start_pi_runtime()
 
         ipc_server = self._ipc_server
-        if ipc_server is not None and not ipc_server.socket_path.exists():
-            logger.info(
-                "socket path missing; rebinding %s", ipc_server.socket_path, extra={"tag": "IPC"}
-            )
+        ipc_missing = False
+        ipc_unreachable = False
+        if ipc_server is not None:
+            ipc_missing = not ipc_server.socket_path.exists()
+            if not ipc_missing:
+                try:
+                    from syke.daemon.ipc import daemon_ipc_status
+
+                    ipc_status = daemon_ipc_status(self.user_id)
+                    ipc_unreachable = not bool(ipc_status.get("reachable"))
+                except Exception:
+                    logger.debug("IPC socket reachability probe failed", exc_info=True)
+                    ipc_unreachable = True
+        if ipc_server is not None and (ipc_missing or ipc_unreachable):
+            reason = "socket path missing" if ipc_missing else "socket unreachable"
+            logger.info("%s; rebinding %s", reason, ipc_server.socket_path, extra={"tag": "IPC"})
             try:
                 ipc_server.stop()
             except Exception as exc:
@@ -484,11 +409,10 @@ class SykeDaemon:
         syke_db_path: str,
         question: str,
         on_event,
-        timeout: float | None,
     ) -> tuple[str, dict[str, object]]:
+        from syke.cli_support.context import get_db
         from syke.config import user_syke_db_path
         from syke.daemon.ipc import socket_path_for_user
-        from syke.db import SykeDB
         from syke.llm.backends.pi_ask import pi_ask
 
         expected_db = Path(user_syke_db_path(self.user_id)).expanduser().resolve(strict=False)
@@ -507,22 +431,20 @@ class SykeDaemon:
                 syke_db_path=syke_db_path,
                 question=question,
                 on_event=on_event,
-                timeout=timeout,
                 transport_details={
                     **transport_details,
                     "routing_reason": "warm_runtime_busy",
                 },
             )
 
-        request_db: SykeDB | None = None
+        request_db = None
         try:
-            request_db = SykeDB(syke_db_path)
+            request_db = get_db(self.user_id)
             return pi_ask(
                 request_db,
                 self.user_id,
                 question,
                 on_event=on_event,
-                timeout=timeout,
                 transport="daemon_ipc",
                 transport_details={
                     **transport_details,
@@ -689,7 +611,7 @@ def _pid_is_safe_daemon_target(pid: int) -> bool:
     if _pid_looks_like_syke(pid) is True:
         return True
 
-    if os.sys.platform == "darwin":
+    if sys.platform == "darwin":
         metadata = launchd_metadata()
         launchd_pid = metadata.get("pid")
         launchd_state = metadata.get("state")
@@ -743,46 +665,16 @@ def is_running() -> tuple[bool, int | None]:
         return False, None
 
 
-def stop_daemon() -> bool:
-    """Send SIGTERM to running daemon. Returns True if signal sent."""
-    running, pid = is_running()
-    if not running or pid is None:
-        return False
-    if not _pid_is_safe_daemon_target(pid):
-        logger.warning("refusing to stop pid=%s; daemon identity not confirmed", pid)
-        return False
-    os.kill(pid, signal.SIGTERM)
-    return True
-
-
 # --- launchd helpers ---
 
 
-def _is_tcc_protected(path: Path) -> bool:
-    """Check if a path is inside a macOS TCC-protected directory."""
-    from syke.runtime.locator import is_tcc_protected
+def generate_plist(user_id: str, interval: int = DAEMON_INTERVAL) -> str:
+    """Generate a LaunchAgent using the resolved background-safe launcher.
 
-    return is_tcc_protected(path)
-
-
-def generate_plist(
-    user_id: str, source_install: bool | None = None, interval: int = DAEMON_INTERVAL
-) -> str:
-    """Generate macOS LaunchAgent plist XML.
-
-    Prefers the ``syke`` console script from PATH for both pip and source installs.
-    Falls back to ``sys.executable -m syke`` with WorkingDirectory only when
-    no ``syke`` binary is available on PATH.
-
-    Auth is not baked into the plist. Provider resolution happens at runtime from
-    the active Syke auth/config state and environment variables, so launchd keeps
-    following the current local configuration.
+    Auth is not baked into the plist. Runtime provider resolution follows the
+    current Syke state instead of preserving setup-time credentials.
     """
-    from syke.config import _is_source_install
     from syke.runtime.locator import ensure_syke_launcher, resolve_background_syke_runtime
-
-    if source_install is None:
-        source_install = _is_source_install()
 
     log_path = str(LOG_PATH)
     runtime = resolve_background_syke_runtime()
@@ -796,12 +688,6 @@ def generate_plist(
         f"        <string>--interval</string>\n"
         f"        <string>{interval}</string>"
     )
-    working_dir_block = ""
-
-    # Auth is not baked into the plist. Keys or endpoints captured at setup time
-    # become stale; runtime provider resolution should always use the current
-    # Syke auth store, config, and environment variables instead.
-    env_block = ""
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -813,7 +699,7 @@ def generate_plist(
     <array>
 {program_args}
     </array>
-{working_dir_block}{env_block}    <key>KeepAlive</key>
+    <key>KeepAlive</key>
     <true/>
     <key>RunAtLoad</key>
     <true/>
@@ -1037,7 +923,7 @@ def daemon_process_state() -> dict[str, object]:
     if running and pid is not None:
         return {"running": True, "pid": pid, "source": "pidfile"}
 
-    if os.sys.platform == "darwin":
+    if sys.platform == "darwin":
         metadata = launchd_metadata()
         launchd_pid = metadata.get("pid")
         launchd_state = metadata.get("state")
@@ -1054,7 +940,7 @@ def daemon_process_state() -> dict[str, object]:
             else:
                 return {"running": True, "pid": launchd_pid, "source": "launchd"}
 
-    if os.sys.platform != "darwin":
+    if sys.platform != "darwin":
         metadata = systemd_metadata()
         systemd_pid = metadata.get("pid")
         active_state = metadata.get("active_state")
@@ -1285,14 +1171,15 @@ def _program_from_systemd_unit(unit_path: Path) -> Path | None:
     return None
 
 
-def _systemd_int(value: str | None) -> int | None:
+def _systemd_int(value: str | None, *, allow_zero: bool = False) -> int | None:
     if value is None:
         return None
     try:
         parsed = int(value)
     except ValueError:
         return None
-    return parsed if parsed > 0 else None
+    minimum = 0 if allow_zero else 1
+    return parsed if parsed >= minimum else None
 
 
 def systemd_metadata() -> dict[str, object]:
@@ -1320,7 +1207,10 @@ def systemd_metadata() -> dict[str, object]:
         "pid": _systemd_int(properties.get("MainPID")),
         "active_state": properties.get("ActiveState"),
         "sub_state": properties.get("SubState"),
-        "last_exit_status": _systemd_int(properties.get("ExecMainStatus")),
+        "last_exit_status": _systemd_int(
+            properties.get("ExecMainStatus"),
+            allow_zero=True,
+        ),
         "unit_path": str(unit_path),
         "program_path": str(program_path) if program_path is not None else None,
         "unit_exists": unit_exists,
@@ -1328,92 +1218,6 @@ def systemd_metadata() -> dict[str, object]:
         "stale": bool(stale_reasons),
         "stale_reasons": stale_reasons,
     }
-
-
-# --- cron helpers (Linux/generic) ---
-
-CRON_TAG = "# syke-daemon"
-
-
-def _build_cron_entry(user_id: str, interval: int = DAEMON_INTERVAL) -> str:
-    """Build a crontab line for periodic sync."""
-    import shlex
-
-    from syke.runtime.locator import ensure_syke_launcher, resolve_syke_runtime
-
-    syke_bin = ensure_syke_launcher(resolve_syke_runtime())
-    log_path = str(LOG_PATH)
-
-    # Convert seconds to minutes for cron (minimum 1 min)
-    minutes = max(1, interval // 60)
-    # Do NOT bake ANTHROPIC_API_KEY into the crontab — it exposes the key in
-    # plaintext in `crontab -l` and creates a stale-key risk if the key rotates.
-    # sync reads from ~/.syke/.env or uses Claude Code session auth automatically.
-    return (
-        f"*/{minutes} * * * * {shlex.quote(str(syke_bin))} --user {shlex.quote(user_id)} "
-        f"sync >> {shlex.quote(log_path)} 2>&1 {CRON_TAG}"
-    )
-
-
-def install_cron(user_id: str, interval: int = DAEMON_INTERVAL) -> None:
-    """Append a tagged crontab entry for periodic sync."""
-    import subprocess
-
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    # Read existing crontab
-    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    if r.returncode == 0:
-        existing = r.stdout
-    else:
-        existing = ""
-
-    # Remove any old syke-daemon entry
-    lines = [line for line in existing.splitlines() if CRON_TAG not in line]
-    lines.append(_build_cron_entry(user_id, interval))
-
-    new_crontab = "\n".join(lines) + "\n"
-    subprocess.run(["crontab", "-"], input=new_crontab, text=True, check=True)
-
-
-def uninstall_cron() -> bool:
-    """Remove syke-daemon entry from crontab. Returns True if removed."""
-    import subprocess
-
-    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    if r.returncode != 0:
-        return False
-
-    lines = r.stdout.splitlines()
-    filtered = [line for line in lines if CRON_TAG not in line]
-
-    if len(filtered) == len(lines):
-        return False  # nothing to remove
-
-    new_crontab = "\n".join(filtered) + "\n"
-    subprocess.run(["crontab", "-"], input=new_crontab, text=True, check=True)
-    return True
-
-
-def cron_is_running() -> tuple[bool, None]:
-    """Check if a syke-daemon cron entry exists. Returns (found, None)."""
-    import subprocess
-
-    try:
-        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0 and CRON_TAG in r.stdout:
-            return True, None
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return False, None
-
-
-def cron_status() -> str:
-    """Get human-readable cron daemon status."""
-    found, _ = cron_is_running()
-    if found:
-        return "[green]Cron job installed[/green] (syke-daemon)"
-    return "[dim]No cron job installed[/dim]"
 
 
 # --- CLI-friendly wrappers (platform-dispatched) ---
@@ -1438,8 +1242,6 @@ def stop_and_unload() -> None:
         uninstall_launchd()
     else:
         uninstall_systemd_user()
-        # Remove legacy cron registration from older Syke versions.
-        uninstall_cron()
 
     if running and pid is not None:
         if _pid_is_safe_daemon_target(pid):
@@ -1447,8 +1249,8 @@ def stop_and_unload() -> None:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
                 still_running, _ = is_running()
                 if not still_running:
                     break
@@ -1464,51 +1266,11 @@ def stop_and_unload() -> None:
                     os.kill(current_pid, signal.SIGKILL)
                 except OSError:
                     pass
-                deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline:
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
                     final_running, _ = is_running()
                     if not final_running:
                         break
                     time.sleep(0.1)
         else:
             logger.warning("refusing to signal pid=%s; daemon identity not confirmed", pid)
-
-
-def get_status() -> str:
-    """Get human-readable daemon status."""
-    import sys
-
-    running, pid = is_running()
-
-    if sys.platform == "darwin":
-        status = launchd_status()
-        if running and pid:
-            msg = f"[green]Daemon is running[/green] (PID {pid})"
-            if status:
-                msg += f"\n\nLaunchAgent status:\n{status}"
-            return msg
-        elif status:
-            return f"[yellow]LaunchAgent installed but daemon not running[/yellow]\n\nLaunchAgent status:\n{status}"
-        else:
-            return "[dim]Daemon not running[/dim]"
-    else:
-        systemd = systemd_metadata()
-        cron_found, _ = cron_is_running()
-        if running and pid:
-            msg = f"[green]Daemon is running[/green] (PID {pid})"
-            if systemd.get("registered"):
-                msg += "\n\nsystemd user service: installed"
-            elif cron_found:
-                msg += "\n\nLegacy cron job: installed"
-            return msg
-        elif systemd.get("registered"):
-            active = systemd.get("active_state") or "unknown"
-            sub = systemd.get("sub_state") or "unknown"
-            return (
-                "[yellow]systemd user service installed but daemon not running[/yellow]"
-                f"\n\nsystemd state: {active}/{sub}"
-            )
-        elif cron_found:
-            return cron_status()
-        else:
-            return "[dim]Daemon not running[/dim]"

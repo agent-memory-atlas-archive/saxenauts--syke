@@ -1,15 +1,16 @@
 # claude-code
 
-Claude Code is Anthropic's official CLI agent for Claude. It runs as a terminal application where the user types natural-language prompts and the agent responds with text, executes tool calls (file reads, writes, bash commands, web searches), and manages multi-turn conversations. Sessions run inside project directories. Claude Code can spawn subagent sessions for parallel work.
+Claude Code stores project conversations and a separate transcript event stream as JSONL. Sessions can branch and spawn subagents.
 
 ## Where
 
 ```
 ~/.claude/projects/**/*.jsonl
+~/.claude/projects/*/memory/**/*.md
 ~/.claude/transcripts/*.jsonl
 ```
 
-The adapter discovers all `.jsonl` files recursively under both roots. Files under `transcripts/` are parsed differently from files under `projects/`.
+Files under `transcripts/` and `projects/` use different schemas.
 
 ## Sessions
 
@@ -23,7 +24,7 @@ Recency is determined by file `st_mtime` and by the latest timestamp found acros
 
 JSONL. Each line is a self-contained JSON object (one record per line).
 
-There are two distinct file families with different schemas:
+There are two distinct file families. Use project files when assistant text matters; transcript files do not contain complete assistant responses.
 
 ### Transcript files (under `transcripts/`)
 
@@ -87,24 +88,27 @@ Per assistant message:
 | `stop_reason` | `message.stop_reason` | Why generation stopped |
 | `usage` | `message.usage` | Token usage object (`input_tokens`, `output_tokens`, etc.) |
 
-## What sessions contain
+## Project instructions
 
-Each session records a complete conversation between the user and Claude Code within a project directory. Claude Code sessions are distinctive in several ways: assistant turns include readable extended thinking content (prefixed `[thinking]`), conversations form a tree structure with branching at user edits, and subagent sessions are spawned for parallel delegated subtasks under `subagents/` directories. Tool calls capture the full spectrum of agent actions including file edits, bash commands, file reads, searches, and web fetches.
+After resolving the project from a session's `cwd` and project-store path, treat applicable `AGENTS.md` files as current shared project instructions. Claude Code's native project context also includes:
+
+- `CLAUDE.md` in the project root
+- `.claude/CLAUDE.md` in the project root (typically gitignored)
+- `~/.claude/CLAUDE.md` (user-level global instructions)
+- `.claude/rules/` (project-level rules)
+- `.claude/settings.json` and `.claude/settings.local.json` (project settings and local override)
+
+These current files do not prove what an older session received. Use the native session and any recorded file reads for historical context.
 
 ## Harness memory
 
-Claude Code reads context from a layered file hierarchy:
+Claude Code keeps project-scoped auto-memory beside its project sessions:
 
-- `CLAUDE.md` in the project root (project instructions, injected into system prompt)
-- `.claude/CLAUDE.md` in the project root (project-level, typically gitignored)
-- `~/.claude/CLAUDE.md` (user-level global instructions)
-- `.claude/settings.json` and `.claude/settings.local.json` (project settings and local override)
-- `.claude/rules/` (project-level rules, plain markdown files)
-- `.claude/agents/` (subagent definitions)
-- `.claude/commands/` and `~/.claude/commands/` (slash commands, project and user level)
-- `~/.claude/skills/` (personal skills, each with a SKILL.md)
-- `.claude/skills/` (project-level skills)
-- `.claude/.mcp.json` (MCP server configuration for the project)
+- `~/.claude/projects/<project-key>/memory/MEMORY.md` is the memory index loaded for that project.
+- Other Markdown files under the same `memory/` directory hold topic-specific retained context.
+- Resolve `<project-key>` from the parent directory of a known native session instead of guessing the path encoding.
+
+Auto-memory is Claude's retained interpretation. Verify material claims against project files or native sessions.
 
 ## Distribution
 

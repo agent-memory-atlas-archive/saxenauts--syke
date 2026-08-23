@@ -11,6 +11,7 @@ from syke.cli_commands.ask import ask
 from syke.cli_commands.auth import auth
 from syke.cli_commands.config import config
 from syke.cli_commands.daemon import daemon, self_update
+from syke.cli_commands.internal import macos_filesystem_probe
 from syke.cli_commands.maintenance import cost, install_current, sync
 from syke.cli_commands.record import record
 from syke.cli_commands.setup import setup
@@ -100,7 +101,12 @@ class SykeGroup(click.Group):
     invoke_without_command=True,
     epilog='\b\nExamples:\n  syke setup\n  syke ask "What changed this week?"\n  syke memex',
 )
-@click.option("--user", "-u", default=DEFAULT_USER, help="User ID")
+@click.option(
+    "--user",
+    "-u",
+    default=DEFAULT_USER,
+    help="Person ID for this installation (one shared store)",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
 @click.option("--provider", "-p", default=None, help="Override LLM provider for this invocation")
 @click.version_option(__version__)
@@ -117,7 +123,11 @@ def cli(ctx: click.Context, user: str, verbose: bool, provider: str | None) -> N
 
     from syke.metrics import setup_logging
 
-    setup_logging(user, verbose=verbose)
+    setup_logging(
+        user,
+        verbose=verbose,
+        file_logging=ctx.invoked_subcommand != "setup",
+    )
 
     if ctx.invoked_subcommand is None:
         show_dashboard(user)
@@ -139,3 +149,4 @@ cli.add_command(self_update)
 cli.add_command(cost)
 cli.add_command(install_current)
 cli.add_command(web)
+cli.add_command(macos_filesystem_probe)

@@ -1,6 +1,6 @@
 # opencode
 
-Opencode is a terminal-based AI coding agent. It runs in a terminal, accepts natural-language prompts, and executes tool calls for code editing, file operations, and shell commands. It stores all session data in a SQLite database. Sessions can have parent-child relationships for subagent tasks.
+OpenCode stores sessions, messages, and content parts in SQLite. Sessions can have parent-child relationships for subagent tasks.
 
 ## Where
 
@@ -8,7 +8,7 @@ Opencode is a terminal-based AI coding agent. It runs in a terminal, accepts nat
 ~/.local/share/opencode/opencode*.db
 ```
 
-The adapter discovers files matching the regex `^opencode(?:-[^.]+)?\.db$`. This covers `opencode.db`, `opencode-something.db`, etc.
+Inspect databases matching `opencode*.db`.
 
 ## Sessions
 
@@ -101,7 +101,7 @@ Parts are the atomic content units within a message. The `data` JSON contains a 
 
 ### Joined tables
 
-The adapter also joins:
+Related context is stored in:
 
 - `project` table: `worktree`, `vcs`, `name`, `commands`, `time_created`, `time_updated`
 - `workspace` table: `type`, `name`, `directory`, `extra`
@@ -138,19 +138,17 @@ ORDER BY s.time_updated DESC
 LIMIT 20;
 ```
 
-## What sessions contain
+Use `time_updated` for active work; these timestamps are epoch milliseconds. After selecting a session, read its `message` and `part` rows: the session row is metadata. Follow `parent_id` when delegated work matters.
 
-Each session records a multi-turn conversation between the user and the opencode agent. This includes: user prompts, assistant text and reasoning, tool invocations with inputs and outputs, code patches applied, files referenced, compaction events, and error states. Sessions track which project and workspace they operated in, and summary statistics of code changes made.
+## Project instructions
+
+OpenCode uses `AGENTS.md` in the project and `~/.config/opencode/AGENTS.md` for global instructions. The `/init` command can generate a project `AGENTS.md`. Project configuration is in `.opencode/config.json`; global configuration is in `~/.config/opencode/opencode.json`.
+
+Resolve the project through `session.directory`, `project.worktree`, and `workspace.directory` before opening applicable instructions. Current files do not prove what an older session received; use its messages and tool reads for historical context.
 
 ## Harness memory
 
-OpenCode reads context from these sources:
-
-- `AGENTS.md` in the project root (project instructions, injected into context)
-- `~/.config/opencode/AGENTS.md` (global instructions)
-- `~/.config/opencode/opencode.json` (global configuration)
-- `.opencode/config.json` (project-level configuration)
-- The `/init` command generates an `AGENTS.md` by scanning the repo structure
+No separate harness-owned durable memory surface is present in the supported local layout. `AGENTS.md` is persistent context; summaries, compaction parts, and conversation rows are session history.
 
 ## Distribution
 
