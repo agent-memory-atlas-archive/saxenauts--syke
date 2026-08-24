@@ -139,6 +139,19 @@ def _select_agent_sources(
     return requested, source_items, []
 
 
+def _agent_setup_command(
+    *,
+    skip_daemon: bool,
+    selected_sources_cli: tuple[str, ...],
+) -> str:
+    parts = ["syke", "setup", "--agent"]
+    if skip_daemon:
+        parts.append("--skip-daemon")
+    for source in selected_sources_cli:
+        parts.extend(("--source", source))
+    return " ".join(parts)
+
+
 def _render_macos_filesystem_access(result: dict[str, object]) -> None:
     folders = result.get("folders")
     folder_payload = folders if isinstance(folders, dict) else {}
@@ -184,6 +197,11 @@ def _run_agent_setup(
             "exit_code": 2,
         }
 
+    rerun_command = _agent_setup_command(
+        skip_daemon=skip_daemon,
+        selected_sources_cli=selected_sources_cli,
+    )
+
     # Check Pi runtime (suppress console output)
     import logging as _logging
 
@@ -202,7 +220,10 @@ def _run_agent_setup(
         return {
             "status": "needs_runtime",
             "error": str(exc),
-            "next_steps": ["Install Node.js 22.19 or newer, then: syke setup --agent"],
+            "next_steps": [
+                "Install Node.js 22.19 or newer",
+                rerun_command,
+            ],
             "exit_code": 1,
         }
     except Exception as exc:
@@ -249,18 +270,18 @@ def _run_agent_setup(
             "user": user_id,
             "detected_sources": detected,
             "instructions": (
-                "Syke needs an LLM provider to synthesize memory. "
-                "Ask the user which provider they use and get their API key. "
-                "Then run: syke auth set <provider> --api-key <KEY> --use\n"
-                "Common providers: anthropic, openai, azure-openai-responses, "
-                "kimi-coding, openrouter.\n"
-                "For Azure, also pass: --base-url https://<resource>.openai.azure.com/openai/v1 "
-                "--model <model>\n"
-                "After auth is configured, run: syke setup --agent"
+                "Choose a provider and authentication method with the user. "
+                "Prefer provider OAuth when available. Never request a secret in chat "
+                "or print credentials. After authentication, rerun the setup command."
             ),
+            "auth_options": {
+                "oauth_example": "syke auth login openai-codex --use",
+                "api_key": "syke auth set <provider> --api-key <KEY> --use",
+                "inspect": "syke auth status --json",
+            },
             "next_steps": [
-                "syke auth set <provider> --api-key <KEY> --use",
-                "syke setup --agent",
+                "Choose one command from auth_options with the user",
+                rerun_command,
             ],
             "exit_code": EXIT_AUTH,
         }
@@ -277,7 +298,7 @@ def _run_agent_setup(
             "error": f"Provider verification failed: {exc}",
             "next_steps": [
                 "syke auth status --json",
-                "syke setup --agent",
+                rerun_command,
             ],
             "exit_code": 1,
         }
@@ -390,10 +411,9 @@ def _run_agent_setup(
     short_help="Review and apply local memory setup.",
     help=(
         "Inspect current setup state, then apply the approved local memory plan.\n\n"
-        "Agents: use --agent for non-interactive JSON setup. "
-        "If the response says needs_runtime, install Node.js 22.19 or newer and rerun. "
-        "If the response says needs_provider, run "
-        "'syke auth set <provider> --api-key <KEY> --use' first, then retry."
+        "Agents: use --agent for structured setup and follow its status and next_steps. "
+        "Use --json to inspect without writing and --skip-daemon when background "
+        "operation is not intended."
     ),
 )
 @click.option(
@@ -408,7 +428,11 @@ def _run_agent_setup(
 @click.option(
     "--json", "use_json", is_flag=True, help="Inspect setup state as JSON without side effects"
 )
-@click.option("--skip-daemon", is_flag=True, help="Skip background service install (testing only)")
+@click.option(
+    "--skip-daemon",
+    is_flag=True,
+    help="Skip background service setup; run `syke sync` manually.",
+)
 @click.option(
     "--agent",
     "agent_mode",

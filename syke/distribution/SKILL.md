@@ -78,30 +78,18 @@ printf '%s\n' 'Decision: keep $(literal) and `quoted` chars.' | syke record
 
 ## Setup & Onboarding
 
-If Syke is not installed or configured, guide setup first.
+If Syke is unavailable, install it with `pipx install syke` or
+`uv tool install syke`.
 
-For humans at a terminal:
-
-1. Install: `pipx install syke` (or `uv tool install syke`)
-2. Run: `syke setup`
-3. Follow the interactive provider, source, and daemon prompts.
-4. Confirm with `syke doctor`.
-
-For unattended agents, installers, and CI:
-
-1. Run `syke setup --agent`.
-2. Parse the JSON `status`, `next_steps`, and `exit_code` fields.
-3. If `status` is `"needs_runtime"`, install Node.js 22.19 or newer
-   and rerun `syke setup --agent`.
-4. If `status` is `"needs_provider"`, configure provider auth with
-   `syke auth set <provider> --api-key <API_KEY> --use` or
-   `syke auth login <provider> --use`, then rerun `syke setup --agent`.
-5. If `status` is `"complete"`, stop setup work and follow the returned
-   `next_steps`. Do not loop on setup.
-6. If `status` is `"failed"`, read the `error` field and fix that issue.
-
-Common providers: `anthropic`, `openai`, `azure-openai-responses`, `kimi-coding`, `openrouter`.
-For Azure, also pass `--base-url https://<resource>.openai.azure.com/openai/v1` and `--model <model>`.
+- Humans run `syke setup` and follow the interactive prompts.
+- Agents run `syke setup --agent`, parse its JSON, and follow the returned
+  `status` and `next_steps` instead of inventing a setup sequence.
+- For `needs_provider`, let the user choose an option from `auth_options`.
+  Never request credentials in chat or print them.
+- For `complete`, stop setup work. Do not loop on setup.
+- Use `--skip-daemon` when background operation is not intended, then run
+  `syke sync` explicitly.
+- Verify the result with `syke doctor`.
 
 ## Provider Commands
 

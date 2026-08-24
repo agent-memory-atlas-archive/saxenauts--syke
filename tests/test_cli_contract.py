@@ -179,6 +179,95 @@ def test_setup_agent_rechecks_provider_after_installing_pi_runtime(cli_runner) -
     assert onboarding["mode"] == "manual"
 
 
+def test_setup_agent_verifies_macos_folders_before_background_start(cli_runner) -> None:
+    payload = {
+        "provider": {"configured": True, "id": "openai-codex", "model": "gpt-5.4"},
+        "sources": [],
+        "daemon": {
+            "platform": "Darwin",
+            "installable": True,
+            "running": False,
+            "persistence": {"manager": "launchd"},
+        },
+    }
+    filesystem_access = {
+        "applicable": True,
+        "ok": True,
+        "status": "granted",
+        "detail": "Desktop, Documents, and Downloads verified for background Syke",
+    }
+
+    with (
+        patch("syke.cli_commands.setup.build_setup_inspect_payload", return_value=payload),
+        patch("syke.llm.pi_client.ensure_pi_binary", return_value="/tmp/pi"),
+        patch("syke.llm.pi_client.get_pi_version", return_value="1.0.0"),
+        patch(
+            "syke.cli_commands.setup.verify_setup_provider_connection",
+            return_value="syke loaded",
+        ),
+        patch(
+            "syke.cli_commands.setup.run_macos_filesystem_access_check",
+            return_value=filesystem_access,
+        ) as verify_access,
+        patch(
+            "syke.cli_commands.setup._launch_background_onboarding",
+            return_value=Path("/tmp/syke-onboarding.log"),
+        ),
+    ):
+        result = cli_runner.invoke(cli, ["--user", "test", "setup", "--agent"])
+
+    parsed = json.loads(result.output)
+    assert result.exit_code == 0
+    assert parsed["status"] == "complete"
+    assert parsed["daemon"] == "started"
+    assert parsed["filesystem_access"] == filesystem_access
+    verify_access.assert_called_once_with("test")
+
+
+def test_setup_agent_returns_secret_safe_auth_and_exact_retry(cli_runner) -> None:
+    payload = {
+        "provider": {"configured": False},
+        "sources": [
+            {
+                "source": "codex",
+                "detected": True,
+                "files_found": 5,
+                "format_cluster": "jsonl",
+            }
+        ],
+        "daemon": {"platform": "Darwin", "installable": False, "running": False},
+    }
+
+    with (
+        patch("syke.cli_commands.setup.build_setup_inspect_payload", return_value=payload),
+        patch("syke.llm.pi_client.ensure_pi_binary", return_value="/tmp/pi"),
+        patch("syke.llm.pi_client.get_pi_version", return_value="1.0.0"),
+    ):
+        result = cli_runner.invoke(
+            cli,
+            [
+                "--user",
+                "test",
+                "setup",
+                "--agent",
+                "--skip-daemon",
+                "--source",
+                "codex",
+            ],
+        )
+
+    parsed = json.loads(result.output)
+    assert result.exit_code == 3
+    assert parsed["status"] == "needs_provider"
+    assert "get their API key" not in parsed["instructions"]
+    assert parsed["auth_options"] == {
+        "oauth_example": "syke auth login openai-codex --use",
+        "api_key": "syke auth set <provider> --api-key <KEY> --use",
+        "inspect": "syke auth status --json",
+    }
+    assert parsed["next_steps"][-1] == ("syke setup --agent --skip-daemon --source codex")
+
+
 def test_setup_agent_rolls_back_to_manual_state_when_background_launch_fails(
     cli_runner,
 ) -> None:

@@ -2,6 +2,8 @@
 
 ## Ingestion (data into Syke)
 
+This table describes native history Syke can ingest, not which agents can install or use it.
+
 | Platform | Local Artifact Contract | Status |
 |----------|-------------------------|--------|
 | Claude Code | `~/.claude/projects/**/*.jsonl`, `~/.claude/transcripts/*.jsonl` | Active |

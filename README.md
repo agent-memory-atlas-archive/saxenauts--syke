@@ -44,6 +44,16 @@ syke setup
 `syke setup` is interactive. It inspects your machine for active harnesses and
 uses Pi agent core for auth and runtime.
 
+### Install with an agent
+
+Give a terminal agent this repository URL and say:
+
+> Install or upgrade Syke from this repository with `uv` using Python 3.12+.
+> Ask whether background operation is allowed, then run `syke setup --agent`
+> (add `--skip-daemon` if declined) and follow its JSON `status` and `next_steps`.
+
+The installing agent does not need to be one of Syke's observed sources.
+
 ## First Run
 
 The normal flow is simple:
@@ -121,8 +131,8 @@ The timeline shows:
 
 ## Supported Harnesses
 
-Syke reads local artifacts from agent tools you already use. Active harnesses
-currently include:
+Syke reads local artifacts from agent tools you already use. This list controls
+native history ingestion, not which terminal agents can install or use Syke:
 
 - Claude Code
 - Codex
@@ -145,9 +155,10 @@ syke ask "what is the current context?"
 syke record "Decision: ship the onboarding fix before changing the API."
 ```
 
-For automation, `syke setup --agent` returns JSON with a `status`, `next_steps`,
-and setup diagnostics. Keep that path for installers, CI, and non-interactive
-agent runners. Humans should start with plain `syke setup`.
+For automation, `syke setup --agent` returns JSON with a `status`, exact
+`next_steps`, and setup diagnostics. Its output is the setup protocol for
+installers and non-interactive agents. Humans should start with plain
+`syke setup`.
 
 More detail: [Setup Guide](docs/SETUP.md).
 

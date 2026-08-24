@@ -75,6 +75,9 @@ than carrying ambiguous state into the pre-1.0 runtime.
   onboarding intent is persisted before background synthesis can start.
 - Added strict config type/range validation and made install, self-update, and
   daemon restoration failures return truthful nonzero outcomes.
+- Made agent setup return secret-safe auth options and exact retry commands,
+  including preserved daemon and source flags. Starting the daemon now requests
+  and verifies macOS access to Desktop, Documents, and Downloads.
 - Reduced managed daemon implementations to launchd and user systemd and made
   process-plus-IPC readiness the success condition.
 - Kept history-backed diagnostics responsive as native session history grows:

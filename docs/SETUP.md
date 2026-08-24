@@ -51,14 +51,17 @@ A healthy first run should end with:
 
 ## Agent Mode (Non-Interactive)
 
+Any terminal agent can install and operate Syke. Native history ingestion is
+limited separately to the sources in [PLATFORMS.md](../PLATFORMS.md).
+
 ```bash
 syke setup --agent
 ```
 
-`--agent` returns JSON with a `status` field:
+`--agent` returns JSON with a `status` field and exact `next_steps`:
 
-- `needs_runtime` - install Node.js 22.19 or newer and rerun setup
-- `needs_provider` - configure provider auth and rerun setup
+- `needs_runtime` - install Node.js 22.19 or newer, then run the returned command
+- `needs_provider` - choose an OAuth or API-key option from `auth_options`
 - `complete` - setup finished
 - `failed` - inspect the returned `error`
 
@@ -68,7 +71,8 @@ because it explains planned writes before applying them.
 Agent payload fields that matter for orchestration:
 
 - `status`, `exit_code`, `instructions`, `next_steps`
-- `estimated_minutes`, `total_files`, `estimate_method`
+- `auth_options` when provider setup is required
+- `estimated_minutes`, `total_files`, `estimate_method`, `sources_ingesting`
 - `daemon` (`started` vs `skipped`)
 - `daemon_persistence`
 - `filesystem_access`
@@ -78,11 +82,13 @@ Agent payload fields that matter for orchestration:
 Recommended automation flow:
 
 1. Run `syke setup --agent` and parse `status`.
-2. If `needs_provider`, run `syke auth set <provider> --api-key <KEY> --use`
-   (or `syke auth login <provider> --use`) and rerun setup.
-3. For CI/smoke or ephemeral environments, use `syke setup --agent --skip-daemon`,
+2. Follow the returned `next_steps`; they preserve `--skip-daemon` and explicit
+   `--source` flags.
+3. For `needs_provider`, let the user choose authentication. Prefer OAuth where
+   available; never request credentials in chat or print them.
+4. For CI/smoke or ephemeral environments, use `syke setup --agent --skip-daemon`,
    then run one explicit `syke sync`.
-4. Only enable daemon setup in environments where launchd/systemd side effects are intended.
+5. Only enable daemon setup where launchd/systemd side effects are intended.
 
 After manual `syke sync`, the JSON payload includes `duration_ms`,
 `session_id`, `session_file`, `num_turns`, `model`, `cost_usd`,
@@ -336,10 +342,11 @@ disabled.
 
 This is separate from macOS privacy permission. Normal folders under `$HOME`
 work without an extra step, but Desktop, Documents, and Downloads require user
-consent. During setup, Syke starts a temporary one-shot launchd job through the
-same installed launcher, Python runtime, Node runtime, and Seatbelt profile used
-by background work. That job tries to list each protected folder so macOS can
-ask for access and Syke can verify the answer immediately.
+consent. During setup—or when `syke daemon start` enables background operation
+later—Syke starts a temporary one-shot launchd job through the same installed
+launcher, Python runtime, Node runtime, and Seatbelt profile used by background
+work. That job tries to list each protected folder so macOS can ask for access
+and Syke can verify the answer immediately.
 
 The check stores only each folder's granted, denied, or missing status plus the
 Python and Node runtime identities. It does not store filenames or file content.

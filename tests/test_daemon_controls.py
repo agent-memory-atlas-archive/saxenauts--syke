@@ -53,6 +53,7 @@ def test_daemon_start_reports_registered_service_without_live_process(cli_runner
             "syke.daemon.daemon.daemon_process_state",
             return_value={"running": False, "pid": None, "source": "none"},
         ),
+        patch("syke.cli_commands.daemon.sys.platform", "linux"),
         patch("syke.daemon.daemon.install_and_start"),
         patch(
             "syke.cli_commands.daemon.daemon_state.wait_for_daemon_startup",
@@ -71,6 +72,51 @@ def test_daemon_start_reports_registered_service_without_live_process(cli_runner
     assert (
         "Daemon service is registered, but no live background process is running." in result.output
     )
+
+
+@pytest.mark.parametrize(
+    ("filesystem_access", "expected_output"),
+    [
+        ({"ok": True}, "Protected-folder access verified."),
+        (
+            {"ok": False, "detail": "blocked: Documents"},
+            "Protected-folder access incomplete: blocked: Documents",
+        ),
+    ],
+)
+def test_daemon_start_verifies_macos_protected_folders(
+    cli_runner,
+    filesystem_access: dict[str, object],
+    expected_output: str,
+) -> None:
+    with (
+        patch("syke.cli_commands.daemon.sys.platform", "darwin"),
+        patch(
+            "syke.daemon.daemon.daemon_process_state",
+            return_value={"running": False, "pid": None, "source": "none"},
+        ),
+        patch("syke.daemon.daemon.install_and_start") as install,
+        patch(
+            "syke.runtime.macos_filesystem_access.run_macos_filesystem_access_check",
+            return_value=filesystem_access,
+        ) as verify_access,
+        patch(
+            "syke.cli_commands.daemon.daemon_state.wait_for_daemon_startup",
+            return_value={
+                "running": True,
+                "registered": True,
+                "platform": "Darwin",
+                "pid": 123,
+                "ipc": {"ok": True, "detail": "ready"},
+            },
+        ),
+    ):
+        result = cli_runner.invoke(cli, ["--user", "test", "daemon", "start"])
+
+    assert result.exit_code == 0
+    verify_access.assert_called_once_with("test")
+    install.assert_called_once_with("test", 900)
+    assert expected_output in result.output
 
 
 def test_daemon_stop_reports_incomplete_when_process_survives(cli_runner) -> None:

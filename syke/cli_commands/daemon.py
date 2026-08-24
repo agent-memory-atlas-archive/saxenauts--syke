@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections import deque
 from typing import cast
 
@@ -53,6 +54,14 @@ def daemon_start(ctx: click.Context, interval: int) -> None:
         return
     console.print(f"[bold]syke daemon start[/bold]  [dim]{user_id}[/dim]")
     console.print(f"  Sync interval: {interval}s ({interval // 60} minutes)")
+
+    filesystem_access: dict[str, object] | None = None
+    if sys.platform == "darwin":
+        from syke.runtime.macos_filesystem_access import run_macos_filesystem_access_check
+
+        console.print("  Checking Desktop, Documents, and Downloads access...")
+        filesystem_access = run_macos_filesystem_access_check(user_id)
+
     install_and_start(user_id, interval)
     readiness = daemon_state.wait_for_daemon_startup(user_id)
     ipc = cast(dict[str, object], readiness["ipc"])
@@ -61,6 +70,12 @@ def daemon_start(ctx: click.Context, interval: int) -> None:
             "[green]✓[/green] Background service started. "
             f"Sync runs every {interval // 60} minutes."
         )
+        if filesystem_access is not None:
+            if filesystem_access.get("ok"):
+                console.print("[green]✓[/green] Protected-folder access verified.")
+            else:
+                detail = filesystem_access.get("detail") or "protected-folder access is blocked"
+                console.print(f"[yellow]Protected-folder access incomplete:[/yellow] {detail}")
         console.print("  Check status: syke daemon status")
         console.print("  View logs:    syke daemon logs")
         return
