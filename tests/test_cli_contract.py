@@ -172,6 +172,8 @@ def test_setup_agent_rechecks_provider_after_installing_pi_runtime(cli_runner) -
         "daemon": "skipped",
         "onboarding_mode": "manual",
     }
+    assert parsed["next_steps"] == ["syke sync", "syke memex", "syke status --json"]
+    assert "`syke ask` requires the daemon" in parsed["instructions"]
     assert inspect_payload.call_count == 2
     launch_onboarding.assert_not_called()
     onboarding = read_onboarding_state("test")
@@ -227,6 +229,17 @@ def test_setup_agent_verifies_macos_folders_before_background_start(cli_runner) 
 def test_setup_agent_returns_secret_safe_auth_and_exact_retry(cli_runner) -> None:
     payload = {
         "provider": {"configured": False},
+        "provider_choices": [
+            {
+                "id": "openai-codex",
+                "label": "OpenAI (ChatGPT Plus/Pro)",
+                "oauth": True,
+                "ready": False,
+                "default_model": "gpt-5.4",
+                "models": ["gpt-5.4", "gpt-5.3-codex"],
+                "detail": "No auth configured",
+            }
+        ],
         "sources": [
             {
                 "source": "codex",
@@ -260,8 +273,17 @@ def test_setup_agent_returns_secret_safe_auth_and_exact_retry(cli_runner) -> Non
     assert result.exit_code == 3
     assert parsed["status"] == "needs_provider"
     assert "get their API key" not in parsed["instructions"]
+    assert parsed["provider_choices"] == [
+        {
+            "id": "openai-codex",
+            "label": "OpenAI (ChatGPT Plus/Pro)",
+            "oauth": True,
+            "ready": False,
+            "default_model": "gpt-5.4",
+        }
+    ]
     assert parsed["auth_options"] == {
-        "oauth_example": "syke auth login openai-codex --use",
+        "oauth": "syke auth login <provider> --use",
         "api_key": "syke auth set <provider> --api-key <KEY> --use",
         "inspect": "syke auth status --json",
     }

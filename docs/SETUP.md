@@ -61,7 +61,7 @@ syke setup --agent
 `--agent` returns JSON with a `status` field and exact `next_steps`:
 
 - `needs_runtime` - install Node.js 22.19 or newer, then run the returned command
-- `needs_provider` - choose an OAuth or API-key option from `auth_options`
+- `needs_provider` - choose from `provider_choices`, then run the matching `auth_options` command
 - `complete` - setup finished
 - `failed` - inspect the returned `error`
 
@@ -71,7 +71,7 @@ because it explains planned writes before applying them.
 Agent payload fields that matter for orchestration:
 
 - `status`, `exit_code`, `instructions`, `next_steps`
-- `auth_options` when provider setup is required
+- `provider_choices` and `auth_options` when provider setup is required
 - `estimated_minutes`, `total_files`, `estimate_method`, `sources_ingesting`
 - `daemon` (`started` vs `skipped`)
 - `daemon_persistence`
@@ -84,8 +84,9 @@ Recommended automation flow:
 1. Run `syke setup --agent` and parse `status`.
 2. Follow the returned `next_steps`; they preserve `--skip-daemon` and explicit
    `--source` flags.
-3. For `needs_provider`, let the user choose authentication. Prefer OAuth where
-   available; never request credentials in chat or print them.
+3. For `needs_provider`, present `provider_choices` and run the selected
+   `auth_options` command. Pi opens the browser or shows a device code. Never
+   request credentials in chat or print them.
 4. For CI/smoke or ephemeral environments, use `syke setup --agent --skip-daemon`,
    then run one explicit `syke sync`.
 5. Only enable daemon setup where launchd/systemd side effects are intended.

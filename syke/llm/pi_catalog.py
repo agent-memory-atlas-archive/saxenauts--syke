@@ -265,19 +265,25 @@ def get_pi_provider_catalog() -> tuple[PiProviderCatalogEntry, ...]:
     return _load_pi_catalog()
 
 
-def run_pi_oauth_login(provider_id: str, *, manual: bool = False) -> None:
-    """Run Pi's native OAuth login flow for a provider."""
+def run_pi_oauth_login(provider_id: str, *, method: str = "auto") -> None:
+    """Run Pi's native OAuth login flow with its standard browser handoff."""
+    if method not in {"auto", "browser", "device-code"}:
+        raise ValueError(f"Unsupported Pi login method: {method}")
+
     script = """
 import readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { openBrowser } from
+  "./node_modules/@earendil-works/pi-coding-agent/dist/utils/open-browser.js";
 
 const provider = process.env.SYKE_PI_LOGIN_PROVIDER;
-const manual = process.env.SYKE_PI_LOGIN_MANUAL === "1";
+const requestedMethod = process.env.SYKE_PI_LOGIN_METHOD ?? "auto";
 if (!provider) {
   throw new Error("Missing SYKE_PI_LOGIN_PROVIDER");
 }
 
+const normalizeMethod = (value) => String(value).replaceAll("-", "_");
 const rl = readline.createInterface({ input: stdin, output: stdout });
 
 try {
@@ -290,6 +296,7 @@ try {
       if (event.type === "auth_url") {
         console.log(`Open this URL to continue: ${event.url}`);
         if (event.instructions) console.log(event.instructions);
+        if (requestedMethod !== "device-code") openBrowser(event.url);
       } else if (event.type === "device_code") {
         console.log(`Open ${event.verificationUri} and enter code ${event.userCode}`);
       } else if (event.type === "info" || event.type === "progress") {
@@ -298,7 +305,7 @@ try {
       }
     },
     prompt: async (prompt) => {
-      if (prompt.type === "manual_code" && !manual && prompt.signal) {
+      if (prompt.type === "manual_code" && prompt.signal) {
         return await new Promise((resolve) => {
           const finish = () => resolve("");
           if (prompt.signal.aborted) finish();
@@ -306,15 +313,17 @@ try {
         });
       }
       if (prompt.type === "select") {
-        if (!manual && prompt.options.length > 0) return prompt.options[0].id;
-        console.log(prompt.message);
-        prompt.options.forEach((option, index) => {
-          const detail = option.description ? ` - ${option.description}` : "";
-          console.log(`${index + 1}. ${option.label}${detail}`);
-        });
-        const answer = await rl.question("Choice: ");
-        const index = Number.parseInt(answer, 10) - 1;
-        return prompt.options[index]?.id ?? answer;
+        if (prompt.options.length === 0) throw new Error("Pi offered no login methods");
+        if (requestedMethod === "auto") return prompt.options[0].id;
+        const requested = normalizeMethod(requestedMethod);
+        const selected = prompt.options.find((option) => normalizeMethod(option.id) === requested);
+        if (!selected) {
+          const supported = prompt.options.map((option) => option.id).join(", ");
+          throw new Error(
+            `Pi does not offer ${requestedMethod} login here (supported: ${supported})`,
+          );
+        }
+        return selected.id;
       }
       const placeholder = prompt.placeholder ? ` (${prompt.placeholder})` : "";
       const options = prompt.signal ? { signal: prompt.signal } : undefined;
@@ -334,7 +343,7 @@ try {
             build_pi_agent_env(
                 {
                     "SYKE_PI_LOGIN_PROVIDER": provider_id,
-                    "SYKE_PI_LOGIN_MANUAL": "1" if manual else "0",
+                    "SYKE_PI_LOGIN_METHOD": method,
                 }
             ),
             provider=provider_id,

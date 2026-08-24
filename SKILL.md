@@ -79,12 +79,13 @@ printf '%s\n' 'Decision: keep $(literal) and `quoted` chars.' | syke record
 ## Setup & Onboarding
 
 If Syke is unavailable, install it with `pipx install syke` or
-`uv tool install syke`.
+`uv tool install syke`. Syke requires Python 3.12+ and Node.js 22.19 or newer.
 
 - Humans run `syke setup` and follow the interactive prompts.
 - Agents run `syke setup --agent`, parse its JSON, and follow the returned
   `status` and `next_steps` instead of inventing a setup sequence.
-- For `needs_provider`, let the user choose an option from `auth_options`.
+- For `needs_provider`, present `provider_choices` and run the selected
+  `auth_options` command. Pi opens the browser or shows a device code.
   Never request credentials in chat or print them.
 - For `complete`, stop setup work. Do not loop on setup.
 - Use `--skip-daemon` when background operation is not intended, then run

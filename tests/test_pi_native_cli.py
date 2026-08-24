@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from syke.entrypoint import cli
 from syke.llm.pi_client import PiProviderCatalogEntry
@@ -220,9 +220,8 @@ def test_auth_login_reloads_catalog_and_activates_after_probe(
         "syke.llm.pi_client.get_pi_provider_catalog",
         lambda: next(catalogs, (entry,)),
     )
-    monkeypatch.setattr(
-        "syke.llm.pi_client.run_pi_oauth_login", lambda provider, manual=False: None
-    )
+    login = Mock()
+    monkeypatch.setattr("syke.llm.pi_client.run_pi_oauth_login", login)
     seen: dict[str, str] = {}
 
     def _probe(provider: str, model: str, **kwargs):
@@ -235,8 +234,38 @@ def test_auth_login_reloads_catalog_and_activates_after_probe(
     result = cli_runner.invoke(cli, ["auth", "login", "openai-codex", "--use"])
 
     assert result.exit_code == 0
+    login.assert_called_once_with("openai-codex", method="auto")
     assert seen == {"provider": "openai-codex", "model": "gpt-5.4"}
     assert (get_default_provider(), get_default_model()) == ("openai-codex", "gpt-5.4")
+
+
+def test_auth_login_passes_device_code_override_to_pi(
+    cli_runner, monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SYKE_PI_AGENT_DIR", str(tmp_path / "pi-agent"))
+    monkeypatch.setattr("syke.llm.pi_client.ensure_pi_binary", lambda: str(tmp_path / "pi"))
+    _patch_catalog(
+        monkeypatch,
+        (
+            PiProviderCatalogEntry(
+                "openai-codex",
+                ("gpt-5.4",),
+                (),
+                "gpt-5.4",
+                True,
+            ),
+        ),
+    )
+    login = Mock()
+    monkeypatch.setattr("syke.llm.pi_client.run_pi_oauth_login", login)
+
+    result = cli_runner.invoke(
+        cli,
+        ["auth", "login", "openai-codex", "--method", "device-code"],
+    )
+
+    assert result.exit_code == 0
+    login.assert_called_once_with("openai-codex", method="device-code")
 
 
 def test_auth_set_rejects_unpersisted_api_version(cli_runner, monkeypatch, tmp_path: Path) -> None:
@@ -433,7 +462,7 @@ def test_sync_source_flag_persists_and_forwards_selection(cli_runner) -> None:
     assert parsed["session_id"] == "session-1"
     assert parsed["session_file"] == "/protected/session-1.jsonl"
     assert "tool_calls" not in parsed
-    assert parsed["next_steps"][0].startswith("syke ask")
+    assert parsed["next_steps"] == ["syke memex", "syke status --json", "syke web --open"]
     onboarding = read_onboarding_state("test")
     assert onboarding is not None
     assert onboarding["status"] == "first_synthesis_completed"

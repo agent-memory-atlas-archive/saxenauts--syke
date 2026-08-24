@@ -248,7 +248,7 @@ def sync(
                         "error": result.get("error"),
                         "selected_sources": list(effective_sources),
                         "next_steps": [
-                            'syke ask "what am I working on?"',
+                            "syke memex",
                             "syke status --json",
                             "syke web --open",
                         ],
@@ -269,7 +269,7 @@ def sync(
                 else "MEMEX unchanged; continue working or record a note when useful."
             )
             console.print(f"\n[bold]Synthesis completed{duration}.[/bold] {memex_state}")
-            console.print('[dim]Next: syke ask "what am I working on?" or keep working.[/dim]')
+            console.print("[dim]Next: syke memex or keep working.[/dim]")
         elif status == "skipped":
             console.print("[dim]No new events. Already up to date.[/dim]")
         else:

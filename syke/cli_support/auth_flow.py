@@ -300,7 +300,8 @@ def resolve_provider_auth_interactive(provider_id: str) -> FlowChoice:
                 default=True,
             )
             try:
-                run_pi_oauth_login(provider_id, manual=not use_local_browser)
+                method = "browser" if use_local_browser else "device-code"
+                run_pi_oauth_login(provider_id, method=method)
             except Exception as exc:
                 console.print(f"\n  [red]Pi login failed:[/red] {escape(str(exc))}")
                 return FlowChoice("cancelled")

@@ -240,8 +240,20 @@ def auth_set(
     default=False,
     help="Also make this the active provider",
 )
+@click.option(
+    "--method",
+    type=click.Choice(["auto", "browser", "device-code"]),
+    default="auto",
+    show_default=True,
+    help="Pi login interaction to prefer",
+)
 @click.pass_context
-def auth_login(ctx: click.Context, provider: str, set_active: bool) -> None:
+def auth_login(
+    ctx: click.Context,
+    provider: str,
+    set_active: bool,
+    method: str,
+) -> None:
     from syke.llm.pi_client import get_pi_provider_catalog, run_pi_oauth_login
     from syke.pi_state import set_default_provider_and_model
 
@@ -262,13 +274,7 @@ def auth_login(ctx: click.Context, provider: str, set_active: bool) -> None:
     _ensure_auth_runtime()
 
     try:
-        use_local_browser = False
-        if sys.stdin.isatty():
-            use_local_browser = click.confirm(
-                "\n  Use this machine's browser for sign-in?",
-                default=True,
-            )
-        run_pi_oauth_login(provider, manual=not use_local_browser)
+        run_pi_oauth_login(provider, method=method)
     except Exception as exc:
         raise SykeAuthException(f"Pi login failed: {escape(str(exc))}") from exc
 

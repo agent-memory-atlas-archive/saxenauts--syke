@@ -265,22 +265,36 @@ def _run_agent_setup(
             for s in source_items
             if s.get("detected") and cast(str, s["source"]) in selected
         ]
+        provider_choices = [
+            {
+                "id": item.get("id"),
+                "label": item.get("label"),
+                "oauth": bool(item.get("oauth")),
+                "ready": bool(item.get("ready")),
+                "default_model": item.get("default_model"),
+            }
+            for item in cast(
+                list[dict[str, object]],
+                inspect_info.get("provider_choices", []),
+            )
+        ]
         return {
             "status": "needs_provider",
             "user": user_id,
             "detected_sources": detected,
+            "provider_choices": provider_choices,
             "instructions": (
-                "Choose a provider and authentication method with the user. "
-                "Prefer provider OAuth when available. Never request a secret in chat "
-                "or print credentials. After authentication, rerun the setup command."
+                "Choose a provider with the user. Prefer OAuth when available; Pi will "
+                "open a browser or show a device code. Never request or print a secret. "
+                "After authentication, rerun the setup command."
             ),
             "auth_options": {
-                "oauth_example": "syke auth login openai-codex --use",
+                "oauth": "syke auth login <provider> --use",
                 "api_key": "syke auth set <provider> --api-key <KEY> --use",
                 "inspect": "syke auth status --json",
             },
             "next_steps": [
-                "Choose one command from auth_options with the user",
+                "Choose a provider from provider_choices and run the matching auth option",
                 rerun_command,
             ],
             "exit_code": EXIT_AUTH,
@@ -377,14 +391,15 @@ def _run_agent_setup(
             "and synthesis are not running yet. "
             f"Run `syke sync` once to bootstrap memory now; first synthesis is "
             f"estimated around {est} minutes based on {total_files} detected files. "
-            "After that, move on with normal work and use `syke ask` when needed. "
+            "After that, use `syke memex` for the local result. `syke ask` requires "
+            "the daemon; start it later only if background operation is wanted. "
             "Do NOT run syke setup again. "
             "Check progress with: syke status --json"
         )
         next_steps = [
             "syke sync",
+            "syke memex",
             "syke status --json",
-            'syke ask "what am I working on?"',
         ]
     return {
         "status": "complete",

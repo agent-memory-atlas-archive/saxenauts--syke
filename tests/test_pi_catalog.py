@@ -132,10 +132,12 @@ from pathlib import Path
 
 Path(os.environ["CAPTURE_PATH"]).write_text(json.dumps({{
     "provider": os.environ.get("SYKE_PI_LOGIN_PROVIDER"),
-    "manual": os.environ.get("SYKE_PI_LOGIN_MANUAL"),
+    "method": os.environ.get("SYKE_PI_LOGIN_METHOD"),
     "openai_key": os.environ.get("OPENAI_API_KEY"),
     "unsafe_present": "UNSAFE_SECRET" in os.environ,
     "args": sys.argv[1:3],
+    "opens_browser": "openBrowser(event.url)" in sys.argv[3],
+    "selects_method": "normalizeMethod(option.id) === requested" in sys.argv[3],
 }}), encoding="utf-8")
 """,
         encoding="utf-8",
@@ -149,16 +151,23 @@ Path(os.environ["CAPTURE_PATH"]).write_text(json.dumps({{
     monkeypatch.setattr(pi_install, "PI_LOCAL_PREFIX", tmp_path)
     monkeypatch.setattr(pi_install, "ensure_node_binary", lambda: node)
 
-    pi_catalog.run_pi_oauth_login("openai", manual=True)
+    pi_catalog.run_pi_oauth_login("openai", method="device-code")
 
     observed = json.loads(capture.read_text(encoding="utf-8"))
     assert observed == {
         "provider": "openai",
-        "manual": "1",
+        "method": "device-code",
         "openai_key": "host-openai",
         "unsafe_present": False,
         "args": ["--input-type=module", "-e"],
+        "opens_browser": True,
+        "selects_method": True,
     }
+
+
+def test_oauth_login_rejects_unknown_interaction_method() -> None:
+    with pytest.raises(ValueError, match="Unsupported Pi login method"):
+        pi_catalog.run_pi_oauth_login("openai", method="magic")
 
 
 def test_prepare_host_oauth_uses_trusted_process_and_fails_closed(

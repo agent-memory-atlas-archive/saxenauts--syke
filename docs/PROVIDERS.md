@@ -53,7 +53,7 @@ Important:
 | Provider Class | Example | Notes |
 |---|---|---|
 | API-key Pi provider | `syke auth set openrouter --api-key <key> --model openai/gpt-5.1-codex --use` | Use Pi provider IDs such as `openai`, `openrouter`, `zai`, `kimi-coding`, or `azure-openai-responses`. |
-| Pi-native OAuth provider | `syke auth login openai-codex --use` | Uses Pi's native login flow and stores the result in `~/.syke/pi-agent/auth.json`. |
+| Pi-native OAuth provider | `syke auth login openai-codex --use` | Uses Pi's native browser/device flow and stores the result in `~/.syke/pi-agent/auth.json`. |
 | Custom OpenAI-compatible provider | `syke auth set localproxy --base-url URL --model MODEL --use` | For self-hosted or local OpenAI-compatible endpoints that are not in Pi's built-in catalog. |
 
 Syke does not ship its own provider registry anymore. The available built-in providers and models come from Pi's live catalog.
@@ -104,6 +104,9 @@ syke auth set openai --api-key <key> --model gpt-5.4 --use
 ```bash
 syke auth login openai-codex --use
 ```
+
+Pi opens browser login when available and otherwise shows the provider's device
+flow. For a remote terminal, request it explicitly with `--method device-code`.
 
 ### Other Supported Providers
 
