@@ -73,7 +73,7 @@ Agent payload fields that matter for orchestration:
 - `status`, `exit_code`, `instructions`, `next_steps`
 - `provider_choices` and `auth_options` when provider setup is required
 - `estimated_minutes`, `total_files`, `estimate_method`, `sources_ingesting`
-- `daemon` (`started` vs `skipped`)
+- `daemon` (`started` on successful setup)
 - `daemon_persistence`
 - `filesystem_access`
 - `monitor`
@@ -82,14 +82,12 @@ Agent payload fields that matter for orchestration:
 Recommended automation flow:
 
 1. Run `syke setup --agent` and parse `status`.
-2. Follow the returned `next_steps`; they preserve `--skip-daemon` and explicit
-   `--source` flags.
+2. Follow the returned `next_steps`; they preserve explicit `--source` flags.
 3. For `needs_provider`, present `provider_choices` and run the selected
    `auth_options` command. Pi opens the browser or shows a device code. Never
    request credentials in chat or print them.
-4. For CI/smoke or ephemeral environments, use `syke setup --agent --skip-daemon`,
-   then run one explicit `syke sync`.
-5. Only enable daemon setup where launchd/systemd side effects are intended.
+4. Treat background-service failure as setup failure; there is no foreground-only
+   installation mode.
 
 After manual `syke sync`, the JSON payload includes `duration_ms`,
 `session_id`, `session_file`, `num_turns`, `model`, `cost_usd`,
@@ -123,9 +121,8 @@ SYKE_MODEL=gpt-5.4 \
 bash install_syke.sh
 ```
 
-`install_syke.sh` defaults to the real user path: after provider auth is ready,
-setup starts the background service. Set `SYKE_SKIP_DAEMON=1` only for CI, tests, or
-throwaway profiles.
+`install_syke.sh` uses the real setup path: after provider auth is ready, setup
+starts and verifies the background service.
 
 ## First Sync And Onboarding
 

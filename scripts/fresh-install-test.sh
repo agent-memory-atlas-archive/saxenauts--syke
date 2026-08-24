@@ -4,14 +4,12 @@
 # Usage:
 #   bash scripts/fresh-install-test.sh --run
 #   bash scripts/fresh-install-test.sh --run --wheel dist/syke-0.5.7-py3-none-any.whl
-#   bash scripts/fresh-install-test.sh --run --provider-state "$HOME/.syke/pi-agent"
 #   bash scripts/fresh-install-test.sh --run --allow-needs-runtime
 
 set -euo pipefail
 
 RUN=false
 WHEEL_PATH=""
-PROVIDER_STATE=""
 USER_ID="fresh"
 ALLOW_NEEDS_RUNTIME=false
 
@@ -26,10 +24,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --wheel)
       WHEEL_PATH="${2:-}"
-      shift 2
-      ;;
-    --provider-state)
-      PROVIDER_STATE="${2:-}"
       shift 2
       ;;
     --user)
@@ -55,7 +49,6 @@ re-run with:
 
 optional:
   --wheel <path-to-wheel>
-  --provider-state <dir-with-auth.json>
   --user <id>
   --allow-needs-runtime
 EOF
@@ -72,18 +65,8 @@ if [[ -n "$WHEEL_PATH" && ! -f "$WHEEL_PATH" ]]; then
   exit 1
 fi
 
-if [[ -n "$PROVIDER_STATE" && ! -d "$PROVIDER_STATE" ]]; then
-  echo "provider state directory not found: $PROVIDER_STATE" >&2
-  exit 1
-fi
-
 TMP_ROOT="$(mktemp -d)"
-DAEMON_PID=""
 cleanup() {
-  if [[ -n "$DAEMON_PID" ]]; then
-    kill "$DAEMON_PID" >/dev/null 2>&1 || true
-    wait "$DAEMON_PID" >/dev/null 2>&1 || true
-  fi
   rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT
@@ -144,117 +127,5 @@ assert payload["exit_code"] in {0, 1, 2, 3}, payload
 assert code == payload["exit_code"], (code, payload["exit_code"], payload)
 print(f"[fresh-agent] step1 status={payload['status']} exit={code}")
 PY
-
-if [[ -n "$PROVIDER_STATE" ]]; then
-  AGENT_JSON_2="$TMP_ROOT/setup-agent-2.json"
-  AGENT_EXIT_2="$TMP_ROOT/setup-agent-2.exit"
-  SYNC_JSON="$TMP_ROOT/sync.json"
-  MEMEX_JSON="$TMP_ROOT/memex.json"
-  ASK_JSON="$TMP_ROOT/ask.json"
-
-  echo "[fresh-agent] copying provider state fixture"
-  mkdir -p "$HOME/.syke/pi-agent"
-  cp "$PROVIDER_STATE/auth.json" "$HOME/.syke/pi-agent/auth.json"
-  if [[ -f "$PROVIDER_STATE/settings.json" ]]; then
-    cp "$PROVIDER_STATE/settings.json" "$HOME/.syke/pi-agent/settings.json"
-  fi
-  if [[ -f "$PROVIDER_STATE/models.json" ]]; then
-    cp "$PROVIDER_STATE/models.json" "$HOME/.syke/pi-agent/models.json"
-  fi
-
-  echo "[fresh-agent] setup --agent --skip-daemon"
-  set +e
-  "$SYKE_BIN" --user "$USER_ID" setup --agent --skip-daemon >"$AGENT_JSON_2"
-  agent_exit_2=$?
-  set -e
-  echo "$agent_exit_2" >"$AGENT_EXIT_2"
-
-  python3 - "$AGENT_JSON_2" "$AGENT_EXIT_2" <<'PY'
-import json
-import sys
-
-setup_path, exit_path = sys.argv[1:3]
-
-with open(setup_path, encoding="utf-8") as fh:
-    payload = json.load(fh)
-with open(exit_path, encoding="utf-8") as fh:
-    code = int(fh.read().strip())
-
-assert payload["status"] == "complete", payload
-assert payload["daemon"] == "skipped", payload
-assert payload["exit_code"] == 0, payload
-assert code == 0, code
-assert payload.get("next_steps", [None])[0] == "syke sync", payload
-print("[fresh-agent] step2 complete with skip-daemon contract")
-PY
-
-  echo "[fresh-agent] sync + ask smoke"
-  "$SYKE_BIN" --user "$USER_ID" sync --json >"$SYNC_JSON"
-  "$SYKE_BIN" --user "$USER_ID" memex --json >"$MEMEX_JSON"
-
-  python3 - "$SYNC_JSON" "$MEMEX_JSON" <<'PY'
-import json
-import sys
-
-sync_path, memex_path = sys.argv[1:3]
-with open(sync_path, encoding="utf-8") as fh:
-    sync = json.load(fh)
-with open(memex_path, encoding="utf-8") as fh:
-    memex = json.load(fh)
-
-assert sync["ok"] is True, sync
-assert sync["status"] == "completed", sync
-assert sync["session_id"], sync
-assert memex["memex"], memex
-PY
-
-  DAEMON_LOG="$TMP_ROOT/daemon.log"
-  DAEMON_STATUS_JSON="$TMP_ROOT/daemon-status.json"
-  "$SYKE_BIN" --user "$USER_ID" daemon run --interval 300 >"$DAEMON_LOG" 2>&1 &
-  DAEMON_PID=$!
-  for _ in $(seq 1 40); do
-    "$SYKE_BIN" --user "$USER_ID" status --json >"$DAEMON_STATUS_JSON" || true
-    if python3 - "$DAEMON_STATUS_JSON" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as fh:
-    payload = json.load(fh)
-
-daemon = payload.get("daemon") or {}
-signals = payload.get("runtime_signals") or {}
-ipc = signals.get("daemon_ipc") or {}
-raise SystemExit(0 if daemon.get("running") and ipc.get("socket_present") else 1)
-PY
-    then
-      break
-    fi
-    sleep 1
-  done
-
-  python3 - "$DAEMON_STATUS_JSON" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as fh:
-    payload = json.load(fh)
-
-assert payload["daemon"]["running"] is True, payload
-assert payload["runtime_signals"]["daemon_ipc"]["socket_present"] is True, payload
-PY
-
-  "$SYKE_BIN" --user "$USER_ID" ask --json "what am I working on" >"$ASK_JSON"
-  python3 - "$ASK_JSON" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as fh:
-    payload = json.load(fh)
-
-assert payload["ok"] is True, payload
-assert "answer" in payload and payload["answer"], payload
-print("[fresh-agent] ask smoke ok")
-PY
-fi
 
 echo "[fresh-agent] passed"

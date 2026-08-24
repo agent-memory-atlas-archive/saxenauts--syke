@@ -50,6 +50,7 @@ def test_setup_json_is_inspect_only(tmp_path: Path) -> None:
     parsed = json.loads(result.stdout)
     assert parsed["mode"] == "inspect"
     assert parsed["user"] == "test"
+    assert all(point["id"] != "daemon" for point in parsed["consent_points"])
     assert not (home / ".syke").exists()
 
 
@@ -135,7 +136,12 @@ def test_setup_agent_rechecks_provider_after_installing_pi_runtime(cli_runner) -
     second_payload = {
         "provider": {"configured": True, "id": "openai-codex", "model": "gpt-5.4"},
         "sources": [],
-        "daemon": {"platform": "Darwin", "installable": False, "running": False},
+        "daemon": {
+            "platform": "Darwin",
+            "installable": True,
+            "running": False,
+            "persistence": {"manager": "launchd"},
+        },
     }
 
     with (
@@ -150,14 +156,15 @@ def test_setup_agent_rechecks_provider_after_installing_pi_runtime(cli_runner) -
             return_value="syke loaded",
         ),
         patch(
+            "syke.cli_commands.setup.run_macos_filesystem_access_check",
+            return_value={"applicable": True, "ok": True, "status": "granted"},
+        ),
+        patch(
             "syke.cli_commands.setup._launch_background_onboarding",
             return_value=Path("/tmp/syke-onboarding.log"),
         ) as launch_onboarding,
     ):
-        result = cli_runner.invoke(
-            cli,
-            ["--user", "test", "setup", "--agent", "--skip-daemon"],
-        )
+        result = cli_runner.invoke(cli, ["--user", "test", "setup", "--agent"])
 
     assert result.exit_code == 0
     parsed = json.loads(result.output)
@@ -169,16 +176,15 @@ def test_setup_agent_rechecks_provider_after_installing_pi_runtime(cli_runner) -
     } == {
         "status": "complete",
         "provider": {"id": "openai-codex", "model": "gpt-5.4"},
-        "daemon": "skipped",
-        "onboarding_mode": "manual",
+        "daemon": "started",
+        "onboarding_mode": "daemon",
     }
-    assert parsed["next_steps"] == ["syke sync", "syke memex", "syke status --json"]
-    assert "`syke ask` requires the daemon" in parsed["instructions"]
+    assert parsed["next_steps"][-1] == "syke status --json"
     assert inspect_payload.call_count == 2
-    launch_onboarding.assert_not_called()
+    launch_onboarding.assert_called_once_with(user_id="test", selected_sources=[])
     onboarding = read_onboarding_state("test")
     assert onboarding is not None
-    assert onboarding["mode"] == "manual"
+    assert onboarding["mode"] == "daemon"
 
 
 def test_setup_agent_verifies_macos_folders_before_background_start(cli_runner) -> None:
@@ -263,7 +269,6 @@ def test_setup_agent_returns_secret_safe_auth_and_exact_retry(cli_runner) -> Non
                 "test",
                 "setup",
                 "--agent",
-                "--skip-daemon",
                 "--source",
                 "codex",
             ],
@@ -287,10 +292,42 @@ def test_setup_agent_returns_secret_safe_auth_and_exact_retry(cli_runner) -> Non
         "api_key": "syke auth set <provider> --api-key <KEY> --use",
         "inspect": "syke auth status --json",
     }
-    assert parsed["next_steps"][-1] == ("syke setup --agent --skip-daemon --source codex")
+    assert parsed["next_steps"][-1] == "syke setup --agent --source codex"
 
 
-def test_setup_agent_rolls_back_to_manual_state_when_background_launch_fails(
+def test_setup_agent_fails_when_background_service_is_unavailable(cli_runner) -> None:
+    payload = {
+        "provider": {"configured": True, "id": "openai-codex", "model": "gpt-5.4"},
+        "sources": [],
+        "daemon": {
+            "platform": "Linux",
+            "installable": False,
+            "running": False,
+            "detail": "systemd user manager unavailable",
+        },
+    }
+    with (
+        patch("syke.cli_commands.setup.build_setup_inspect_payload", return_value=payload),
+        patch("syke.llm.pi_client.ensure_pi_binary", return_value="/tmp/pi"),
+        patch("syke.llm.pi_client.get_pi_version", return_value="1.0.0"),
+        patch(
+            "syke.cli_commands.setup.verify_setup_provider_connection",
+            return_value="syke loaded",
+        ),
+        patch("syke.cli_commands.setup._launch_background_onboarding") as launch_onboarding,
+    ):
+        result = cli_runner.invoke(cli, ["--user", "test", "setup", "--agent"])
+
+    parsed = json.loads(result.output)
+    assert result.exit_code == 1
+    assert parsed["status"] == "failed"
+    assert parsed["error"] == (
+        "Background service is required for setup: systemd user manager unavailable"
+    )
+    launch_onboarding.assert_not_called()
+
+
+def test_setup_agent_fails_without_downgrading_when_background_launch_fails(
     cli_runner,
 ) -> None:
     payload = {
@@ -323,11 +360,11 @@ def test_setup_agent_rolls_back_to_manual_state_when_background_launch_fails(
     assert result.exit_code == 1
     assert parsed["status"] == "failed"
     assert "cannot spawn" in parsed["error"]
-    assert parsed["onboarding"]["mode"] == "manual"
-    assert parsed["onboarding"]["monitor"] is None
+    assert parsed["onboarding"]["mode"] == "daemon"
+    assert parsed["onboarding"]["monitor"] == "/tmp/onboarding.log"
     onboarding = read_onboarding_state("test")
     assert onboarding is not None
-    assert onboarding["mode"] == "manual"
+    assert onboarding["mode"] == "daemon"
 
 
 def test_setup_agent_source_flag_limits_ingestion(cli_runner) -> None:
@@ -347,7 +384,12 @@ def test_setup_agent_source_flag_limits_ingestion(cli_runner) -> None:
                 "format_cluster": "jsonl",
             },
         ],
-        "daemon": {"platform": "Darwin", "installable": False, "running": False},
+        "daemon": {
+            "platform": "Linux",
+            "installable": True,
+            "running": False,
+            "persistence": {"manager": "systemd"},
+        },
     }
 
     with (
@@ -358,11 +400,14 @@ def test_setup_agent_source_flag_limits_ingestion(cli_runner) -> None:
             "syke.cli_commands.setup.verify_setup_provider_connection",
             return_value="syke loaded",
         ),
-        patch("syke.cli_commands.setup._launch_background_onboarding") as launch_onboarding,
+        patch(
+            "syke.cli_commands.setup._launch_background_onboarding",
+            return_value=Path("/tmp/syke-onboarding.log"),
+        ) as launch_onboarding,
     ):
         result = cli_runner.invoke(
             cli,
-            ["--user", "test", "setup", "--agent", "--skip-daemon", "--source", "codex"],
+            ["--user", "test", "setup", "--agent", "--source", "codex"],
         )
 
     assert result.exit_code == 0
@@ -370,7 +415,14 @@ def test_setup_agent_source_flag_limits_ingestion(cli_runner) -> None:
     assert parsed["sources_ingesting"] == ["codex"]
     assert parsed["total_files"] == 5
     assert parsed["onboarding"]["selected_sources"] == ["codex"]
-    launch_onboarding.assert_not_called()
+    launch_onboarding.assert_called_once_with(user_id="test", selected_sources=["codex"])
+
+
+def test_setup_rejects_removed_skip_daemon_option(cli_runner) -> None:
+    result = cli_runner.invoke(cli, ["setup", "--agent", "--skip-daemon"])
+
+    assert result.exit_code == 2
+    assert "No such option: --skip-daemon" in result.output
 
 
 def test_setup_agent_source_flag_rejects_undetected_source(cli_runner) -> None:

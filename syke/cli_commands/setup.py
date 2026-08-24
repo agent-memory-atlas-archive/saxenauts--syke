@@ -45,31 +45,26 @@ def _launch_background_onboarding(
     *,
     user_id: str,
     selected_sources: list[str],
-    start_daemon_after: bool,
 ) -> Path:
     from syke.daemon.daemon import LOG_PATH
-    from syke.runtime.locator import (
-        ensure_syke_launcher,
-        resolve_background_syke_runtime,
-        resolve_syke_runtime,
-    )
+    from syke.runtime.locator import ensure_syke_launcher, resolve_background_syke_runtime
 
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    runtime = resolve_background_syke_runtime() if start_daemon_after else resolve_syke_runtime()
+    runtime = resolve_background_syke_runtime()
     launcher = ensure_syke_launcher(runtime)
     cmd = [str(launcher), "--user", user_id, "sync"]
     for source in selected_sources:
         cmd.extend(["--source", source])
-    if start_daemon_after:
-        cmd.append("--start-daemon-after")
+    cmd.append("--start-daemon-after")
 
     with LOG_PATH.open("a", encoding="utf-8") as log_file:
-        subprocess.Popen(
+        subprocess.run(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=log_file,
-            start_new_session=True,
+            timeout=60,
+            check=True,
             cwd=str(runtime.working_directory) if runtime.working_directory else os.getcwd(),
         )
     return LOG_PATH
@@ -82,43 +77,26 @@ def _begin_onboarding(
     total_files: int,
     estimated_minutes: int,
     estimate_method: str,
-    start_background: bool,
     persistence: dict[str, object],
 ) -> tuple[dict[str, object], Path | None, str | None]:
-    log_path: Path | None = None
-    if start_background:
-        from syke.daemon.daemon import LOG_PATH
+    from syke.daemon.daemon import LOG_PATH
 
-        log_path = LOG_PATH
     onboarding = write_onboarding_state(
         user_id,
         selected_sources=selected_sources,
         total_files=total_files,
         estimated_minutes=estimated_minutes,
         estimate_method=estimate_method,
-        mode="daemon" if start_background else "manual",
-        monitor=str(log_path) if log_path else None,
+        mode="daemon",
+        monitor=str(LOG_PATH),
         persistence=persistence,
     )
-    if not start_background:
-        return onboarding, None, None
-
     try:
         log_path = _launch_background_onboarding(
             user_id=user_id,
             selected_sources=selected_sources,
-            start_daemon_after=True,
         )
     except Exception as exc:
-        onboarding = write_onboarding_state(
-            user_id,
-            selected_sources=selected_sources,
-            total_files=total_files,
-            estimated_minutes=estimated_minutes,
-            estimate_method=estimate_method,
-            mode="manual",
-            persistence=persistence,
-        )
         return onboarding, None, str(exc)
     return onboarding, log_path, None
 
@@ -139,14 +117,8 @@ def _select_agent_sources(
     return requested, source_items, []
 
 
-def _agent_setup_command(
-    *,
-    skip_daemon: bool,
-    selected_sources_cli: tuple[str, ...],
-) -> str:
+def _agent_setup_command(*, selected_sources_cli: tuple[str, ...]) -> str:
     parts = ["syke", "setup", "--agent"]
-    if skip_daemon:
-        parts.append("--skip-daemon")
     for source in selected_sources_cli:
         parts.extend(("--source", source))
     return " ".join(parts)
@@ -173,7 +145,6 @@ def _render_macos_filesystem_access(result: dict[str, object]) -> None:
 def _run_agent_setup(
     user_id: str,
     cli_provider: str | None,
-    skip_daemon: bool,
     selected_sources_cli: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Non-interactive agent setup. Returns structured JSON result."""
@@ -197,10 +168,7 @@ def _run_agent_setup(
             "exit_code": 2,
         }
 
-    rerun_command = _agent_setup_command(
-        skip_daemon=skip_daemon,
-        selected_sources_cli=selected_sources_cli,
-    )
+    rerun_command = _agent_setup_command(selected_sources_cli=selected_sources_cli)
 
     # Check Pi runtime (suppress console output)
     import logging as _logging
@@ -318,11 +286,9 @@ def _run_agent_setup(
         }
 
     # Handle managed install (macOS source checkout)
-    daemon_after = not skip_daemon
     daemon_info = cast(dict[str, object], inspect_info["daemon"])
     if (
-        daemon_after
-        and not daemon_info.get("installable")
+        not daemon_info.get("installable")
         and daemon_info.get("platform") == "Darwin"
         and _is_source_install()
     ):
@@ -337,9 +303,17 @@ def _run_agent_setup(
                 "detail": f"Managed background install failed: {exc}",
             }
 
-    daemon_started = bool(daemon_after and daemon_info.get("installable"))
+    if not daemon_info.get("installable"):
+        detail = daemon_info.get("detail") or "no supported background service is available"
+        return {
+            "status": "failed",
+            "error": f"Background service is required for setup: {detail}",
+            "next_steps": ["syke doctor", rerun_command],
+            "exit_code": 1,
+        }
+
     filesystem_access = macos_filesystem_access_status()
-    if daemon_started and daemon_info.get("platform") == "Darwin":
+    if daemon_info.get("platform") == "Darwin":
         filesystem_access = run_macos_filesystem_access_check(user_id)
 
     if selected:
@@ -359,7 +333,6 @@ def _run_agent_setup(
         total_files=total_files,
         estimated_minutes=est,
         estimate_method=estimate_method,
-        start_background=daemon_started,
         persistence=cast(dict[str, object], daemon_info.get("persistence") or {}),
     )
     if launch_error:
@@ -367,7 +340,7 @@ def _run_agent_setup(
             "status": "failed",
             "error": f"Background launch failed: {launch_error}",
             "onboarding": onboarding,
-            "next_steps": ["syke sync", "syke daemon start"],
+            "next_steps": ["syke doctor", rerun_command],
             "exit_code": 1,
         }
     instructions = (
@@ -385,22 +358,6 @@ def _run_agent_setup(
     if filesystem_access.get("applicable") and not filesystem_access.get("ok"):
         instructions += f" Protected-folder access is incomplete: {filesystem_access['detail']}."
         next_steps.insert(0, "syke doctor")
-    if not daemon_started:
-        instructions = (
-            "Setup is complete. Background service start was skipped, so ingestion "
-            "and synthesis are not running yet. "
-            f"Run `syke sync` once to bootstrap memory now; first synthesis is "
-            f"estimated around {est} minutes based on {total_files} detected files. "
-            "After that, use `syke memex` for the local result. `syke ask` requires "
-            "the daemon; start it later only if background operation is wanted. "
-            "Do NOT run syke setup again. "
-            "Check progress with: syke status --json"
-        )
-        next_steps = [
-            "syke sync",
-            "syke memex",
-            "syke status --json",
-        ]
     return {
         "status": "complete",
         "user": user_id,
@@ -410,7 +367,7 @@ def _run_agent_setup(
         "total_files": total_files,
         "estimated_minutes": est,
         "estimate_method": estimate_method,
-        "daemon": "started" if daemon_started else "skipped",
+        "daemon": "started",
         "daemon_persistence": daemon_info.get("persistence"),
         "daemon_detail": daemon_info.get("detail"),
         "filesystem_access": filesystem_access,
@@ -427,8 +384,8 @@ def _run_agent_setup(
     help=(
         "Inspect current setup state, then apply the approved local memory plan.\n\n"
         "Agents: use --agent for structured setup and follow its status and next_steps. "
-        "Use --json to inspect without writing and --skip-daemon when background "
-        "operation is not intended."
+        "Use --json to inspect without writing. A running background service is required "
+        "for setup to complete."
     ),
 )
 @click.option(
@@ -442,11 +399,6 @@ def _run_agent_setup(
 )
 @click.option(
     "--json", "use_json", is_flag=True, help="Inspect setup state as JSON without side effects"
-)
-@click.option(
-    "--skip-daemon",
-    is_flag=True,
-    help="Skip background service setup; run `syke sync` manually.",
 )
 @click.option(
     "--agent",
@@ -465,7 +417,6 @@ def setup(
     ctx: click.Context,
     yes: bool,
     use_json: bool,
-    skip_daemon: bool,
     agent_mode: bool,
     selected_sources_cli: tuple[str, ...],
 ) -> None:
@@ -477,7 +428,6 @@ def setup(
         result = _run_agent_setup(
             user_id,
             ctx.obj.get("provider"),
-            skip_daemon,
             selected_sources_cli,
         )
         click.echo(json.dumps(result, indent=2))
@@ -596,53 +546,38 @@ def setup(
         if handshake:
             console.print(f"    [dim]{handshake}[/dim]")
 
-    daemon_after_onboarding = not skip_daemon
     daemon_info = cast(dict[str, object], inspect_info["daemon"])
     if (
-        daemon_after_onboarding
-        and not daemon_info.get("installable")
+        not daemon_info.get("installable")
         and daemon_info.get("platform") == "Darwin"
         and _is_source_install()
     ):
-        if yes or click.confirm(
-            "\nInstall a background-safe build? (standard for dev checkouts on macOS)",
-            default=True,
-        ):
-            try:
-                run_setup_stage(
-                    "Installing managed background-service build...",
-                    lambda: run_managed_checkout_install(
-                        user_id=user_id,
-                        installer="auto",
-                        restart_daemon=False,
-                        prompt=False,
-                    ),
-                )
-                daemon_info = setup_daemon_viability_payload()
-            except click.ClickException as exc:
-                daemon_info = {
-                    **daemon_info,
-                    "detail": str(exc),
-                    "remediation": (
-                        "Install a managed build with `syke install-current` or fix the "
-                        "local installer tooling, then rerun setup."
-                    ),
-                }
-    if (
-        not yes
-        and daemon_after_onboarding
-        and daemon_info.get("installable")
-        and not daemon_info.get("running")
-        and not click.confirm("\nEnable background service after onboarding?", default=True)
-    ):
-        daemon_after_onboarding = False
-        console.print("  [dim]Background service will stay off after onboarding.[/dim]")
+        try:
+            run_setup_stage(
+                "Installing managed background-service build...",
+                lambda: run_managed_checkout_install(
+                    user_id=user_id,
+                    installer="auto",
+                    restart_daemon=False,
+                    prompt=False,
+                ),
+            )
+            daemon_info = setup_daemon_viability_payload()
+        except click.ClickException as exc:
+            daemon_info = {
+                **daemon_info,
+                "detail": str(exc),
+                "remediation": (
+                    "Install a managed build with `syke install-current` or fix the "
+                    "local installer tooling, then rerun setup."
+                ),
+            }
 
-    if (
-        daemon_after_onboarding
-        and daemon_info.get("installable")
-        and daemon_info.get("platform") == "Darwin"
-    ):
+    if not daemon_info.get("installable"):
+        detail = daemon_info.get("detail") or "no supported background service is available"
+        raise click.ClickException(f"Background service is required for setup: {detail}")
+
+    if daemon_info.get("platform") == "Darwin":
         render_section("Files")
         console.print("  Normal folders under your home directory already work.")
         console.print("  macOS may now ask about Desktop, Documents, and Downloads.")
@@ -668,14 +603,12 @@ def setup(
     est_minutes = max(2, total_files // 1500 + 3)
     estimate_method = "max(2, total_files // 1500 + 3)"
 
-    start_background = bool(daemon_after_onboarding and daemon_info.get("installable"))
     _, log_path, launch_error = _begin_onboarding(
         user_id=user_id,
         selected_sources=selected_sources,
         total_files=total_files,
         estimated_minutes=est_minutes,
         estimate_method=estimate_method,
-        start_background=start_background,
         persistence=cast(dict[str, object], daemon_info.get("persistence") or {}),
     )
     if launch_error:
@@ -696,16 +629,11 @@ def setup(
         unit = "db" if fmt == "sqlite" else "files"
         console.print(f"  [dim]…[/dim] {src}  {files:,} {unit}")
     console.print("  [dim]…[/dim] installing skill files to detected harnesses")
-    if start_background:
-        console.print("  [dim]…[/dim] first daemon cycle will synthesize your memex")
-        console.print("  [dim]…[/dim] background service starts after onboarding")
-        persistence = cast(dict[str, object], daemon_info.get("persistence") or {})
-        if persistence.get("keeps_daemon_alive"):
-            console.print(
-                f"  [dim]…[/dim] {persistence.get('manager')} keeps Syke running if it exits"
-            )
-    else:
-        console.print("  [dim]·[/dim] background service is off; run `syke sync` when ready")
+    console.print("  [dim]…[/dim] first daemon cycle will synthesize your memex")
+    console.print("  [dim]…[/dim] background service is running")
+    persistence = cast(dict[str, object], daemon_info.get("persistence") or {})
+    if persistence.get("keeps_daemon_alive"):
+        console.print(f"  [dim]…[/dim] {persistence.get('manager')} keeps Syke running if it exits")
     console.print(f"\n  [dim]Estimated: ~{est_minutes} minutes[/dim]")
 
     render_section("What happens next")
@@ -722,10 +650,7 @@ def setup(
     console.print("    syke status        [dim]check what's connected[/dim]")
 
     render_section("Monitor")
-    if log_path:
-        console.print(f"  tail -f {log_path}")
-    else:
-        console.print("  syke sync")
+    console.print(f"  tail -f {log_path}")
     console.print("  syke status")
 
     console.print()

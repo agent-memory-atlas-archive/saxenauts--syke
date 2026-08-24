@@ -88,8 +88,7 @@ If Syke is unavailable, install it with `pipx install syke` or
   `auth_options` command. Pi opens the browser or shows a device code.
   Never request credentials in chat or print them.
 - For `complete`, stop setup work. Do not loop on setup.
-- Use `--skip-daemon` when background operation is not intended, then run
-  `syke sync` explicitly.
+- Setup is complete only when the background service is running.
 - Verify the result with `syke doctor`.
 
 ## Provider Commands

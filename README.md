@@ -49,8 +49,8 @@ uses Pi agent core for auth and runtime.
 Give a terminal agent this repository URL and say:
 
 > Install or upgrade Syke from this repository with `uv` using Python 3.12+.
-> Ask whether background operation is allowed, then run `syke setup --agent`
-> (add `--skip-daemon` if declined) and follow its JSON `status` and `next_steps`.
+> Run `syke setup --agent` and follow its JSON `status` and `next_steps`.
+> Setup is complete only after Syke's background service is running.
 > If provider login is needed, present `provider_choices` and run the selected
 > `auth_options` command; Pi opens the browser or shows a device code.
 

@@ -276,7 +276,7 @@ def setup_daemon_viability_payload() -> dict[str, object]:
     }
 
 
-def _build_next_steps(provider: dict[str, object], daemon: dict[str, object]) -> list[str]:
+def _build_next_steps(provider: dict[str, object]) -> list[str]:
     """Actionable commands an agent should run to complete setup non-interactively."""
     steps: list[str] = []
     if not provider.get("configured"):
@@ -383,15 +383,6 @@ def build_setup_inspect_payload(*, user_id: str, cli_provider: str | None) -> di
                 ),
             }
         )
-        consent_points.append(
-            {
-                "id": "daemon",
-                "question": "Enable the background service after setup?",
-                "options": ["yes", "no"],
-                "default": "yes",
-            }
-        )
-
     return {
         "ok": True,
         "schema_version": 1,
@@ -416,7 +407,7 @@ def build_setup_inspect_payload(*, user_id: str, cli_provider: str | None) -> di
         "daemon_runtime": warm_runtime,
         "proposed_actions": proposed_actions,
         "consent_points": consent_points,
-        "next_steps": _build_next_steps(provider, daemon),
+        "next_steps": _build_next_steps(provider),
         "next_commands": [
             "syke auth status",
             "syke status --json",

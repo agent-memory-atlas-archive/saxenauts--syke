@@ -219,22 +219,26 @@ if [[ -n "${SYKE_QA_PROVIDER_STATE:-}" ]]; then
     fi
   done
 
-  echo "[linux-qa] provider-backed setup"
-  "$SYKE_BIN" --user "$SYKE_QA_USER" setup --agent --skip-daemon \
+  echo "[linux-qa] setup fails closed without a managed user service"
+  set +e
+  "$SYKE_BIN" --user "$SYKE_QA_USER" setup --agent \
     >/qa-output/setup-provider.json </dev/null
-  python3 - <<'PY'
+  setup_provider_exit=$?
+  set -e
+  python3 - "$setup_provider_exit" <<'PY'
 import json
+import sys
 
 with open("/qa-output/setup-provider.json", encoding="utf-8") as fh:
     payload = json.load(fh)
 
-assert payload["status"] == "complete", payload
-assert payload["exit_code"] == 0, payload
-assert payload["daemon"] == "skipped", payload
-assert payload["next_steps"][0] == "syke sync", payload
+assert int(sys.argv[1]) != 0, payload
+assert payload["status"] == "failed", payload
+assert "Background" in payload["error"], payload
+assert "daemon" not in payload, payload
 PY
 
-  echo "[linux-qa] provider-backed sync"
+  echo "[linux-qa] provider-backed manual component sync"
   "$SYKE_BIN" --user "$SYKE_QA_USER" sync --json >/qa-output/sync.json </dev/null
   python3 - <<'PY'
 import json

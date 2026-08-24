@@ -78,10 +78,10 @@ than carrying ambiguous state into the pre-1.0 runtime.
 - Made agent setup return live Pi provider choices, secret-safe auth options,
   and exact retry commands, including preserved daemon and source flags. Pi
   OAuth now opens its native browser flow under agent/non-TTY execution and
-  keeps device-code login available for remote terminals. Skipped-daemon setup
-  and manual sync now point to `syke memex` instead of the daemon-only Ask path.
-  Starting the daemon now requests and verifies macOS access to Desktop,
-  Documents, and Downloads.
+  keeps device-code login available for remote terminals. Removed the
+  foreground-only setup path: setup now completes only after the managed
+  background service starts. Starting the daemon requests and verifies macOS
+  access to Desktop, Documents, and Downloads.
 - Reduced managed daemon implementations to launchd and user systemd and made
   process-plus-IPC readiness the success condition.
 - Kept history-backed diagnostics responsive as native session history grows:

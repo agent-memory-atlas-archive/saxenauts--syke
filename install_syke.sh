@@ -3,7 +3,7 @@
 #
 # This script is intentionally non-interactive by default for agent use.
 # It installs Syke from the current checkout, runs `setup --agent`, and
-# optionally completes provider auth + first sync when env vars are set.
+# optionally completes provider auth when env vars are set.
 
 set -euo pipefail
 
@@ -11,8 +11,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$SCRIPT_DIR"
 
 SYKE_BIN="${SYKE_BIN:-syke}"
-SYKE_SKIP_DAEMON="${SYKE_SKIP_DAEMON:-0}"
-SYKE_BOOTSTRAP_SYNC="${SYKE_BOOTSTRAP_SYNC:-1}"
 SYKE_REUSE_EXISTING="${SYKE_REUSE_EXISTING:-0}"
 
 SYKE_PROVIDER="${SYKE_PROVIDER:-}"
@@ -117,9 +115,6 @@ run_setup_agent() {
     cmd+=("$line")
   done < <(build_user_args)
   cmd+=("setup" "--agent")
-  if [[ "$SYKE_SKIP_DAEMON" == "1" ]]; then
-    cmd+=("--skip-daemon")
-  fi
 
   set +e
   "${cmd[@]}" >"$out_json"
@@ -147,17 +142,6 @@ configure_provider_from_env() {
 
   log "configuring provider from environment: $SYKE_PROVIDER"
   "${cmd[@]}" >/dev/null
-}
-
-run_bootstrap_sync() {
-  local -a cmd
-  cmd=("$SYKE_BIN")
-  while IFS= read -r line; do
-    cmd+=("$line")
-  done < <(build_user_args)
-  cmd+=("sync")
-  log "running first sync"
-  "${cmd[@]}"
 }
 
 main() {
@@ -198,9 +182,6 @@ main() {
       exit 3
     else
       local setup_hint="syke setup --agent"
-      if [[ "$SYKE_SKIP_DAEMON" == "1" ]]; then
-        setup_hint="$setup_hint --skip-daemon"
-      fi
       log "provider is required but SYKE_PROVIDER/SYKE_API_KEY were not set."
       log "next steps:"
       log "  syke auth set <provider> --api-key <KEY> --use"
@@ -218,10 +199,6 @@ main() {
   log "$(json_get "$setup_json" "instructions")"
   log "estimated minutes: $(json_get "$setup_json" "estimated_minutes")"
   log "estimate basis files: $(json_get "$setup_json" "total_files")"
-
-  if [[ "$SYKE_SKIP_DAEMON" == "1" && "$SYKE_BOOTSTRAP_SYNC" == "1" ]]; then
-    run_bootstrap_sync
-  fi
 
   log "done"
 }

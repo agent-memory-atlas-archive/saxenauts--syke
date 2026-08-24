@@ -209,8 +209,7 @@ if [[ -n "$PROVIDER_STATE" ]]; then
   step "running provider-backed installed and live runtime proof"
   bash "$SCRIPT_DIR/fresh-install-test.sh" \
     --run \
-    --wheel "$wheel_path" \
-    --provider-state "$PROVIDER_STATE"
+    --wheel "$wheel_path"
   live_pytest_base="$(mktemp -d "${TMPDIR:-/tmp}/syke-live-pytest.XXXXXX")"
   if ! env \
     SYKE_RUN_PI_INTEGRATION=1 \

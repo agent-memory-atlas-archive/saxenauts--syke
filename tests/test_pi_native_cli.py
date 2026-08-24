@@ -387,7 +387,7 @@ def test_launch_background_onboarding_uses_background_safe_launcher(
         target_path=tmp_path / "managed" / "syke",
         working_directory=tmp_path / "managed-root",
     )
-    popen_calls: list[dict[str, object]] = []
+    run_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr("syke.daemon.daemon.LOG_PATH", log_path)
     monkeypatch.setattr(
@@ -399,19 +399,18 @@ def test_launch_background_onboarding_uses_background_safe_launcher(
         lambda resolved_runtime: launcher_path,
     )
     monkeypatch.setattr(
-        "syke.cli_commands.setup.subprocess.Popen",
-        lambda cmd, **kwargs: popen_calls.append({"cmd": cmd, **kwargs}) or SimpleNamespace(),
+        "syke.cli_commands.setup.subprocess.run",
+        lambda cmd, **kwargs: run_calls.append({"cmd": cmd, **kwargs}) or SimpleNamespace(),
     )
 
     result = _launch_background_onboarding(
         user_id="test",
         selected_sources=["claude-code"],
-        start_daemon_after=True,
     )
 
     assert result == log_path
-    assert len(popen_calls) == 1
-    assert popen_calls[0]["cmd"] == [
+    assert len(run_calls) == 1
+    assert run_calls[0]["cmd"] == [
         str(launcher_path),
         "--user",
         "test",
@@ -420,7 +419,9 @@ def test_launch_background_onboarding_uses_background_safe_launcher(
         "claude-code",
         "--start-daemon-after",
     ]
-    assert popen_calls[0]["cwd"] == str(runtime.working_directory)
+    assert run_calls[0]["cwd"] == str(runtime.working_directory)
+    assert run_calls[0]["timeout"] == 60
+    assert run_calls[0]["check"] is True
 
 
 def test_sync_source_flag_persists_and_forwards_selection(cli_runner) -> None:
