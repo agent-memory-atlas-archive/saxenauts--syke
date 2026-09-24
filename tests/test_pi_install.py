@@ -219,7 +219,9 @@ def test_node_selection_rejects_incomplete_runtimes_and_uses_valid_fallback(
 
 def test_ensure_pi_binary_refuses_automatic_downgrade(tmp_path: Path, monkeypatch) -> None:
     pi_prefix, _pi_bin, _pi_node = _patch_pi_install_paths(monkeypatch, tmp_path / "home")
-    _write_test_pi_install(pi_prefix, pi_version="0.85.0", root_pi_version="0.85.0")
+    major, minor, patch = (int(part) for part in pi_client.PI_PACKAGE_VERSION.split("."))
+    newer_version = f"{major}.{minor}.{patch + 1}"
+    _write_test_pi_install(pi_prefix, pi_version=newer_version, root_pi_version=newer_version)
 
     monkeypatch.setattr(pi_client, "ensure_node_binary", lambda: tmp_path / "node")
     monkeypatch.setattr(

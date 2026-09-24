@@ -2,6 +2,23 @@
 
 All notable changes to Syke are documented here.
 
+## [0.6.1] - 2026-09-24
+
+### Runtime
+
+- Updated the managed Pi runtime from 0.84.1 to 0.87.1, which adds the GPT-6
+  Sol and Luna families, Claude Opus 5.5, prompt-cache warming, and current
+  provider fixes. Model discovery continues to come from Pi's own runtime
+  catalog, so newly published Pi models do not need a Syke release.
+- Added `max` to the accepted `synthesis.thinking_level` values and to
+  `model:thinking` suffix parsing, matching Pi's current thinking levels
+  (#49).
+
+### Docs
+
+- Refreshed provider examples from GPT-5.4 to GPT-5.6 Luna and listed the
+  accepted thinking levels in the config reference.
+
 ## [0.6.0] - 2026-08-23
 
 This release makes Syke's current authority model explicit: one mutable graph,

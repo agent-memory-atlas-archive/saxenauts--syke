@@ -9,7 +9,7 @@ Authoritative provider reference for the current CLI/runtime surface.
 Pick a provider you already trust, activate it, then confirm the resolved runtime:
 
 ```bash
-syke auth set openai --api-key <key> --model gpt-5.4 --use
+syke auth set openai --api-key <key> --model gpt-5.6-luna --use
 syke auth status
 ```
 
@@ -96,7 +96,7 @@ Source: `syke/pi_state.py`, `syke/cli_support/providers.py`, `syke/llm/env.py`.
 ### Example API-Key Provider
 
 ```bash
-syke auth set openai --api-key <key> --model gpt-5.4 --use
+syke auth set openai --api-key <key> --model gpt-5.6-luna --use
 ```
 
 ### Pi-Native OAuth Provider

@@ -53,6 +53,19 @@ def test_load_pi_catalog_parses_provider_requirements(monkeypatch, tmp_path: Pat
     assert entries[1].requires_base_url is False
 
 
+@pytest.mark.parametrize("thinking", ["xhigh", "max"])
+def test_match_pi_model_pattern_preserves_every_pi_thinking_suffix(thinking: str) -> None:
+    resolved = pi_catalog._match_pi_model_pattern(
+        "openai", f"gpt-5.6-luna:{thinking}", ("gpt-5.6-luna", "gpt-5.6-luna-pro")
+    )
+    assert resolved == f"gpt-5.6-luna:{thinking}"
+
+
+def test_match_pi_model_pattern_keeps_unknown_suffix_in_model_id() -> None:
+    resolved = pi_catalog._match_pi_model_pattern("openai", "gpt-5.6-luna:wild", ("gpt-5.6-luna",))
+    assert resolved is None
+
+
 def test_resolve_pi_model_uses_pi_provider_default_when_no_explicit_model(monkeypatch) -> None:
     monkeypatch.setattr(
         pi_catalog,

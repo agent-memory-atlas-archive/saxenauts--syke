@@ -117,7 +117,7 @@ Provider auth can be passed via env for agent runners:
 ```bash
 SYKE_PROVIDER=openai \
 SYKE_API_KEY=<KEY> \
-SYKE_MODEL=gpt-5.4 \
+SYKE_MODEL=gpt-5.6-luna \
 bash install_syke.sh
 ```
 
@@ -178,7 +178,7 @@ errors instead of writing failed cycles every few seconds.
 You can let interactive `syke setup` handle provider choice, or configure directly:
 
 ```bash
-syke auth set openai --api-key <KEY> --model gpt-5.4 --use
+syke auth set openai --api-key <KEY> --model gpt-5.6-luna --use
 syke auth status
 ```
 

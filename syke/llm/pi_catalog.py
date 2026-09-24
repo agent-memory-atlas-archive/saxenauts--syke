@@ -8,13 +8,14 @@ import re
 import subprocess
 from dataclasses import dataclass
 
+from syke.config_file import THINKING_LEVELS
 from syke.llm import pi_install as _pi_install
 from syke.pi_state import build_pi_agent_env, get_default_model, load_pi_auth
 from syke.runtime.child_env import build_child_process_env
 
 logger = logging.getLogger("syke.llm.pi_client")
 
-_PI_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
+_PI_THINKING_LEVELS = frozenset(THINKING_LEVELS)
 
 
 @dataclass(frozen=True)

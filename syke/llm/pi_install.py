@@ -18,13 +18,13 @@ logger = logging.getLogger("syke.llm.pi_client")
 
 PI_PACKAGE = "@earendil-works/pi-coding-agent"
 
-PI_PACKAGE_VERSION = "0.84.1"
+PI_PACKAGE_VERSION = "0.87.1"
 
 PI_PACKAGE_SPEC = f"{PI_PACKAGE}@{PI_PACKAGE_VERSION}"
 
 PI_SCHEMA_PACKAGE = "typebox"
 
-PI_SCHEMA_VERSION = "1.3.7"
+PI_SCHEMA_VERSION = "1.3.27"
 
 PI_SCHEMA_SPEC = f"{PI_SCHEMA_PACKAGE}@{PI_SCHEMA_VERSION}"
 

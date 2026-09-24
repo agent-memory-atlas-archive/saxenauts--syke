@@ -81,6 +81,13 @@ def test_invalid_config_values_fall_back_instead_of_crashing(tmp_path: Path) -> 
         assert cfg.synthesis.thinking_level == "medium"
 
 
+def test_max_thinking_level_is_accepted(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[synthesis]\nthinking_level = "max"\n', encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.synthesis.thinking_level == "max"
+
+
 def test_removed_and_unknown_keys_are_ignored(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(

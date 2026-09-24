@@ -65,7 +65,7 @@ syke config path
 
 | Key | Type | Default | Meaning | Env override |
 |---|---|---|---|---|
-| `thinking_level` | `string` | `"medium"` | Pi thinking level for synthesis | `SYKE_SYNC_THINKING_LEVEL` |
+| `thinking_level` | `string` | `"medium"` | Pi thinking level for synthesis: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` | `SYKE_SYNC_THINKING_LEVEL` |
 | `timeout` | `int` | `600` | Wall-clock timeout in seconds | `SYKE_SYNC_TIMEOUT` |
 | `first_run_timeout` | `int` | `1500` | Wall-clock timeout for the first synthesis run | `SYKE_SYNC_FIRST_RUN_TIMEOUT` |
 
@@ -138,7 +138,7 @@ Use the CLI to manage that state:
 syke setup
 syke auth
 syke auth status
-syke auth set openai --api-key KEY --model gpt-5.4 --use
+syke auth set openai --api-key KEY --model gpt-5.6-luna --use
 syke auth login openai-codex --use
 syke auth set localproxy --base-url URL --model MODEL --use
 ```
