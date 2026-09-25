@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,7 +22,6 @@ from syke.runtime.pi_sessions import find_session_by_id, find_session_by_name, l
 
 WORKSPACE_SCAN_ENTRY_LIMIT = 10_000
 LARGE_WORKSPACE_FILE_BYTES = 10 * 1024 * 1024
-STATE_CHANGE_ITEM_LIMIT = 3
 WORKSPACE_SOFT_TARGET_BYTES = 3 * 1024 * 1024 * 1024
 RUNTIME_SOFT_TARGET_BYTES = 3 * 1024 * 1024 * 1024
 CYCLE_RUNTIME_SOFT_TARGET_BYTES = 3 * 1024 * 1024 * 1024
@@ -54,20 +52,6 @@ def _parse_time(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
-
-
-def _latest_receipt(
-    control_dir: Path,
-    *,
-    completed_only: bool = False,
-) -> dict[str, Any] | None:
-    status = "completed" if completed_only else None
-    receipts = list_receipts(control_dir, status=status, limit=1)
-    return receipts[0] if receipts else None
-
-
-def _receipt_by_id(control_dir: Path, cycle_id: str) -> dict[str, Any] | None:
-    return get_receipt(control_dir, cycle_id)
 
 
 def _sessions_path(
@@ -214,39 +198,6 @@ def _plural(count: int, singular: str, plural: str | None = None) -> str:
     return f"{count:,} {noun}"
 
 
-def _parse_state_change(value: object) -> dict[str, Any] | None:
-    if isinstance(value, dict):
-        return value
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = json.loads(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _format_changed_items(value: object) -> str:
-    if not isinstance(value, list):
-        return "unknown"
-    items = [str(item) for item in value]
-    if not items:
-        return "0"
-    shown = ", ".join(_short(item, 80) for item in items[:STATE_CHANGE_ITEM_LIMIT])
-    remainder = len(items) - STATE_CHANGE_ITEM_LIMIT
-    suffix = f", +{remainder:,} more" if remainder > 0 else ""
-    return f"{len(items):,} [{shown}{suffix}]"
-
-
-def _format_workspace_change(change: dict[str, Any], *, label: str) -> str:
-    return (
-        f"- {label}: "
-        f"created {_format_changed_items(change.get('created_paths'))}; "
-        f"revised {_format_changed_items(change.get('revised_paths'))}; "
-        f"removed {_format_changed_items(change.get('removed_paths'))}."
-    )
-
-
 def _source_inventory_lines(
     workspace: Path,
     *,
@@ -285,8 +236,6 @@ def build_self_view(
     as_of: str = "unavailable",
     home: Path | None = None,
     selected_sources: tuple[str, ...] | None = None,
-    system_prompt_path: Path | None = None,
-    core_version: str = __version__,
 ) -> str:
     """Render the current self-observation projection without storing it."""
     workspace = workspace_root.expanduser().resolve()
@@ -336,8 +285,10 @@ def build_self_view(
             )
     except Exception:
         learned_state = "unavailable; treat its current status as unknown"
-    accepted = _latest_receipt(control_dir, completed_only=True)
-    latest_receipt = _latest_receipt(control_dir)
+    completed_receipts = list_receipts(control_dir, status="completed", limit=1)
+    accepted = completed_receipts[0] if completed_receipts else None
+    all_receipts = list_receipts(control_dir, limit=1)
+    latest_receipt = all_receipts[0] if all_receipts else None
     recent_sessions = list_sessions(sessions_path, limit=20)
     latest_session = recent_sessions[0] if recent_sessions else None
     latest = _latest_operation(latest_receipt, latest_session)
@@ -355,7 +306,7 @@ def build_self_view(
     from syke.config import DAEMON_INTERVAL
 
     installed_core = Path(__file__).resolve().parents[1]
-    prompt_path = (system_prompt_path or Path(__file__).with_name("syke_self.md")).resolve()
+    prompt_path = Path(__file__).with_name("syke_self.md").resolve()
     composer_path = Path(__file__).with_name("prompt_context.py").resolve()
     tool_contract_path = Path(__file__).with_name("pi_tools.mjs").resolve()
     memex_path = workspace / "MEMEX.md"
@@ -372,7 +323,7 @@ def build_self_view(
         "person, computer, or outside world.",
         "",
         f"- Person served: {_short(user_id, 120)}.",
-        f"- Syke installation: version {_short(core_version, 80)} at "
+        f"- Syke installation: version {_short(__version__, 80)} at "
         f"{_short(installed_core, 500)}; "
         "source commit unavailable from the installed package.",
         f"- Runtime: {runtime}.",
@@ -388,7 +339,7 @@ def build_self_view(
         "",
         "## Durable and protected surfaces",
         "",
-        f"- Core: Syke {_short(core_version, 80)}.",
+        f"- Core: Syke {_short(__version__, 80)}.",
         f"- Installed core (read-only): {_short(installed_core, 500)}.",
         f"- Mutable graph: {_short(graph_path, 500)}.",
         f"- Current learned language: ordinary memory `{LEARNED_MEMORY_ID}` is {learned_state}.",
@@ -536,12 +487,6 @@ def build_self_view(
 
     lines.extend(["", "Accepted continuation details"])
     if accepted:
-        state_change = _parse_state_change(accepted.get("state_change"))
-        workspace_change = state_change.get("workspace") if state_change else None
-        if isinstance(workspace_change, dict):
-            lines.append(_format_workspace_change(workspace_change, label="Workspace changes"))
-        else:
-            lines.append("- No exact workspace-change summary is recorded.")
         lines.append(
             "- Ordinary graph changes are not copied into the receipt. Use the linked native "
             "session to investigate why the current graph changed."
@@ -560,20 +505,6 @@ def build_self_view(
 
     if latest_receipt and (not accepted or latest_receipt.get("id") != accepted.get("id")):
         lines.extend(["", "Latest attempt effects"])
-        latest_change = _parse_state_change(latest_receipt.get("state_change"))
-        if latest_change:
-            latest_workspace_change = latest_change.get("workspace")
-            if isinstance(latest_workspace_change, dict):
-                lines.append(
-                    _format_workspace_change(
-                        latest_workspace_change,
-                        label="Surviving workspace changes",
-                    )
-                )
-            else:
-                lines.append("- Final workspace observation is unavailable.")
-        else:
-            lines.append("- No exact workspace-change summary is recorded.")
         if latest_receipt.get("status") != "completed":
             failure_reason = latest_receipt.get("error")
             lines.append(
@@ -582,16 +513,8 @@ def build_self_view(
             )
             acceptance_trace = latest_receipt.get("acceptance")
             if isinstance(acceptance_trace, dict):
-                rejections = acceptance_trace.get("rejections")
-                rejected_rows = rejections if isinstance(rejections, list) else []
-                stages = [
-                    str(row.get("stage"))
-                    for row in rejected_rows
-                    if isinstance(row, dict) and row.get("stage")
-                ]
                 lines.append(
-                    f"- Acceptance trace: {len(rejected_rows)} rejected attempts across "
-                    f"{', '.join(stages) if stages else 'unknown stages'}; "
+                    "- Acceptance trace: "
                     f"{int(acceptance_trace.get('repair_prompts') or 0)} repair prompts."
                 )
                 lines.append(
@@ -805,7 +728,7 @@ def build_self_view(
 
         related_receipt = None
         if session.get("kind") == "synthesis":
-            related_receipt = _receipt_by_id(control_dir, str(session.get("operation_id") or ""))
+            related_receipt = get_receipt(control_dir, str(session.get("operation_id") or ""))
             if related_receipt:
                 lines.append(
                     f"- Host receipt {_short(related_receipt.get('id') or 'unknown', 120)} "

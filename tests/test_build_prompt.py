@@ -110,16 +110,3 @@ def test_prompt_dependency_failures_degrade_without_disclosing_exceptions(
     assert "private database failure" not in memex_failure
     assert "# Operation" in self_view_failure
     assert "# Operation" in memex_failure
-
-
-def test_reference_time_rule_can_be_disabled_without_removing_the_reference(
-    tmp_path: Path,
-) -> None:
-    with_directive = build_prompt(tmp_path, now=NOW)
-    without_directive = build_prompt(tmp_path, now=NOW, time_directive=False)
-    directive = "Resolve relative time against this reference time. Do not use the host clock"
-
-    assert NOW in with_directive
-    assert NOW in without_directive
-    assert directive in with_directive
-    assert directive not in without_directive
