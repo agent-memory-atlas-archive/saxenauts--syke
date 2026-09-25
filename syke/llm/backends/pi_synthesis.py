@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shlex
 import sqlite3
 import time
@@ -208,11 +207,7 @@ def _db_validation_issues(validation: dict[str, object]) -> list[str]:
 
 
 def _current_memex_content(db: SykeDB, user_id: str) -> str | None:
-    return _memex_content(_current_memex_row(db, user_id))
-
-
-def _current_memex_row(db: SykeDB, user_id: str) -> dict[str, object] | None:
-    return db.get_memex(user_id)
+    return _memex_content(db.get_memex(user_id))
 
 
 def _memex_content(memex: dict[str, object] | None) -> str | None:
@@ -229,20 +224,10 @@ def _read_memex_artifact() -> str | None:
     return content or None
 
 
-def _strip_memex_header(content: str) -> str:
-    """Compatibility wrapper around the canonical projection parser."""
-    return strip_memex_header(content)
-
-
-def _inject_memex_header(content: str) -> str:
-    """Prepend the exact token budget fill indicator."""
-    return format_memex_projection(content)
-
-
 def _memex_bodies_match(left: str | None, right: str | None) -> bool:
     if left is None or right is None:
         return False
-    return _strip_memex_header(left).strip() == _strip_memex_header(right).strip()
+    return strip_memex_header(left).strip() == strip_memex_header(right).strip()
 
 
 def _normalize_current_memex_projection_header(
@@ -251,16 +236,16 @@ def _normalize_current_memex_projection_header(
     memex: dict[str, object] | None,
 ) -> dict[str, object] | None:
     content = _memex_content(memex)
-    if content is None or _strip_memex_header(content) == content:
+    if content is None or strip_memex_header(content) == content:
         return memex
     from syke.memory.memex import update_memex
 
-    update_memex(db, user_id, _strip_memex_header(content))
-    return _current_memex_row(db, user_id)
+    update_memex(db, user_id, strip_memex_header(content))
+    return db.get_memex(user_id)
 
 
 def _write_memex_artifact(content: str) -> bool:
-    content_with_header = _inject_memex_header(content)
+    content_with_header = format_memex_projection(content)
     existing = _read_memex_artifact()
     if existing == content_with_header.strip():
         return False
@@ -308,7 +293,7 @@ def _sync_memex_to_db(
     current_memex = _normalize_current_memex_projection_header(
         db,
         user_id,
-        _current_memex_row(db, user_id),
+        db.get_memex(user_id),
     )
     current_content = _memex_content(current_memex)
     artifact_content = _read_memex_artifact()
@@ -319,7 +304,7 @@ def _sync_memex_to_db(
         canonical_content = current_content
         result["source"] = "db"
     elif artifact_content is not None and artifact_changed_during_cycle:
-        canonical_content = _strip_memex_header(artifact_content)
+        canonical_content = strip_memex_header(artifact_content)
         result["source"] = "artifact"
         try:
             update_memex(db, user_id, canonical_content)
@@ -393,8 +378,6 @@ def _sync_memex_to_db(
 
 def _discovered_source_file_counts(
     selected_sources: tuple[str, ...] | None,
-    *,
-    home: Path | None = None,
 ) -> dict[str, int]:
     from syke.observe.catalog import active_sources, iter_discovered_files
 
@@ -404,7 +387,7 @@ def _discovered_source_file_counts(
         if selected_set is not None and spec.source not in selected_set:
             continue
         try:
-            count = len(iter_discovered_files(spec, home=home))
+            count = len(iter_discovered_files(spec))
         except OSError:
             logger.debug("Source discovery failed for %s", spec.source, exc_info=True)
             continue
@@ -416,7 +399,7 @@ def _discovered_source_file_counts(
 def _looks_like_empty_first_memex(content: str | None) -> bool:
     if not content:
         return True
-    body = _strip_memex_header(content).lower()
+    body = strip_memex_header(content).lower()
     return any(marker in body for marker in _EMPTY_FIRST_MEMEX_MARKERS)
 
 
@@ -447,18 +430,6 @@ of copying source material wholesale. Do not write an empty MEMEX merely because
 adapter markdown exists. Adapter presence is not memory. Only write "no durable
 memories" after this bounded survey finds no usable harness history, and then
 include which sources and paths were checked."""
-
-
-def _safe_runtime_status(runtime: object) -> dict[str, object]:
-    status_fn = getattr(runtime, "status", None)
-    if callable(status_fn):
-        try:
-            status = status_fn()
-            if isinstance(status, dict):
-                return status
-        except Exception:
-            logger.debug("Failed to read Pi runtime status", exc_info=True)
-    return {}
 
 
 def _fit_json_preview(payload: str, max_chars: int) -> tuple[str, bool]:
@@ -542,13 +513,9 @@ def pi_synthesize(
     user_id: str,
     *,
     skill_override: str | None = None,
-    model_override: str | None = None,
     first_run: bool | None = None,
-    progress: Callable[[str], None] | None = None,
     now_override: datetime | None = None,
     workspace_root: Path | None = None,
-    home: Path | None = None,
-    skill_path: Path | None = None,
     selected_sources: tuple[str, ...] | None = None,
     on_runtime_event: Callable[[dict[str, Any]], None] | None = None,
     timeout_override: float | None = None,
@@ -560,19 +527,9 @@ def pi_synthesize(
     last cycle time) and decides whether anything warrants updating.
 
     now_override: If set, use this as "now" instead of wall clock.
-    Used by replay to simulate the correct time period for a dataset window.
 
     workspace_root: If set, use this workspace instead of the module-level
     WORKSPACE_ROOT. Eliminates the need for callers to monkey-patch globals.
-
-    home: Passed to build_prompt so source discovery in self-observation
-    resolves relative to this directory instead of the real user home.
-    Used by replay to scope observed roots to the workspace.
-
-    skill_path: If set, build_prompt reads the skill from this file
-    instead of the default SKILL_PATH. Used for ablation conditions
-    (different synthesis prompts) without bypassing self-observation and MEMEX
-    injection.
 
     Flow:
     1. Setup/validate workspace
@@ -674,34 +631,6 @@ def pi_synthesize(
                 exc_info=True,
             )
 
-    def _progress(message: str) -> None:
-        if progress is not None:
-            progress(message)
-
-    def _pause_db_connection_for_agent() -> bool:
-        if not os.environ.get("SYKE_REPLAY_PAUSE_DB_CONNECTION_DURING_PI"):
-            return False
-        if getattr(db, "db_path", ":memory:") == ":memory:":
-            return False
-        try:
-            db.conn.commit()
-            db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            db.suspend()
-            logger.info("Replay DB connection paused while Pi agent runs")
-            return True
-        except Exception:
-            logger.warning("Failed to pause replay DB connection before Pi", exc_info=True)
-            return False
-
-    def _resume_db_connection_after_agent(paused: bool) -> None:
-        if not paused:
-            return
-        _reopen_db_connection()
-        logger.info("Replay DB connection resumed after Pi agent run")
-
-    def _reopen_db_connection() -> None:
-        db.reopen()
-
     def _capture_valid_learned_candidate() -> None:
         nonlocal learned_candidate
         row = get_learned_memory(db, user_id)
@@ -722,7 +651,7 @@ def pi_synthesize(
                 learned_snapshot=learned_candidate,
             )
         finally:
-            _reopen_db_connection()
+            db.reopen()
             restored_memex = _current_memex_content(db, user_id)
             if restored_memex is None:
                 MEMEX_PATH.unlink(missing_ok=True)
@@ -836,12 +765,12 @@ def pi_synthesize(
                 if reconciled:
                     db.reopen()
 
-        previous_memex = _current_memex_row(db, user_id)
+        previous_memex = db.get_memex(user_id)
         previous_memex_content = _memex_content(previous_memex)
         is_first_run = first_run if first_run is not None else previous_memex_content is None
         previous_memex_artifact_content = _read_memex_artifact()
         first_run_source_file_counts = (
-            _discovered_source_file_counts(selected_sources, home=home) if is_first_run else {}
+            _discovered_source_file_counts(selected_sources) if is_first_run else {}
         )
         pre_memory_count = int(db.get_graph_stats(user_id)["memories"]) if is_first_run else 0
 
@@ -859,10 +788,8 @@ def pi_synthesize(
                 logger.error("Failed to write workspace failure receipt", exc_info=True)
             return result
 
-        _progress("workspace ready")
-
         try:
-            requested_model = resolve_pi_model(model_override)
+            resolve_pi_model()
         except RuntimeError as exc:
             blocked_duration = _elapsed_ms()
             result["status"] = "blocked"
@@ -920,7 +847,6 @@ def pi_synthesize(
             record_dir=records_dir(control_dir),
         )
         observed_record_ids = [str(record["id"]) for record in observed_records]
-        result["records_in_context"] = len(observed_records)
         result["record_ids_in_context"] = observed_record_ids
 
         # ── 3. Build the host-composed operation context ──
@@ -972,8 +898,6 @@ def pi_synthesize(
                 db=db,
                 user_id=user_id,
                 context=operation_context,
-                home=home,
-                synthesis_path=skill_path,
                 now=now_str,
                 selected_sources=selected_sources,
                 session_dir=(
@@ -989,7 +913,6 @@ def pi_synthesize(
             )
 
         logger.info("Starting Pi synthesis cycle #%d", cycle_count + 1)
-        _progress("starting synthesis")
 
         # ── 4. Establish the accepted-state boundary ──
         recovery_point: RecoveryPoint | None = None
@@ -1008,7 +931,6 @@ def pi_synthesize(
                 recovery_point,
                 started_at=started_at.isoformat(),
             )
-            _progress("state baseline, recovery point, and crash marker ready")
         except Exception as e:
             logger.exception("Failed to prepare accepted-state boundary before synthesis")
             duration_ms = _elapsed_ms()
@@ -1039,32 +961,13 @@ def pi_synthesize(
         # sleep, so a monotonic deadline stretches across sleep.
         cycle_deadline = time.time() + timeout
 
-        runtime_reused = False
         try:
-            from syke.runtime import get_pi_runtime, start_pi_runtime
-
-            try:
-                existing_runtime = get_pi_runtime()
-                existing_status = _safe_runtime_status(existing_runtime)
-                runtime_reused = (
-                    existing_runtime.is_alive
-                    and existing_runtime.model == requested_model
-                    and existing_status.get("workspace") == str(WORKSPACE_ROOT)
-                )
-            except RuntimeError:
-                runtime_reused = False
-
-            if runtime_reused:
-                _progress(f"reusing Pi runtime · {requested_model}")
-            else:
-                _progress(f"starting Pi runtime · {requested_model}")
+            from syke.runtime import start_pi_runtime
 
             runtime = start_pi_runtime(
                 workspace_dir=WORKSPACE_ROOT,
                 session_dir=SESSIONS_DIR,
-                model=model_override,
             )
-            _progress(f"runtime ready · {requested_model}")
 
             def _on_runtime_event(event: dict[str, object]) -> None:
                 nonlocal external_runtime_event
@@ -1077,30 +980,17 @@ def pi_synthesize(
                     except Exception:
                         logger.debug("Synthesis event callback failed", exc_info=True)
                         external_runtime_event = None
-                event_type = event.get("type")
-                if event_type == "tool_execution_start":
-                    name = event.get("toolName")
-                    if isinstance(name, str) and name:
-                        _progress(f"tool · {name}")
-                    return
-                if event_type == "response":
-                    _progress("finalizing response")
 
-            db_paused_for_agent = _pause_db_connection_for_agent()
-            try:
-                pi_result = runtime.prompt(
-                    prompt,
-                    timeout=timeout,
-                    new_session=True,
-                    session_name=f"syke:synthesis:{cycle_id}",
-                    on_event=_on_runtime_event,
-                )
-            finally:
-                _resume_db_connection_after_agent(db_paused_for_agent)
+            pi_result = runtime.prompt(
+                prompt,
+                timeout=timeout,
+                new_session=True,
+                session_name=f"syke:synthesis:{cycle_id}",
+                on_event=_on_runtime_event,
+            )
         except Exception as e:
             logger.exception("Pi runtime failed during synthesis cycle")
             failure_duration = _elapsed_ms()
-            result["runtime_reused"] = runtime_reused
             return _fail_after_restore(
                 error=f"Pi runtime failed: {e}",
                 recovery_point=recovery_point,
@@ -1110,7 +1000,6 @@ def pi_synthesize(
                 output_tokens=0,
                 completed_at_override=_completed_at_override,
             )
-        runtime_status = _safe_runtime_status(runtime)
         total_cost_usd: float | None = None
         total_input_tokens = 0
         total_output_tokens = 0
@@ -1167,10 +1056,6 @@ def pi_synthesize(
                     result[result_name] = value
 
         _record_pi_attempt(pi_result)
-        result["runtime_reused"] = runtime_reused
-        result["runtime_pid"] = runtime_status.get("pid")
-        result["runtime_uptime_s"] = runtime_status.get("uptime_s")
-        result["runtime_session_count"] = runtime_status.get("session_count")
 
         acceptance: dict[str, object] = {
             "max_repair_prompts": MAX_ACCEPTANCE_REPAIR_PROMPTS,
@@ -1320,7 +1205,6 @@ def pi_synthesize(
 
             memex_updated = False
             if rejected is None:
-                _progress("syncing memex")
                 memex_sync: dict[str, object] = {}
                 try:
                     with db.transaction():
@@ -1334,22 +1218,11 @@ def pi_synthesize(
                         memex_synced = bool(memex_sync.get("ok", False))
                         memex_updated = bool(memex_sync.get("updated", False))
                         if not memex_synced:
-                            if os.environ.get("SYKE_ALLOW_EMPTY_MEMEX"):
-                                logger.warning(
-                                    "Memex sync produced no content; continuing "
-                                    "(SYKE_ALLOW_EMPTY_MEMEX)"
-                                )
-                            else:
-                                raise _SynthesisCommitFailed(
-                                    "Pi synthesis completed but canonical memex is unavailable"
-                                )
+                            raise _SynthesisCommitFailed(
+                                "Pi synthesis completed but canonical memex is unavailable"
+                            )
 
-                        if (
-                            memex_synced
-                            and is_first_run
-                            and first_run_source_file_counts
-                            and not os.environ.get("SYKE_ALLOW_EMPTY_MEMEX")
-                        ):
+                        if memex_synced and is_first_run and first_run_source_file_counts:
                             memory_count_after = int(db.get_graph_stats(user_id)["memories"])
                             current_memex = _current_memex_content(db, user_id)
                             if (
@@ -1368,12 +1241,7 @@ def pi_synthesize(
                                 )
 
                     assert safety_baseline is not None
-                    semantic_gate = validate_state_after_cycle(
-                        db,
-                        user_id,
-                        safety_baseline,
-                        allow_empty_memex=bool(os.environ.get("SYKE_ALLOW_EMPTY_MEMEX")),
-                    )
+                    semantic_gate = validate_state_after_cycle(db, user_id, safety_baseline)
                     result["semantic_gate"] = semantic_gate
                     if not semantic_gate.get("valid", False):
                         issues = semantic_gate.get("issues")
@@ -1543,21 +1411,13 @@ def pi_synthesize(
                 )
             acceptance["repair_prompts"] = repair_number
 
-            _progress(
-                f"state rejected · same-session repair "
-                f"{repair_number}/{MAX_ACCEPTANCE_REPAIR_PROMPTS}"
-            )
-            db_paused_for_agent = _pause_db_connection_for_agent()
             try:
-                try:
-                    pi_result = runtime.prompt(
-                        _repair_prompt(rejected, repair_number),
-                        timeout=remaining_timeout,
-                        new_session=False,
-                        on_event=_on_runtime_event,
-                    )
-                finally:
-                    _resume_db_connection_after_agent(db_paused_for_agent)
+                pi_result = runtime.prompt(
+                    _repair_prompt(rejected, repair_number),
+                    timeout=remaining_timeout,
+                    new_session=False,
+                    on_event=_on_runtime_event,
+                )
             except Exception as exc:
                 error = f"Pi runtime failed during acceptance repair: {exc}"
                 rejections = acceptance["rejections"]
