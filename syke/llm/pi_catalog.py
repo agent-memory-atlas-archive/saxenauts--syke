@@ -124,19 +124,14 @@ def _format_model_examples(model_ids: tuple[str, ...]) -> str:
     return ", ".join(repr(model_id) for model_id in examples)
 
 
-def _run_pi_node_script(
-    script: str,
-    *,
-    extra_env: dict[str, str] | None = None,
-    timeout: int = 10,
-) -> subprocess.CompletedProcess[str]:
+def _run_pi_node_script(script: str) -> subprocess.CompletedProcess[str]:
     node_bin = _pi_install.ensure_node_binary()
-    env = _build_subprocess_env(build_pi_agent_env(extra_env))
+    env = _build_subprocess_env(build_pi_agent_env())
     return subprocess.run(
         [str(node_bin), "--input-type=module", "-e", script],
         capture_output=True,
         text=True,
-        timeout=timeout,
+        timeout=10,
         cwd=str(_pi_install.PI_LOCAL_PREFIX),
         env=env,
     )
@@ -366,7 +361,7 @@ def probe_pi_provider_connection(
     try:
         result = subprocess.run(
             [
-                str(_pi_install.resolve_pi_binary()),
+                str(_pi_install.ensure_pi_binary()),
                 "--provider",
                 provider_id,
                 "--model",

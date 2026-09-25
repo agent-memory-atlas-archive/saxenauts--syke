@@ -105,7 +105,7 @@ def test_probe_and_node_script_use_the_bounded_child_environment(
     monkeypatch.setenv("OPENAI_API_KEY", "host-openai")
     monkeypatch.setenv("UNSAFE_SECRET", "must-not-leak")
     monkeypatch.setattr(pi_install, "PI_LOCAL_PREFIX", tmp_path)
-    monkeypatch.setattr(pi_install, "resolve_pi_binary", lambda: "/tmp/pi")
+    monkeypatch.setattr(pi_install, "ensure_pi_binary", lambda: "/tmp/pi")
     monkeypatch.setattr(pi_install, "ensure_node_binary", lambda: tmp_path / "node")
 
     def run(cmd, **kwargs):
@@ -118,16 +118,12 @@ def test_probe_and_node_script_use_the_bounded_child_environment(
     monkeypatch.setattr(pi_catalog.subprocess, "run", run)
 
     ok, _ = pi_catalog.probe_pi_provider_connection("openai", "gpt-5.4")
-    result = pi_catalog._run_pi_node_script(
-        "console.log('ok')",
-        extra_env={"SYKE_TEST_FLAG": "1"},
-    )
+    result = pi_catalog._run_pi_node_script("console.log('ok')")
 
     assert ok is True
     assert result.returncode == 0
     probe_env, script_env = calls[0][1], calls[1][1]
     assert probe_env["OPENAI_API_KEY"] == "host-openai"
-    assert script_env["SYKE_TEST_FLAG"] == "1"
     assert probe_env["PI_CODING_AGENT_DIR"] == script_env["PI_CODING_AGENT_DIR"]
     assert "UNSAFE_SECRET" not in probe_env
     assert "UNSAFE_SECRET" not in script_env

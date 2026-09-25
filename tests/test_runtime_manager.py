@@ -11,7 +11,6 @@ def test_runtime_key_changes_only_when_the_sandbox_boundary_changes(monkeypatch,
     )
     monkeypatch.setattr("syke.runtime.sandbox.sandbox_available", lambda: True)
     monkeypatch.delenv("SYKE_DISABLE_SANDBOX", raising=False)
-    monkeypatch.delenv("SYKE_SANDBOX_HARNESS_PATHS", raising=False)
 
     workspace = tmp_path / "workspace"
     sessions = tmp_path / "sessions"
@@ -19,7 +18,9 @@ def test_runtime_key_changes_only_when_the_sandbox_boundary_changes(monkeypatch,
     assert home_key == _normalize_runtime_key(workspace, sessions, None)
 
     frozen_slice = tmp_path / "frozen-slice"
-    monkeypatch.setenv("SYKE_SANDBOX_HARNESS_PATHS", str(frozen_slice))
+    monkeypatch.setattr(
+        "syke.runtime.sandbox.sandbox_read_paths", lambda: (str(frozen_slice.resolve()),)
+    )
     frozen_key = _normalize_runtime_key(workspace, sessions, None)
     assert frozen_key != home_key
 

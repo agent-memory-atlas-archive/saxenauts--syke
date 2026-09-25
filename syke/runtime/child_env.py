@@ -55,17 +55,12 @@ PROVIDER_HOST_ENV_ALLOWLIST: dict[str, frozenset[str]] = {
 }
 
 
-def host_env_passthrough_keys(
-    provider: str | None = None,
-    *,
-    host_env: Mapping[str, str] | None = None,
-) -> set[str]:
+def host_env_passthrough_keys(provider: str | None = None) -> set[str]:
     keys: set[str] = set(ALWAYS_ALLOWED_HOST_ENV_KEYS)
     if provider:
         keys.update(PROVIDER_HOST_ENV_ALLOWLIST.get(provider, frozenset()))
 
-    source = host_env or os.environ
-    extra = source.get(PI_PASSTHROUGH_ENV_VAR, "")
+    extra = os.environ.get(PI_PASSTHROUGH_ENV_VAR, "")
     for raw in re.split(r"[,\s]+", extra):
         key = raw.strip()
         if not key:
@@ -138,13 +133,9 @@ def temp_paths_from_env(env: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
-def child_temp_paths(
-    *,
-    extra_temp_dirs: tuple[str, ...] | None = None,
-    host_env: Mapping[str, str] | None = None,
-) -> list[str]:
+def child_temp_paths(*, extra_temp_dirs: tuple[str, ...] | None = None) -> list[str]:
     paths = [
-        *temp_paths_from_env(normalized_temp_env(host_env)),
+        *temp_paths_from_env(normalized_temp_env()),
         *(extra_temp_dirs or ()),
     ]
     resolved: list[str] = []
@@ -159,21 +150,19 @@ def build_child_process_env(
     runtime_env: Mapping[str, str] | None = None,
     *,
     provider: str | None = None,
-    host_env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build a bounded child env instead of inheriting the full host shell."""
-    source = host_env or os.environ
     env: dict[str, str] = {}
     for key in BASE_CHILD_ENV_KEYS:
-        value = source.get(key)
+        value = os.environ.get(key)
         if value:
             env[key] = value
-    for key in host_env_passthrough_keys(provider, host_env=source):
-        value = source.get(key)
+    for key in host_env_passthrough_keys(provider):
+        value = os.environ.get(key)
         if value:
             env[key] = value
     if runtime_env:
         env.update(runtime_env)
-    temp_source = {**source, **(runtime_env or {})}
+    temp_source = {**os.environ, **(runtime_env or {})}
     env.update(normalized_temp_env(temp_source))
     return env

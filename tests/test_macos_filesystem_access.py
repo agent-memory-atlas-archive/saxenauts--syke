@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,8 +12,8 @@ from syke.runtime import macos_filesystem_access as access
 
 def _identity(name: str) -> dict[str, dict[str, str]]:
     return {
-        "python": {"path": f"/{name}/python", "resolved_path": f"/{name}/python", "sha256": name},
-        "node": {"path": f"/{name}/node", "resolved_path": f"/{name}/node", "sha256": name},
+        "python": {"resolved_path": f"/{name}/python", "sha256": name},
+        "node": {"resolved_path": f"/{name}/node", "sha256": name},
     }
 
 
@@ -29,31 +28,6 @@ def _granted_folders(home: Path) -> dict[str, dict[str, object]]:
         }
         for name in access.PROTECTED_FOLDER_NAMES
     }
-
-
-def test_job_payload_uses_installed_launcher_and_hidden_worker(tmp_path: Path) -> None:
-    payload = access._job_payload(
-        label="com.syke.test",
-        launcher=tmp_path / "syke",
-        user_id="test",
-        request_path=tmp_path / "request.json",
-        result_path=tmp_path / "result.json",
-        log_path=tmp_path / "probe.log",
-    )
-    decoded = plistlib.loads(plistlib.dumps(payload))
-
-    assert decoded["ProgramArguments"] == [
-        str(tmp_path / "syke"),
-        "--user",
-        "test",
-        "_macos-filesystem-probe",
-        "--request",
-        str(tmp_path / "request.json"),
-        "--result",
-        str(tmp_path / "result.json"),
-    ]
-    assert decoded["RunAtLoad"] is True
-    assert "KeepAlive" not in decoded
 
 
 def test_launchd_probe_timeout_uses_wall_clock(monkeypatch, tmp_path: Path) -> None:
@@ -185,10 +159,7 @@ def test_probe_worker_uses_seatbelt_and_records_only_folder_results(
     monkeypatch, tmp_path: Path
 ) -> None:
     home = tmp_path / "home"
-    request_path = tmp_path / "request.json"
     result_path = tmp_path / "result.json"
-    folders = [{"name": name, "path": str(home / name)} for name in access.PROTECTED_FOLDER_NAMES]
-    request_path.write_text(json.dumps({"folders": folders}), encoding="utf-8")
     node = tmp_path / "node"
     python = tmp_path / "python"
     node.write_bytes(b"node")
@@ -208,7 +179,7 @@ def test_probe_worker_uses_seatbelt_and_records_only_folder_results(
         ),
     )
 
-    returncode = access.run_probe_worker(request_path, result_path)
+    returncode = access.run_probe_worker(result_path)
     payload = json.loads(result_path.read_text(encoding="utf-8"))
 
     assert returncode == 0

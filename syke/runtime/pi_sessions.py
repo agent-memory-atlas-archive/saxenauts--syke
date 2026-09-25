@@ -11,14 +11,6 @@ from typing import Any
 
 
 def _timestamp(value: object) -> datetime | None:
-    if isinstance(value, (int, float)):
-        seconds = float(value)
-        if seconds > 10_000_000_000:
-            seconds /= 1000
-        try:
-            return datetime.fromtimestamp(seconds, tz=UTC)
-        except (OSError, OverflowError, ValueError):
-            return None
     if not isinstance(value, str) or not value:
         return None
     try:

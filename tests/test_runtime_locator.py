@@ -35,7 +35,6 @@ def test_ensure_syke_launcher_writes_exec_script(tmp_path: Path, monkeypatch) ->
         mode="external_cli",
         syke_command=("/usr/local/bin/syke",),
         target_path=Path("/usr/local/bin/syke"),
-        launcher_path=launcher_path,
     )
 
     monkeypatch.setattr("syke.runtime.locator.SYKE_BIN_DIR", launcher_path.parent)

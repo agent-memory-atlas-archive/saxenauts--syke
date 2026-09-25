@@ -1,9 +1,4 @@
-"""Runtime locator for Syke's own executable surfaces.
-
-This is the first slice of the broader runtime-locator plan. It gives Syke a
-stable launcher boundary for daemon/service execution instead of binding
-background jobs directly to whichever install surface happened to invoke setup.
-"""
+"""Runtime locator for Syke's own executable surfaces."""
 
 from __future__ import annotations
 
@@ -35,7 +30,6 @@ class SykeRuntimeDescriptor:
     mode: Literal["external_cli", "source_dev", "python_module"]
     syke_command: tuple[str, ...]
     target_path: Path | None
-    launcher_path: Path = SYKE_BIN
     working_directory: Path | None = None
     package_version: str | None = None
     install_origin: Path | None = None
@@ -55,18 +49,6 @@ def is_tcc_protected(path: Path) -> bool:
         resolved == directory.resolve() or directory.resolve() in resolved.parents
         for directory in protected_dirs
     )
-
-
-def _dedupe_paths(paths: list[Path]) -> list[Path]:
-    seen: set[str] = set()
-    result: list[Path] = []
-    for path in paths:
-        key = str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(path)
-    return result
 
 
 def _is_executable_file(path: Path) -> bool:
@@ -103,7 +85,7 @@ def _candidate_console_scripts() -> list[Path]:
         if _is_executable_file(candidate):
             candidates.append(candidate.resolve())
 
-    return _dedupe_paths(candidates)
+    return list(dict.fromkeys(candidates))
 
 
 def _find_dist_info_dir(script_path: Path) -> Path | None:
@@ -157,13 +139,6 @@ def _install_metadata(script_path: Path) -> tuple[Path | None, bool]:
         return None, editable
 
     raw_path = unquote(parsed.path or "")
-    if (
-        sys.platform == "win32"
-        and raw_path.startswith("/")
-        and len(raw_path) > 2
-        and raw_path[2] == ":"
-    ):
-        raw_path = raw_path[1:]
     if not raw_path:
         return None, editable
     return Path(raw_path).resolve(), editable
@@ -206,14 +181,10 @@ def describe_runtime_target(runtime: SykeRuntimeDescriptor) -> str:
     return f"{target} ({', '.join(details)})"
 
 
-def resolve_syke_runtime(*, prefer_external: bool = False) -> SykeRuntimeDescriptor:
+def resolve_syke_runtime() -> SykeRuntimeDescriptor:
     """Resolve the current Syke runtime command for the active install surface."""
     for candidate in _candidate_console_scripts():
-        descriptor = _describe_console_script(candidate)
-        mode = descriptor.mode
-        if prefer_external and mode == "source_dev":
-            continue
-        return descriptor
+        return _describe_console_script(candidate)
 
     python_executable = Path(sys.executable).resolve()
     return SykeRuntimeDescriptor(
@@ -314,7 +285,7 @@ def resolve_background_syke_runtime() -> SykeRuntimeDescriptor:
 def ensure_syke_launcher(runtime: SykeRuntimeDescriptor | None = None) -> Path:
     """Write the stable Syke launcher used by daemon/service registrations."""
     runtime = runtime or resolve_syke_runtime()
-    launcher_path = runtime.launcher_path
+    launcher_path = SYKE_BIN
 
     launcher_path.parent.mkdir(parents=True, exist_ok=True)
     launcher_lines = ["#!/bin/sh"]

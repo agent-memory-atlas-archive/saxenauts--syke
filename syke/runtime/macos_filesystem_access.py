@@ -76,7 +76,6 @@ def _sha256(path: Path) -> str:
 def _executable_identity(path: Path) -> dict[str, str]:
     resolved = path.expanduser().resolve()
     return {
-        "path": str(path.expanduser()),
         "resolved_path": str(resolved),
         "sha256": _sha256(resolved),
     }
@@ -154,18 +153,14 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _folder_summary(folders: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
-    granted: list[str] = []
+def _folder_summary(folders: dict[str, Any]) -> tuple[bool, list[str]]:
     blocked: list[str] = []
     for name in PROTECTED_FOLDER_NAMES:
         raw = folders.get(name)
         item = raw if isinstance(raw, dict) else {}
-        status = item.get("status")
-        if status in {"granted", "missing"}:
-            granted.append(name)
-        else:
+        if item.get("status") not in {"granted", "missing"}:
             blocked.append(name)
-    return not blocked, granted, blocked
+    return not blocked, blocked
 
 
 def _detail_for_state(payload: dict[str, Any], *, identity_matches: bool = True) -> str:
@@ -176,7 +171,7 @@ def _detail_for_state(payload: dict[str, Any], *, identity_matches: bool = True)
         return "Syke's background runtime changed; run `syke doctor` in a terminal to verify access"
     folders = payload.get("folders")
     folder_payload = folders if isinstance(folders, dict) else {}
-    ok, _granted, blocked = _folder_summary(folder_payload)
+    ok, blocked = _folder_summary(folder_payload)
     if ok:
         return "Desktop, Documents, and Downloads verified for background Syke"
     if blocked:
@@ -218,7 +213,7 @@ def macos_filesystem_access_status() -> dict[str, Any]:
         identity_matches = False
     folders = payload.get("folders")
     folder_payload = folders if isinstance(folders, dict) else {}
-    folders_ok, _granted, _blocked = _folder_summary(folder_payload)
+    folders_ok, _ = _folder_summary(folder_payload)
     ok = folders_ok and identity_matches
     return {
         **payload,
@@ -230,39 +225,12 @@ def macos_filesystem_access_status() -> dict[str, Any]:
     }
 
 
-def _validated_request_folders(payload: dict[str, Any]) -> list[dict[str, str]]:
-    raw_folders = payload.get("folders")
-    if not isinstance(raw_folders, list):
-        raise ValueError("macOS filesystem probe request has no folder list")
-    expected = {path.name: path for path in protected_home_folders()}
-    folders: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for raw in raw_folders:
-        if not isinstance(raw, dict):
-            raise ValueError("macOS filesystem probe folder is not an object")
-        name = raw.get("name")
-        path_text = raw.get("path")
-        if not isinstance(name, str) or name not in expected or name in seen:
-            raise ValueError(f"invalid macOS protected-folder category: {name!r}")
-        if (
-            not isinstance(path_text, str)
-            or Path(path_text).expanduser().resolve() != expected[name]
-        ):
-            raise ValueError(f"invalid macOS protected-folder path for {name}")
-        seen.add(name)
-        folders.append({"name": name, "path": str(expected[name])})
-    return folders
-
-
-def run_probe_worker(request_path: Path, result_path: Path) -> int:
+def run_probe_worker(result_path: Path) -> int:
     """Run the sandboxed Node folder check inside the one-shot LaunchAgent."""
     from syke.llm.pi_client import ensure_node_binary
     from syke.runtime.sandbox import generate_seatbelt_profile
 
-    request = _read_json(request_path)
-    if request is None:
-        raise ValueError(f"Could not read macOS filesystem probe request: {request_path}")
-    folders = _validated_request_folders(request)
+    folders = [{"name": path.name, "path": str(path)} for path in protected_home_folders()]
     node = ensure_node_binary()
     profile_path = result_path.with_suffix(".sb")
     profile_path.write_text(
@@ -309,33 +277,6 @@ def run_probe_worker(request_path: Path, result_path: Path) -> int:
     return 0 if completed.returncode == 0 else 1
 
 
-def _job_payload(
-    *,
-    label: str,
-    launcher: Path,
-    user_id: str,
-    request_path: Path,
-    result_path: Path,
-    log_path: Path,
-) -> dict[str, Any]:
-    return {
-        "Label": label,
-        "ProgramArguments": [
-            str(launcher),
-            "--user",
-            user_id,
-            "_macos-filesystem-probe",
-            "--request",
-            str(request_path),
-            "--result",
-            str(result_path),
-        ],
-        "RunAtLoad": True,
-        "StandardOutPath": str(log_path),
-        "StandardErrorPath": str(log_path),
-    }
-
-
 def _run_launchd_probe(
     *,
     launcher: Path,
@@ -345,32 +286,25 @@ def _run_launchd_probe(
 ) -> dict[str, Any]:
     run_id = run_dir.name
     label = f"{LAUNCHD_LABEL_PREFIX}.{run_id}"
-    request_path = run_dir / "request.json"
     result_path = run_dir / "result.json"
     log_path = run_dir / "probe.log"
     plist_path = run_dir / "probe.plist"
-    _write_json(
-        request_path,
-        {
-            "schema_version": 1,
-            "folders": [
-                {"name": path.name, "path": str(path)} for path in protected_home_folders()
-            ],
-        },
-    )
+    job = {
+        "Label": label,
+        "ProgramArguments": [
+            str(launcher),
+            "--user",
+            user_id,
+            "_macos-filesystem-probe",
+            "--result",
+            str(result_path),
+        ],
+        "RunAtLoad": True,
+        "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(log_path),
+    }
     with plist_path.open("wb") as handle:
-        plistlib.dump(
-            _job_payload(
-                label=label,
-                launcher=launcher,
-                user_id=user_id,
-                request_path=request_path,
-                result_path=result_path,
-                log_path=log_path,
-            ),
-            handle,
-            sort_keys=False,
-        )
+        plistlib.dump(job, handle, sort_keys=False)
 
     domain = f"gui/{os.getuid()}"
     service = f"{domain}/{label}"
@@ -424,16 +358,10 @@ def _run_launchd_probe(
         )
 
 
-def run_macos_filesystem_access_check(
-    user_id: str,
-    *,
-    timeout: float = 300.0,
-) -> dict[str, Any]:
+def run_macos_filesystem_access_check(user_id: str) -> dict[str, Any]:
     """Request and verify protected-folder access through background Syke."""
     if sys.platform != "darwin":
         return macos_filesystem_access_status()
-    if timeout <= 0:
-        raise ValueError("macOS filesystem access timeout must be positive")
 
     from syke.runtime.locator import ensure_syke_launcher, resolve_background_syke_runtime
 
@@ -448,7 +376,7 @@ def run_macos_filesystem_access_check(
             launcher=launcher,
             user_id=user_id,
             run_dir=run_dir,
-            timeout=timeout,
+            timeout=300.0,
         )
     except Exception as exc:
         payload = {
@@ -463,7 +391,7 @@ def run_macos_filesystem_access_check(
 
     folders = payload.get("folders")
     folder_payload = folders if isinstance(folders, dict) else {}
-    ok, _granted, _blocked = _folder_summary(folder_payload)
+    ok, _ = _folder_summary(folder_payload)
     ok = ok and not bool(payload.get("error"))
     result = {
         **payload,

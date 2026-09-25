@@ -363,13 +363,13 @@ def resolve_pi_binary() -> str:
     return ensure_pi_binary()
 
 
-def get_pi_version(*, install: bool = False, minimal_env: bool = False, timeout: int = 10) -> str:
+def get_pi_version(*, install: bool = False, minimal_env: bool = False) -> str:
     """Return Pi version through Syke's stable launcher.
 
     When ``minimal_env`` is true, simulate a launchd-style cold environment with
     a stripped PATH to catch shell-dependent runtime failures.
     """
-    launcher = Path(ensure_pi_binary() if install else PI_BIN)
+    launcher = PI_BIN
     _validate_pi_install(PI_LOCAL_PREFIX)
     if not launcher.exists():
         raise FileNotFoundError(f"Pi launcher not found at {launcher}")
@@ -385,7 +385,7 @@ def get_pi_version(*, install: bool = False, minimal_env: bool = False, timeout:
         [str(launcher), "--version"],
         capture_output=True,
         text=True,
-        timeout=timeout,
+        timeout=10,
         env=env,
     )
     if result.returncode != 0:

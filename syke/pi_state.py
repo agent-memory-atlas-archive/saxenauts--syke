@@ -63,27 +63,25 @@ def build_pi_agent_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
-def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+def _load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return dict(default)
+        return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return dict(default)
-    return raw if isinstance(raw, dict) else dict(default)
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
-def _write_json(path: Path, data: dict[str, Any], *, mode: int | None = None) -> None:
+def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if mode is not None:
-        os.chmod(path.parent, _PRIVATE_DIR_MODE)
+    os.chmod(path.parent, _PRIVATE_DIR_MODE)
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2, sort_keys=True)
             handle.write("\n")
-        if mode is not None:
-            os.chmod(tmp_path, mode)
+        os.chmod(tmp_path, _PRIVATE_FILE_MODE)
         os.replace(tmp_path, path)
     except BaseException:
         try:
@@ -196,19 +194,14 @@ def _append_pi_state_audit(
     os.chmod(audit_path, stat.S_IRUSR | stat.S_IWUSR)
 
 
-def load_pi_auth() -> dict[str, Any]:
-    return _load_json(get_pi_auth_path(), {})
-
-
-def save_pi_auth(data: dict[str, Any], *, reason: str = "save_pi_auth") -> None:
-    path = get_pi_auth_path()
-    before = load_pi_auth()
-    _write_json(
-        path,
-        data,
-        mode=_PRIVATE_FILE_MODE,
-    )
+def _save_pi_state(path: Path, data: dict[str, Any], *, reason: str) -> None:
+    before = _load_json(path)
+    _write_json(path, data)
     _append_pi_state_audit(event=reason, path=path, before=before, after=data)
+
+
+def load_pi_auth() -> dict[str, Any]:
+    return _load_json(get_pi_auth_path())
 
 
 def get_credential(provider_id: str) -> dict[str, Any] | None:
@@ -224,7 +217,7 @@ def list_credential_providers() -> list[str]:
 def set_api_key(provider_id: str, key: str) -> None:
     auth = load_pi_auth()
     auth[provider_id] = {"type": "api_key", "key": key}
-    save_pi_auth(auth, reason="set_api_key")
+    _save_pi_state(get_pi_auth_path(), auth, reason="set_api_key")
 
 
 def remove_credential(provider_id: str) -> bool:
@@ -232,19 +225,12 @@ def remove_credential(provider_id: str) -> bool:
     if provider_id not in auth:
         return False
     del auth[provider_id]
-    save_pi_auth(auth, reason="remove_credential")
+    _save_pi_state(get_pi_auth_path(), auth, reason="remove_credential")
     return True
 
 
 def load_pi_settings() -> dict[str, Any]:
-    return _load_json(get_pi_settings_path(), {})
-
-
-def save_pi_settings(data: dict[str, Any], *, reason: str = "save_pi_settings") -> None:
-    path = get_pi_settings_path()
-    before = load_pi_settings()
-    _write_json(path, data, mode=_PRIVATE_FILE_MODE)
-    _append_pi_state_audit(event=reason, path=path, before=before, after=data)
+    return _load_json(get_pi_settings_path())
 
 
 def get_default_provider() -> str | None:
@@ -271,18 +257,11 @@ def set_default_provider_and_model(
     else:
         settings.pop("defaultProvider", None)
         settings.pop("defaultModel", None)
-    save_pi_settings(settings, reason="set_default_provider_and_model")
+    _save_pi_state(get_pi_settings_path(), settings, reason="set_default_provider_and_model")
 
 
 def load_pi_models() -> dict[str, Any]:
-    return _load_json(get_pi_models_path(), {})
-
-
-def save_pi_models(data: dict[str, Any], *, reason: str = "save_pi_models") -> None:
-    path = get_pi_models_path()
-    before = load_pi_models()
-    _write_json(path, data, mode=_PRIVATE_FILE_MODE)
-    _append_pi_state_audit(event=reason, path=path, before=before, after=data)
+    return _load_json(get_pi_models_path())
 
 
 def upsert_provider_override(
@@ -316,7 +295,7 @@ def upsert_provider_override(
     if models is not None:
         provider["models"] = models
 
-    save_pi_models(payload, reason="upsert_provider_override")
+    _save_pi_state(get_pi_models_path(), payload, reason="upsert_provider_override")
 
 
 def get_provider_override(provider_id: str) -> dict[str, Any] | None:
@@ -341,5 +320,5 @@ def remove_provider_override(provider_id: str) -> bool:
         return False
     del providers[provider_id]
     payload["providers"] = providers
-    save_pi_models(payload, reason="remove_provider_override")
+    _save_pi_state(get_pi_models_path(), payload, reason="remove_provider_override")
     return True

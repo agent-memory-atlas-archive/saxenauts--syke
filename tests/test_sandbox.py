@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -43,7 +42,6 @@ def test_profile_declares_the_current_authority_boundary(monkeypatch, tmp_path: 
     runtime = control / "runtime"
     home.mkdir(exist_ok=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    monkeypatch.delenv("SYKE_SANDBOX_HARNESS_PATHS", raising=False)
 
     profile = generate_seatbelt_profile(
         workspace,
@@ -76,20 +74,8 @@ def test_sandbox_read_paths_default_to_home(monkeypatch, tmp_path: Path) -> None
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    monkeypatch.delenv("SYKE_SANDBOX_HARNESS_PATHS", raising=False)
 
     assert sandbox_read_paths() == (str(home.resolve()),)
-
-
-def test_sandbox_read_paths_can_be_overridden(monkeypatch) -> None:
-    monkeypatch.setenv(
-        "SYKE_SANDBOX_HARNESS_PATHS",
-        os.pathsep.join(["/tmp/frozen-slice", "/tmp/frozen-slice-2"]),
-    )
-    resolved = sandbox_read_paths()
-    assert len(resolved) == 2
-    assert resolved[0].endswith("/tmp/frozen-slice")
-    assert resolved[1].endswith("/tmp/frozen-slice-2")
 
 
 @pytest.mark.platform
@@ -124,7 +110,6 @@ def test_profile_enforces_home_read_only_and_syke_write_boundary(
     runtime = control / "runtime"
     runtime.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    monkeypatch.delenv("SYKE_SANDBOX_HARNESS_PATHS", raising=False)
     monkeypatch.setenv("SYKE_CONTROL_ROOT", str(control))
 
     profile_path = write_sandbox_profile(workspace)
@@ -283,9 +268,10 @@ def test_redirected_caller_tmpdir_cannot_strand_child_runtime_temp(
             assert child_tmp == darwin_temp
 
 
+@pytest.mark.platform
 def test_unique_temp_file_per_call(tmp_path: Path) -> None:
     if not sandbox_available():
-        return
+        pytest.fail("macOS sandbox-exec is unavailable")
     p1 = write_sandbox_profile(_workspace(tmp_path))
     p2 = write_sandbox_profile(_workspace(tmp_path))
     assert p1 is not None and p2 is not None

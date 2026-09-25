@@ -13,6 +13,7 @@ def test_child_environment_is_bounded_and_explicitly_extensible(
     monkeypatch.setattr(child_env.sys, "platform", "linux")
     runtime_tmp = tmp_path / "runtime-tmp"
     runtime_tmp.mkdir()
+    monkeypatch.delenv("SYKE_PI_TMPDIR", raising=False)
     host = {
         "HOME": "/tmp/home",
         "PATH": "/usr/bin:/bin",
@@ -25,6 +26,8 @@ def test_child_environment_is_bounded_and_explicitly_extensible(
         "PI_CODING_AGENT_DIR": "/tmp/pi-agent",
         "SYKE_PI_PASSTHROUGH_ENV": "ANTHROPIC_API_KEY",
     }
+    for key, value in host.items():
+        monkeypatch.setenv(key, value)
 
     env = child_env.build_child_process_env(
         {
@@ -32,7 +35,6 @@ def test_child_environment_is_bounded_and_explicitly_extensible(
             "AZURE_OPENAI_API_KEY": "runtime-azure",
         },
         provider="openai",
-        host_env=host,
     )
 
     assert env["OPENAI_API_KEY"] == "runtime-openai"
@@ -54,6 +56,8 @@ def test_child_environment_uses_the_darwin_user_temp_directory(
     for path in (inherited_tmp, runtime_tmp, darwin_tmp):
         path.mkdir()
     monkeypatch.setattr(child_env.sys, "platform", "darwin")
+    monkeypatch.setenv("TMPDIR", str(inherited_tmp))
+    monkeypatch.delenv("SYKE_PI_TMPDIR", raising=False)
     monkeypatch.setattr(
         child_env.subprocess,
         "run",
@@ -63,7 +67,6 @@ def test_child_environment_uses_the_darwin_user_temp_directory(
     env = child_env.build_child_process_env(
         {"TMPDIR": str(runtime_tmp)},
         provider="openai-codex",
-        host_env={"TMPDIR": str(inherited_tmp)},
     )
 
     assert env["TMPDIR"] == env["TMP"] == env["TEMP"] == str(darwin_tmp)
