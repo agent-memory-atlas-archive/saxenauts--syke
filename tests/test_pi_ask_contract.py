@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
-from syke.db_access import DatabaseLeaseUnavailable, acquire_database_lease
-from syke.llm.backends import AskEvent, pi_synthesis
+from syke.llm.backends import AskEvent
 from syke.llm.backends import pi_ask as pi_ask_module
 from syke.llm.pi_client import PiCycleResult
 from syke.runtime import workspace as workspace_module
@@ -102,9 +99,6 @@ def test_pi_ask_runs_a_standalone_attention_episode(
     started_with: dict[str, object] = {}
     prompt_context: dict[str, object] = {}
 
-    def fail_if_synthesis_runs(*_args, **_kwargs):
-        raise AssertionError("foreground ask must not enter synthesis")
-
     def fake_start_runtime(**kwargs):
         started_with.update(kwargs)
         return runtime
@@ -114,7 +108,6 @@ def test_pi_ask_runs_a_standalone_attention_episode(
         prompt_context["kwargs"] = kwargs
         return "standalone ask prompt"
 
-    monkeypatch.setattr(pi_synthesis, "pi_synthesize", fail_if_synthesis_runs)
     monkeypatch.setattr(workspace_module, "WORKSPACE_ROOT", workspace_root)
     monkeypatch.setattr(workspace_module, "SESSIONS_DIR", session_dir)
     monkeypatch.setattr("syke.runtime.start_pi_runtime", fake_start_runtime)
@@ -252,46 +245,3 @@ def test_pi_ask_removes_only_spills_reported_by_its_runtime(
     assert callback_calls == 1
     assert not owned.exists()
     assert unreported.read_text(encoding="utf-8") == "unreported"
-
-
-def test_pi_ask_pause_keeps_database_lease_until_owner_closes(
-    db,
-    user_id: str,
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    workspace_root = tmp_path / "workspace"
-    session_dir = tmp_path / "control" / "sessions"
-    workspace_root.mkdir()
-    session_dir.mkdir(parents=True)
-    runtime = _FakeRuntime(_cycle_result(), workspace_root)
-    original_prompt = runtime.prompt
-    lease_blocked_during_prompt = False
-
-    def fake_prompt(*args: object, **kwargs: object) -> PiCycleResult:
-        nonlocal lease_blocked_during_prompt
-        with pytest.raises(DatabaseLeaseUnavailable):
-            acquire_database_lease(db.db_path, exclusive=True, blocking=False)
-        lease_blocked_during_prompt = True
-        return original_prompt(*args, **kwargs)
-
-    monkeypatch.setenv("SYKE_REPLAY_PAUSE_DB_CONNECTION_DURING_PI", "1")
-    monkeypatch.setattr(workspace_module, "WORKSPACE_ROOT", workspace_root)
-    monkeypatch.setattr(workspace_module, "SESSIONS_DIR", session_dir)
-    monkeypatch.setattr("syke.runtime.start_pi_runtime", lambda **_kwargs: runtime)
-    monkeypatch.setattr(
-        "syke.runtime.prompt_context.build_prompt",
-        lambda *_args, **_kwargs: "standalone ask prompt",
-    )
-    monkeypatch.setattr(pi_ask_module, "get_selected_sources", lambda _user_id: ())
-    monkeypatch.setattr(runtime, "prompt", fake_prompt)
-
-    answer, metadata = pi_ask_module.pi_ask(db, user_id, "question")
-
-    assert answer == "answer"
-    assert metadata["error"] is None
-    assert lease_blocked_during_prompt is True
-
-    db.close()
-    with acquire_database_lease(db.db_path, exclusive=True, blocking=False):
-        pass

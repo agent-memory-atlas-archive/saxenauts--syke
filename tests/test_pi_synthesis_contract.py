@@ -17,6 +17,7 @@ from syke.db import SykeDB
 from syke.llm import pi_client
 from syke.llm.backends import pi_synthesis
 from syke.memory.memex import update_memex
+from syke.memory.memex_budget import strip_memex_header
 
 pytestmark = pytest.mark.usefixtures("isolated_synthesis_paths")
 
@@ -60,20 +61,7 @@ def _install_success_runtime(monkeypatch, prompt_fn) -> None:
             model=model_override or "k2p5",
         ),
     )
-    runtime = SimpleNamespace(
-        is_alive=True,
-        model="k2p5",
-        prompt=prompt_fn,
-        status=lambda: {
-            "workspace": str(pi_synthesis.WORKSPACE_ROOT),
-            "pid": 1,
-            "uptime_s": 1,
-            "session_count": 1,
-        },
-    )
-    monkeypatch.setattr(
-        runtime_module, "get_pi_runtime", lambda: (_ for _ in ()).throw(RuntimeError())
-    )
+    runtime = SimpleNamespace(prompt=prompt_fn)
     monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
 
 
@@ -99,7 +87,6 @@ def _pi_success_result(
         stop_reason="stop",
         tool_calls=[],
         events=[],
-        transcript=[{"role": "assistant", "content": [{"type": "text", "text": output}]}],
         num_turns=1,
         thinking=[],
         session_id=resolved_session_id,
@@ -145,7 +132,7 @@ def test_failed_graph_restore_still_restores_the_accepted_memex_projection(
         assert "recovery" not in result
         assert "restore unavailable" in str(result["recovery_error"])
         restored_projection = memex_path.read_text(encoding="utf-8")
-        assert pi_synthesis._strip_memex_header(restored_projection).strip() == "accepted memex"
+        assert strip_memex_header(restored_projection).strip() == "accepted memex"
     finally:
         db.close()
 
@@ -296,7 +283,7 @@ def test_sync_memex_authority_matrix(
     written = memex_path.read_text(encoding="utf-8")
     assert written.startswith("# MEMEX [")
     assert "/ 2,000 tokens" in written
-    assert pi_synthesis._strip_memex_header(written).strip() == expected_content
+    assert strip_memex_header(written).strip() == expected_content
 
 
 def test_pi_synthesize_treats_header_only_memex_normalization_as_noop(
@@ -354,7 +341,7 @@ def test_first_run_state_matches_available_history(
     monkeypatch.setattr(
         pi_synthesis,
         "_discovered_source_file_counts",
-        lambda selected_sources, *, home=None: source_counts,
+        lambda selected_sources: source_counts,
     )
     monkeypatch.setattr(
         pi_synthesis,
@@ -404,7 +391,7 @@ def test_first_run_state_matches_available_history(
             assert memex is not None
             assert "No prior harness history was detected" in memex["content"]
             assert (
-                pi_synthesis._strip_memex_header(memex_path.read_text(encoding="utf-8")).strip()
+                strip_memex_header(memex_path.read_text(encoding="utf-8")).strip()
                 == memex["content"]
             )
             assert _latest_receipt()["status"] == "completed"
@@ -503,48 +490,7 @@ def test_pi_synthesize_marks_replay_db_validation_issue_failed(
     db = SykeDB(tmp_path / "syke.db")
     update_memex(db, user_id, "canonical memex")
 
-    monkeypatch.setattr(
-        pi_client,
-        "resolve_pi_launch_binding",
-        lambda model_override=None: pi_client.PiLaunchBinding(
-            provider="kimi-coding",
-            model=model_override or "k2p5",
-        ),
-    )
-    runtime = SimpleNamespace(
-        is_alive=True,
-        model="k2p5",
-        prompt=lambda *args, **kwargs: SimpleNamespace(
-            ok=True,
-            output="done",
-            duration_ms=5,
-            cost_usd=0.0,
-            input_tokens=10,
-            output_tokens=4,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-            provider="kimi-coding",
-            response_model="k2p5",
-            response_id="resp_validation_fail",
-            stop_reason="stop",
-            tool_calls=[],
-            events=[],
-            transcript=[{"role": "assistant", "content": [{"type": "text", "text": "done"}]}],
-            num_turns=1,
-            thinking=[],
-        ),
-        status=lambda: {
-            "workspace": str(pi_synthesis.WORKSPACE_ROOT),
-            "pid": 1,
-            "uptime_s": 1,
-            "session_count": 1,
-        },
-    )
-
-    monkeypatch.setattr(
-        runtime_module, "get_pi_runtime", lambda: (_ for _ in ()).throw(RuntimeError())
-    )
-    monkeypatch.setattr(runtime_module, "start_pi_runtime", lambda **kwargs: runtime)
+    _install_success_runtime(monkeypatch, lambda *args, **kwargs: _pi_success_result())
     monkeypatch.setattr(
         pi_synthesis,
         "_validate_cycle_output",

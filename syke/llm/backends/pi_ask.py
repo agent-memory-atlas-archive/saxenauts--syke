@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -182,27 +181,6 @@ def pi_ask(
             logger.debug("Ask event callback failed", exc_info=True)
             external_on_event = None
 
-    def _pause_db_connection_for_agent() -> bool:
-        if not os.environ.get("SYKE_REPLAY_PAUSE_DB_CONNECTION_DURING_PI"):
-            return False
-        if getattr(db, "db_path", ":memory:") == ":memory:":
-            return False
-        try:
-            db.conn.commit()
-            db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            db.suspend()
-            logger.info("Replay DB connection paused while Pi ask runs")
-            return True
-        except Exception:
-            logger.warning("Failed to pause replay DB connection before Pi ask", exc_info=True)
-            return False
-
-    def _resume_db_connection_after_agent(paused: bool) -> None:
-        if not paused:
-            return
-        db.reopen()
-        logger.info("Replay DB connection resumed after Pi ask run")
-
     try:
         operation_runtime.mkdir(parents=True, exist_ok=False)
         prompt = build_prompt(
@@ -224,17 +202,13 @@ def pi_ask(
             model=model,
         )
 
-        db_paused_for_agent = _pause_db_connection_for_agent()
-        try:
-            result = runtime.prompt(
-                prompt,
-                timeout=timeout,
-                on_event=_on_raw_event,
-                new_session=True,
-                session_name=f"syke:ask:{run_id}",
-            )
-        finally:
-            _resume_db_connection_after_agent(db_paused_for_agent)
+        result = runtime.prompt(
+            prompt,
+            timeout=timeout,
+            on_event=_on_raw_event,
+            new_session=True,
+            session_name=f"syke:ask:{run_id}",
+        )
     except Exception as exc:
         duration_ms = int((time.monotonic() - started) * 1000)
         logger.exception("Pi ask failed for user %s", user_id)

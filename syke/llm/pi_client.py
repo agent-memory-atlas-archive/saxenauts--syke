@@ -26,28 +26,18 @@ from syke.runtime.pi_settings import configure_pi_workspace
 
 logger = logging.getLogger(__name__)
 
-# Compatibility surface for callers that historically imported installation
-# helpers from pi_client.
+# Public API of the Pi runtime package. Callers import installation, catalog,
+# and RPC names from pi_client; the implementations live in the sibling
+# modules.
 PI_BIN = _pi_install.PI_BIN
-PI_CLI_JS = _pi_install.PI_CLI_JS
-PI_LOCAL_PREFIX = _pi_install.PI_LOCAL_PREFIX
 PI_NODE_BIN = _pi_install.PI_NODE_BIN
 PI_PACKAGE = _pi_install.PI_PACKAGE
-PI_PACKAGE_ROOT = _pi_install.PI_PACKAGE_ROOT
-PI_PACKAGE_SPEC = _pi_install.PI_PACKAGE_SPEC
 PI_PACKAGE_VERSION = _pi_install.PI_PACKAGE_VERSION
-PI_SCHEMA_PACKAGE = _pi_install.PI_SCHEMA_PACKAGE
-PI_SCHEMA_SPEC = _pi_install.PI_SCHEMA_SPEC
-PI_SCHEMA_VERSION = _pi_install.PI_SCHEMA_VERSION
-PI_TOOL_EXTENSION = _pi_install.PI_TOOL_EXTENSION
-PI_TOOL_EXTENSION_SOURCE = _pi_install.PI_TOOL_EXTENSION_SOURCE
 ensure_node_binary = _pi_install.ensure_node_binary
 ensure_pi_binary = _pi_install.ensure_pi_binary
 get_pi_version = _pi_install.get_pi_version
 resolve_pi_binary = _pi_install.resolve_pi_binary
 
-# Compatibility surface for provider/runtime callers that historically
-# imported catalog and auth helpers from pi_client.
 PiLaunchBinding = _pi_catalog.PiLaunchBinding
 PiProviderCatalogEntry = _pi_catalog.PiProviderCatalogEntry
 get_pi_provider_catalog = _pi_catalog.get_pi_provider_catalog
@@ -55,14 +45,16 @@ probe_pi_provider_connection = _pi_catalog.probe_pi_provider_connection
 resolve_pi_launch_binding = _pi_catalog.resolve_pi_launch_binding
 run_pi_oauth_login = _pi_catalog.run_pi_oauth_login
 
-# Compatibility surface for callers that historically imported RPC types from
-# pi_client.
 PiCycleResult = _pi_rpc.PiCycleResult
 RpcEventStream = _pi_rpc.RpcEventStream
 
 
 def resolve_pi_model(model_override: str | None = None) -> str:
-    """Resolve through the compatibility binding seam retained by pi_client."""
+    """Resolve the Pi model through this module's binding seam.
+
+    Kept here rather than aliased to pi_catalog so tests that patch
+    ``pi_client.resolve_pi_launch_binding`` also steer model resolution.
+    """
     return resolve_pi_launch_binding(model_override).model
 
 
