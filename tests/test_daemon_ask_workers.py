@@ -113,7 +113,7 @@ def test_daemon_ask_worker_env_is_bounded_and_normalizes_temp(
     assert env["TEMP"] == str(child_tmp)
 
 
-def test_ask_worker_opens_the_validated_user_database(monkeypatch, tmp_path, capsys) -> None:
+def test_ask_worker_opens_the_user_database(monkeypatch, tmp_path, capsys) -> None:
     db_path = tmp_path / "syke.db"
     opened: list[str] = []
 
@@ -124,7 +124,6 @@ def test_ask_worker_opens_the_validated_user_database(monkeypatch, tmp_path, cap
         def __exit__(self, *_exc):
             return None
 
-    monkeypatch.setattr("syke.config.user_syke_db_path", lambda _user: db_path)
     monkeypatch.setattr(
         "syke.cli_support.context.get_db",
         lambda user: opened.append(user) or FakeDB(),
@@ -152,25 +151,6 @@ def test_ask_worker_opens_the_validated_user_database(monkeypatch, tmp_path, cap
     payload = json.loads(capsys.readouterr().out)
     assert payload["type"] == "result"
     assert payload["answer"] == "answer"
-
-
-def test_ask_worker_rejects_a_database_outside_user_scope(monkeypatch, tmp_path) -> None:
-    expected = tmp_path / "expected.db"
-    monkeypatch.setattr("syke.config.user_syke_db_path", lambda _user: expected)
-    monkeypatch.setattr(
-        "syke.cli_support.context.get_db",
-        lambda _user: pytest.fail("database must not open before path validation"),
-    )
-
-    with pytest.raises(ValueError, match="outside user scope"):
-        run_child(
-            {
-                "user_id": "person",
-                "syke_db_path": str(tmp_path / "other.db"),
-                "question": "what changed",
-                "transport_details": {},
-            }
-        )
 
 
 def test_ask_worker_timeout_uses_wall_clock(monkeypatch, tmp_path) -> None:

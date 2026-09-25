@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from collections import deque
 from typing import cast
@@ -106,8 +107,6 @@ def daemon_start(ctx: click.Context, interval: int) -> None:
 @daemon.command("stop")
 @click.pass_context
 def daemon_stop(ctx: click.Context) -> None:
-    import sys
-
     from syke.cli_support.exit_codes import SykeRuntimeException
     from syke.daemon.daemon import (
         daemon_process_state,
@@ -394,10 +393,6 @@ def logs(ctx: click.Context, lines: int, follow: bool, errors: bool, use_json: b
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
 def self_update(ctx: click.Context, yes: bool) -> None:
-    import subprocess
-    import sys
-
-    from syke import __version__
     from syke.daemon.daemon import daemon_process_state, install_and_start, stop_and_unload
     from syke.version_check import check_update_available
 

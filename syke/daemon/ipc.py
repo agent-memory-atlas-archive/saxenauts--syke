@@ -9,8 +9,7 @@ import socket
 import socketserver
 import threading
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from hashlib import sha1
 from pathlib import Path
 from tempfile import gettempdir
@@ -19,20 +18,11 @@ from typing import Any, Literal, cast
 from syke.config import ASK_MAX_PARALLEL, ASK_TIMEOUT
 from syke.llm.backends import AskEvent
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - non-POSIX fallback
-    fcntl = None
-
 logger = logging.getLogger(__name__)
 
 IPC_PROTOCOL_VERSION = 1
 IPC_DIR = Path(os.path.expanduser("~/.config/syke"))
 IPC_LISTEN_BACKLOG = max(32, ASK_MAX_PARALLEL + 8 if ASK_MAX_PARALLEL > 0 else 64)
-# Cap on simultaneous IPC handler threads. Sized above the ask-worker pool so
-# worker staging keeps absorbing bursts; past it the server rejects immediately
-# instead of growing handler threads without bound.
-IPC_MAX_HANDLERS = max(16, ASK_MAX_PARALLEL * 2) if ASK_MAX_PARALLEL > 0 else 64
 AskEventType = Literal["thinking", "text", "tool_call"]
 
 
@@ -53,30 +43,6 @@ def _unlink_socket(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         logger.debug("Failed to remove daemon IPC socket %s", path, exc_info=True)
-
-
-def _path_identity(path: Path) -> tuple[int, int] | None:
-    try:
-        stat_result = path.stat()
-    except FileNotFoundError:
-        return None
-    return (stat_result.st_dev, stat_result.st_ino)
-
-
-@contextmanager
-def _socket_handoff_lock(socket_path: Path) -> Iterator[None]:
-    if fcntl is None:
-        yield
-        return
-
-    lock_path = socket_path.with_name(f"{socket_path.name}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def socket_path_for_user(user_id: str) -> Path:
@@ -251,14 +217,11 @@ class DaemonIpcServer:
             tuple[str, dict[str, object]],
         ],
         runtime_status_handler: Callable[[], dict[str, Any]] | None = None,
-        *,
-        max_handlers: int = IPC_MAX_HANDLERS,
     ):
         self.user_id = user_id
         self.ask_handler = ask_handler
         self.runtime_status_handler = runtime_status_handler
         self.socket_path = socket_path_for_user(user_id)
-        self.max_handlers = max(1, max_handlers)
         self._server: _ThreadingUnixStreamServer | None = None
         self._thread: threading.Thread | None = None
         # Track in-flight handlers so stop() can drain gracefully.
@@ -266,8 +229,6 @@ class DaemonIpcServer:
         self._handler_lock = threading.Lock()
         self._handlers_done = threading.Event()
         self._handlers_done.set()  # no active handlers at start
-        self._owns_socket = False
-        self._socket_identity: tuple[int, int] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -294,28 +255,8 @@ class DaemonIpcServer:
                     return
 
                 with outer._handler_lock:
-                    saturated = outer._active_handlers >= outer.max_handlers
-                    if not saturated:
-                        outer._active_handlers += 1
-                        outer._handlers_done.clear()
-                if saturated:
-                    # Reject immediately instead of growing handler threads without bound.
-                    try:
-                        self._send(
-                            {
-                                "type": "error",
-                                "error": (
-                                    f"daemon IPC saturated "
-                                    f"({outer.max_handlers} handlers in flight); "
-                                    "retry after in-flight requests finish"
-                                ),
-                                "busy": True,
-                                "daemon_pid": os.getpid(),
-                            }
-                        )
-                    except _DaemonIpcClientDisconnected:
-                        logger.debug("Daemon IPC client disconnected while sending busy response")
-                    return
+                    outer._active_handlers += 1
+                    outer._handlers_done.clear()
                 try:
                     self._handle_request(raw_request)
                 finally:
@@ -414,37 +355,25 @@ class DaemonIpcServer:
 
         try:
             self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-            with _socket_handoff_lock(self.socket_path):
-                existing_identity = _path_identity(self.socket_path)
-                if existing_identity is not None:
-                    reachable, _probe_error = _socket_is_reachable(self.socket_path, timeout=0.25)
-                    if reachable:
-                        logger.info(
-                            "Daemon IPC socket already owned by a live daemon at %s",
-                            self.socket_path,
-                        )
-                        return False
-                    current_identity = _path_identity(self.socket_path)
-                    if current_identity is not None and current_identity != existing_identity:
-                        logger.info(
-                            "Daemon IPC socket changed during handoff at %s",
-                            self.socket_path,
-                        )
-                        return False
-                    if current_identity is not None:
-                        _unlink_socket(self.socket_path)
-                try:
-                    self._server = _ThreadingUnixStreamServer(str(self.socket_path), Handler)
-                except OSError:
+            if self.socket_path.exists():
+                reachable, _probe_error = _socket_is_reachable(self.socket_path, timeout=0.25)
+                if reachable:
                     logger.info(
-                        "Daemon IPC disabled: could not bind socket %s",
+                        "Daemon IPC socket already owned by a live daemon at %s",
                         self.socket_path,
-                        exc_info=True,
                     )
-                    self._server = None
                     return False
-                self._owns_socket = True
-                self._socket_identity = _path_identity(self.socket_path)
+                _unlink_socket(self.socket_path)
+            try:
+                self._server = _ThreadingUnixStreamServer(str(self.socket_path), Handler)
+            except OSError:
+                logger.info(
+                    "Daemon IPC disabled: could not bind socket %s",
+                    self.socket_path,
+                    exc_info=True,
+                )
+                self._server = None
+                return False
         except OSError:
             logger.info(
                 "Daemon IPC disabled: could not prepare socket path %s",
@@ -469,6 +398,7 @@ class DaemonIpcServer:
         return True
 
     def stop(self) -> None:
+        bound = self._server is not None
         if self._server is not None:
             self._server.shutdown()  # stop accepting new connections
             self._handlers_done.wait(timeout=5)  # drain in-flight handlers
@@ -477,24 +407,8 @@ class DaemonIpcServer:
         if self._thread is not None:
             self._thread.join(timeout=2)
             self._thread = None
-        if self._owns_socket:
-            try:
-                with _socket_handoff_lock(self.socket_path):
-                    if _path_identity(self.socket_path) == self._socket_identity:
-                        _unlink_socket(self.socket_path)
-                    else:
-                        logger.info(
-                            "Daemon IPC socket no longer owned at %s; leaving it in place",
-                            self.socket_path,
-                        )
-            except OSError:
-                logger.debug(
-                    "Failed to lock daemon IPC socket for cleanup %s",
-                    self.socket_path,
-                    exc_info=True,
-                )
-            self._owns_socket = False
-            self._socket_identity = None
+        if bound:
+            _unlink_socket(self.socket_path)
 
 
 def ask_via_daemon(

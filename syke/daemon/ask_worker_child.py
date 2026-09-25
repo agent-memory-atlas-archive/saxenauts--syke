@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import sys
-from pathlib import Path
 from typing import Any
 
 from syke.llm.backends import AskEvent
@@ -29,31 +28,14 @@ def _event_to_payload(event: AskEvent) -> dict[str, object]:
 
 
 def run_child(request: dict[str, Any]) -> int:
-    user_id = request.get("user_id")
-    syke_db_path = request.get("syke_db_path")
-    question = request.get("question")
-    transport_details = request.get("transport_details")
-
-    if not isinstance(user_id, str) or not user_id:
-        raise ValueError("worker request missing user_id")
-    if not isinstance(syke_db_path, str) or not syke_db_path:
-        raise ValueError("worker request missing syke_db_path")
-    if not isinstance(question, str) or not question:
-        raise ValueError("worker request missing question")
-    if not isinstance(transport_details, dict):
-        transport_details = {}
-
-    details = dict(transport_details)
+    """Answer one ask request the daemon validated before spawning this worker."""
+    user_id = request["user_id"]
+    question = request["question"]
+    details = dict(request["transport_details"])
     details["worker_pid"] = os.getpid()
 
     from syke.cli_support.context import get_db
-    from syke.config import user_syke_db_path
     from syke.llm.backends.pi_ask import pi_ask
-
-    expected_db = Path(user_syke_db_path(user_id)).expanduser().resolve(strict=False)
-    requested_db = Path(syke_db_path).expanduser().resolve(strict=False)
-    if requested_db != expected_db:
-        raise ValueError(f"worker rejected syke_db_path outside user scope: {requested_db}")
 
     with get_db(user_id) as db:
         answer, metadata = pi_ask(
