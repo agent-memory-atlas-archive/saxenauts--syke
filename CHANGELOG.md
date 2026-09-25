@@ -14,6 +14,52 @@ All notable changes to Syke are documented here.
   `model:thinking` suffix parsing, matching Pi's current thinking levels
   (#49).
 
+### Security
+
+- Model-invoked bash no longer runs as a login shell, so shell startup files
+  cannot re-export secrets that the bounded child environment removed.
+- The macOS model-tool sandbox keeps the home directory readable for
+  observation but now denies reads of the Pi agent directory (OAuth tokens
+  and API keys), `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, and
+  `~/.config/gh`. The Pi host process reads its own auth outside the sandbox.
+
+### Fixed
+
+- Daemon ask workers are killed on any error, not only on timeout; a child
+  that emitted malformed output used to keep its Pi ask running untracked.
+- Recovery refuses to restore over a final receipt that exists but cannot be
+  read, instead of treating it as an unfinished cycle. Recovery copies and
+  restores fsync the database file before renaming it into place.
+- Synthesis prompts fail closed when the current MEMEX row cannot be read;
+  only asks degrade to the "no MEMEX" text.
+- `syke doctor` accepts idle synthesis (6-24h since the last cycle) as
+  healthy, matching the daemon's own check, so a machine that slept
+  overnight no longer fails doctor until the first new cycle completes.
+- Four settings were documented and displayed but never read: synthesis now
+  honors `SYKE_SYNC_TIMEOUT` and the 600s default instead of a stale 300s
+  fallback; the timezone resolver reads `timezone` from `config.toml` after
+  the env var; `syke daemon start --interval` defaults to the configured
+  interval; and `syke config show` reports "invalid, using defaults" with
+  the reason instead of "loaded" when the file cannot be used.
+- Agent-mode setup returns the same runtime exit code as interactive mode.
+  Setup tolerates a hung `pi --version` instead of tracebacking. Doctor
+  reports a failed harness-access check instead of silently dropping it.
+  `syke memex --json` emits JSON when no memex exists yet. Replay first runs
+  no longer receive the ask-path "no memories yet" placeholder as MEMEX.
+
+### Removed
+
+- About 1,750 lines of dead or unreachable code and 680 lines of tests that
+  only exercised it, found by a full read of the package: launchd fallbacks
+  whose output nothing parsed, the IPC socket-handoff identity lock and
+  handler cap, `doctor --network` (it never performed a live probe), the
+  unconsumed `trust`/`consent_points`/`proposed_actions` keys in the setup
+  inspect payload, readers for the receipt narrative removed in 0.6.0, the
+  cron-era onboarding patch, `MetricsTracker`, replay-only environment hooks,
+  and parameters that no production caller passed. No CLI or JSON surface
+  that an installer, doc, or the web UI reads was changed, except that
+  `syke memex --format` (a duplicate of `--json`) is gone.
+
 ### Docs
 
 - Refreshed provider examples from GPT-5.4 to GPT-5.6 Luna and listed the
