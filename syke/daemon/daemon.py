@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import plistlib
@@ -19,11 +20,6 @@ from typing import TextIO, cast
 
 from syke.config import DAEMON_INTERVAL
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - non-POSIX fallback
-    fcntl = None
-
 logger = logging.getLogger(__name__)
 
 PIDFILE = Path(os.path.expanduser("~/.config/syke/daemon.pid"))
@@ -31,7 +27,6 @@ LOCKFILE = Path(os.path.expanduser("~/.config/syke/daemon.lock"))
 
 
 _TAG_MAP: dict[str, str] = {
-    "syke.sync": "SYNC",
     "syke.runtime.workspace": "WKSP",
     "syke.runtime.prompt_context": "WKSP",
     "syke.runtime": "PI",
@@ -46,6 +41,7 @@ _TAG_MAP: dict[str, str] = {
     "syke.memory": "MEM",
     "syke.config": "CONF",
 }
+_TAG_PREFIXES = sorted(_TAG_MAP, key=len, reverse=True)
 
 
 class DaemonFormatter(logging.Formatter):
@@ -55,7 +51,7 @@ class DaemonFormatter(logging.Formatter):
         tag = getattr(record, "tag", None)
         if not tag:
             name = record.name
-            for prefix in sorted(_TAG_MAP, key=len, reverse=True):
+            for prefix in _TAG_PREFIXES:
                 if name == prefix or name.startswith(prefix + "."):
                     tag = _TAG_MAP[prefix]
                     break
@@ -76,7 +72,6 @@ class SykeDaemon:
     def __init__(self, user_id: str, interval: int = DAEMON_INTERVAL):
         self.user_id = user_id
         self.interval = interval
-        self.running = True
         self._stop_event = threading.Event()
         self._db = None
         self._pi_runtime = None
@@ -123,7 +118,7 @@ class SykeDaemon:
             self._start_ipc_server()
             self._start_web_server()
 
-            while self.running and not self._stop_event.is_set():
+            while not self._stop_event.is_set():
                 self._ensure_process_markers()
                 cycle_failed = False
                 cycle_error = ""
@@ -148,13 +143,12 @@ class SykeDaemon:
             if self._db is not None:
                 self._db.close()
                 self._db = None
-            _remove_pid()
+            _unlink_pidfile()
             _release_daemon_lock(self._lock_handle)
             self._lock_handle = None
             logger.info("daemon stopped", extra={"tag": "STOP"})
 
     def stop(self) -> None:
-        self.running = False
         self._stop_event.set()
 
     def _daemon_cycle(self, db) -> None:
@@ -314,7 +308,7 @@ class SykeDaemon:
                 logger.info("warm runtime unreachable; restarting", extra={"tag": "PI"})
                 self._stop_pi_runtime()
                 self._start_pi_runtime()
-        elif self._pi_runtime is None:
+        else:
             logger.info("warm runtime missing; starting", extra={"tag": "PI"})
             self._start_pi_runtime()
 
@@ -518,12 +512,6 @@ def _cycle_failure_wait_seconds(error: str, interval: int) -> int:
 def _acquire_daemon_lock() -> TextIO:
     LOCKFILE.parent.mkdir(parents=True, exist_ok=True)
     handle = LOCKFILE.open("a+", encoding="utf-8")
-    if fcntl is None:
-        handle.seek(0)
-        handle.truncate()
-        handle.write(str(os.getpid()))
-        handle.flush()
-        return handle
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
@@ -540,18 +528,13 @@ def _release_daemon_lock(handle: TextIO | None) -> None:
     if handle is None:
         return
     try:
-        if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     except OSError:
         pass
     try:
         handle.close()
     except OSError:
         pass
-
-
-def _remove_pid() -> None:
-    _unlink_pidfile()
 
 
 def _unlink_pidfile() -> bool:
@@ -647,22 +630,17 @@ def is_running() -> tuple[bool, int | None]:
         return False, None
     try:
         os.kill(pid, 0)
-        if pid == os.getpid():
-            return True, pid
-        pid_looks_like_syke = _pid_looks_like_syke(pid)
-        if pid_looks_like_syke is False:
-            _unlink_pidfile()
-            return False, None
-        return True, pid
     except PermissionError:
-        pid_looks_like_syke = _pid_looks_like_syke(pid)
-        if pid_looks_like_syke is False:
-            _unlink_pidfile()
-            return False, None
-        return True, pid
+        pass
     except OSError:
         _unlink_pidfile()
         return False, None
+    if pid == os.getpid():
+        return True, pid
+    if _pid_looks_like_syke(pid) is False:
+        _unlink_pidfile()
+        return False, None
+    return True, pid
 
 
 # --- launchd helpers ---
@@ -745,50 +723,27 @@ def uninstall_launchd() -> bool:
 
 
 def _bootstrap_launchd() -> None:
-    bootstrap_cmd = ["launchctl", "bootstrap", _launchd_domain(), str(PLIST_PATH)]
-    result = subprocess.run(
-        bootstrap_cmd,
-        check=False,
+    subprocess.run(
+        ["launchctl", "bootstrap", _launchd_domain(), str(PLIST_PATH)],
+        check=True,
         capture_output=True,
         text=True,
-    )
-    if result.returncode == 0:
-        return
-
-    stderr = (result.stderr or "").lower()
-    if "unknown subcommand" in stderr or "unrecognized subcommand" in stderr:
-        # Older launchctl clients can still require legacy load.
-        subprocess.run(["launchctl", "load", str(PLIST_PATH)], check=True)
-        return
-
-    raise subprocess.CalledProcessError(
-        result.returncode,
-        bootstrap_cmd,
-        output=result.stdout,
-        stderr=result.stderr,
     )
 
 
 def launchd_status() -> str | None:
     """Check launchctl for our agent. Returns status string or None."""
-    import subprocess
-
-    commands = [
-        ["launchctl", "print", _launchd_service_target()],
-        ["launchctl", "list", LAUNCHD_LABEL],
-    ]
-    for cmd in commands:
-        try:
-            r = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if r.returncode == 0:
-                return r.stdout.strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
+    try:
+        r = subprocess.run(
+            ["launchctl", "print", _launchd_service_target()],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode == 0:
+        return r.stdout.strip()
     return None
 
 
@@ -801,17 +756,12 @@ def _launchd_domain() -> str:
 
 
 def _parse_launchd_program(status: str) -> Path | None:
-    patterns = (
-        r'"Program"\s*=\s*"([^"]+)"',
-        r"^\s*program\s*=\s*(.+?)\s*$",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, status, re.MULTILINE)
-        if match is None:
-            continue
-        program = match.group(1).strip().strip('"')
-        if program:
-            return Path(os.path.expanduser(program))
+    match = re.search(r"^\s*program\s*=\s*(.+?)\s*$", status, re.MULTILINE)
+    if match is None:
+        return None
+    program = match.group(1).strip().strip('"')
+    if program:
+        return Path(os.path.expanduser(program))
     return None
 
 
@@ -836,53 +786,24 @@ def _program_from_plist(plist_path: Path) -> Path | None:
 
 
 def _parse_launchd_exit_status(status: str) -> int | None:
-    patterns = (
-        r'"LastExitStatus"\s*=\s*(\d+)',
-        r"last exit code = (\d+)",
-        rf"^\s*(?:\d+|-)\s+(-?\d+)\s+{re.escape(LAUNCHD_LABEL)}\s*$",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, status, re.MULTILINE)
-        if match is None:
-            continue
-        try:
-            return int(match.group(1))
-        except ValueError:
-            return None
-    return None
+    match = re.search(r"last exit code = (\d+)", status, re.MULTILINE)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _parse_launchd_pid(status: str) -> int | None:
-    patterns = (
-        r"^\s*pid = (\d+)\s*$",
-        rf"^\s*(\d+)\s+(-?\d+)\s+{re.escape(LAUNCHD_LABEL)}\s*$",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, status, re.MULTILINE)
-        if match is None:
-            continue
-        try:
-            return int(match.group(1))
-        except ValueError:
-            continue
-    return None
+    match = re.search(r"^\s*pid = (\d+)\s*$", status, re.MULTILINE)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _parse_launchd_state(status: str) -> str | None:
     match = re.search(r"^\s*state = ([^\s]+)\s*$", status, re.MULTILINE)
-    if match is not None:
-        state = match.group(1).strip()
-        if state:
-            return state
-
-    tabular = re.search(
-        rf"^\s*(\d+|-)\s+(-?\d+)\s+{re.escape(LAUNCHD_LABEL)}\s*$",
-        status,
-        re.MULTILINE,
-    )
-    if tabular is None:
+    if match is None:
         return None
-    return "running" if tabular.group(1).isdigit() else "loaded"
+    return match.group(1).strip() or None
 
 
 def launchd_metadata() -> dict[str, object]:
@@ -980,20 +901,7 @@ def _clear_launchd_registration() -> bool:
             )
         except FileNotFoundError:
             return removed
-        if result.returncode == 0 and cmd[1] in {"bootout", "remove", "unload"}:
-            removed = True
-
-    if not removed and PLIST_PATH.exists():
-        try:
-            result = subprocess.run(
-                ["launchctl", "unload", str(PLIST_PATH)],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError:
-            return removed
-        if result.returncode == 0:
+        if result.returncode == 0 and cmd[1] in {"bootout", "remove"}:
             removed = True
     return removed
 
@@ -1225,8 +1133,6 @@ def systemd_metadata() -> dict[str, object]:
 
 def install_and_start(user_id: str, interval: int = DAEMON_INTERVAL) -> None:
     """Install and start the background service for the current platform."""
-    import sys
-
     if sys.platform == "darwin":
         install_launchd(user_id, interval=interval)
     else:
@@ -1235,8 +1141,6 @@ def install_and_start(user_id: str, interval: int = DAEMON_INTERVAL) -> None:
 
 def stop_and_unload() -> None:
     """Stop and uninstall the daemon."""
-    import sys
-
     running, pid = is_running()
     if sys.platform == "darwin":
         uninstall_launchd()

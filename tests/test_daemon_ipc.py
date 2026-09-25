@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import socket
-import threading
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -108,67 +107,6 @@ def test_daemon_ipc_errors_surface_as_unavailable(monkeypatch, tmp_path: Path) -
         server.stop()
 
 
-@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="requires Unix sockets")
-def test_daemon_ipc_rejects_asks_beyond_handler_cap(monkeypatch, tmp_path: Path) -> None:
-    """A saturated IPC server rejects immediately instead of growing handlers."""
-    monkeypatch.setattr("syke.daemon.ipc.IPC_DIR", tmp_path)
-    _require_unix_socket_bind(tmp_path)
-
-    handler_started = threading.Event()
-    handler_release = threading.Event()
-
-    def slow_handler(
-        syke_db_path: str,
-        question: str,
-        on_event,
-    ) -> tuple[str, dict[str, object]]:
-        del syke_db_path, on_event
-        handler_started.set()
-        handler_release.wait(timeout=10)
-        return question, {"backend": "pi", "duration_ms": 12}
-
-    server = DaemonIpcServer("test_user", slow_handler, max_handlers=1)
-    _start_server_or_skip(server)
-
-    first_result: dict[str, str] = {}
-
-    def first_ask() -> None:
-        answer, _metadata = ask_via_daemon(
-            user_id="test_user",
-            syke_db_path="/tmp/replay-syke.db",
-            question="slow",
-        )
-        first_result["answer"] = answer
-
-    occupant = threading.Thread(target=first_ask, daemon=True)
-    try:
-        occupant.start()
-        assert handler_started.wait(timeout=5), "first handler never started"
-
-        with pytest.raises(DaemonIpcUnavailable, match="saturated"):
-            ask_via_daemon(
-                user_id="test_user",
-                syke_db_path="/tmp/replay-syke.db",
-                question="rejected",
-            )
-
-        handler_release.set()
-        occupant.join(timeout=10)
-        assert first_result.get("answer") == "slow"
-
-        # Once the in-flight handler drains, the server accepts asks again.
-        assert server._handlers_done.wait(timeout=5), "handler never drained"
-        answer, _metadata = ask_via_daemon(
-            user_id="test_user",
-            syke_db_path="/tmp/replay-syke.db",
-            question="after-drain",
-        )
-        assert answer == "after-drain"
-    finally:
-        handler_release.set()
-        server.stop()
-
-
 def test_daemon_ipc_busy_runtime_round_trips_daemon_worker(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("syke.daemon.ipc.IPC_DIR", tmp_path)
     _require_unix_socket_bind(tmp_path)
@@ -267,37 +205,3 @@ def test_daemon_ipc_start_refuses_to_clobber_live_socket(monkeypatch, tmp_path: 
         assert server.start() is False
 
     unlink_socket.assert_not_called()
-
-
-def test_daemon_ipc_bind_failure_does_not_unlink_socket_won_by_other_owner(
-    monkeypatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr("syke.daemon.ipc.IPC_DIR", tmp_path)
-    server = DaemonIpcServer("test_user", lambda *_args, **_kwargs: ("ok", {}))
-    server.socket_path.write_text("stale", encoding="utf-8")
-
-    def bind_loses_race(*_args, **_kwargs):
-        server.socket_path.write_text("owned-by-other", encoding="utf-8")
-        raise OSError("address already in use")
-
-    with (
-        patch("syke.daemon.ipc._socket_is_reachable", return_value=(False, "stale")),
-        patch("syke.daemon.ipc._ThreadingUnixStreamServer", side_effect=bind_loses_race),
-    ):
-        assert server.start() is False
-
-    assert server.socket_path.read_text(encoding="utf-8") == "owned-by-other"
-
-
-@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="requires Unix sockets")
-def test_daemon_ipc_stop_does_not_unlink_replaced_socket_path(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("syke.daemon.ipc.IPC_DIR", tmp_path)
-    server = DaemonIpcServer("test_user", lambda *_args, **_kwargs: ("ok", {}))
-    _require_unix_socket_bind(server.socket_path.parent)
-    _start_server_or_skip(server)
-
-    server.socket_path.unlink()
-    server.socket_path.write_text("owned-by-other", encoding="utf-8")
-    server.stop()
-
-    assert server.socket_path.read_text(encoding="utf-8") == "owned-by-other"

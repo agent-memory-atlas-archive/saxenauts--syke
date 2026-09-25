@@ -1,4 +1,3 @@
-import inspect
 import plistlib
 import signal
 import subprocess
@@ -20,12 +19,6 @@ from syke.daemon.daemon import (
     stop_and_unload,
 )
 from syke.runtime.locator import SykeRuntimeDescriptor
-
-
-def _call_with_supported_args(func, **kwargs):
-    params = inspect.signature(func).parameters
-    call_kwargs = {k: v for k, v in kwargs.items() if k in params}
-    return func(**call_kwargs)
 
 
 def test_daemon_pid_permission_denied_treated_as_running(monkeypatch, tmp_path):
@@ -160,7 +153,7 @@ def test_generate_plist_uses_stable_syke_launcher(monkeypatch):
             return_value=Path("/Users/me/.syke/bin/syke"),
         ),
     ):
-        plist = _call_with_supported_args(generate_plist, user_id="testuser", interval=900)
+        plist = generate_plist("testuser", interval=900)
 
     assert "/Users/me/.syke/bin/syke" in plist
     assert "/usr/local/bin/syke" not in plist
@@ -178,7 +171,7 @@ def test_generate_plist_rejects_tcc_path_when_no_alternative():
         side_effect=RuntimeError("macOS-protected directory"),
     ):
         with pytest.raises(RuntimeError, match="macOS-protected directory"):
-            _call_with_supported_args(generate_plist, user_id="testuser", interval=900)
+            generate_plist("testuser", interval=900)
 
 
 def test_install_launchd_writes_generated_service(tmp_path, monkeypatch):
@@ -311,11 +304,13 @@ def test_daemon_run_contains_cycle_failure_and_continues(monkeypatch):
         patch("syke.daemon.daemon._acquire_daemon_lock", return_value=None),
         patch("syke.daemon.daemon._release_daemon_lock"),
         patch("syke.daemon.daemon._write_pid"),
-        patch("syke.daemon.daemon._remove_pid"),
+        patch("syke.daemon.daemon._unlink_pidfile"),
         patch.object(daemon, "_start_pi_runtime"),
         patch.object(daemon, "_stop_pi_runtime"),
         patch.object(daemon, "_start_ipc_server"),
         patch.object(daemon, "_stop_ipc_server"),
+        patch.object(daemon, "_start_web_server"),
+        patch.object(daemon, "_stop_web_server"),
         patch.object(daemon._stop_event, "wait", return_value=False),
         patch.object(daemon, "_daemon_cycle", side_effect=_cycle),
     ):
