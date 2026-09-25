@@ -325,6 +325,7 @@ def query_timeline(user_id: str, end_iso: str, *, days: float) -> dict[str, Any]
     return {
         "user_id": user_id,
         "window": {"start": start_iso, "end": end_iso_norm},
+        "count": len(events),
         "events": events,
     }
 
