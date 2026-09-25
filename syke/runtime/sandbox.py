@@ -7,10 +7,6 @@ its authoritative path. Ordinary home files remain non-writable.
 Persistent write access is restricted to the supplied workspace and durable
 runtime subtree. Sessions, receipts, records, and recovery state remain
 read-only.
-Network is wide-open outbound (port filtering was tested but parked).
-
-An internal environment override can replace the normal home read root for
-isolated external callers.
 """
 
 from __future__ import annotations
@@ -44,23 +40,6 @@ _SYSTEM_READ_PATHS = [
 
 def sandbox_read_paths() -> tuple[str, ...]:
     """Return the computer read roots configured for model-invoked tools."""
-    override = os.environ.get("SYKE_SANDBOX_HARNESS_PATHS")
-    if override is not None:
-        paths: list[str] = []
-        seen: set[str] = set()
-        for raw in override.split(os.pathsep):
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                expanded = str(Path(raw).expanduser().resolve())
-            except OSError:
-                continue
-            if expanded not in seen:
-                seen.add(expanded)
-                paths.append(expanded)
-        return tuple(paths)
-
     return (str(Path.home().expanduser().resolve()),)
 
 
@@ -125,16 +104,6 @@ def _node_runtime_paths() -> list[str]:
     return list(dict.fromkeys(paths))
 
 
-def _protected_read_paths() -> list[str]:
-    """Syke control state available for inspection."""
-    return [str(user_control_dir("").resolve())]
-
-
-def _core_read_paths() -> list[str]:
-    """Installed Syke code available for self-inspection but never mutation."""
-    return [str(Path(__file__).resolve().parents[1])]
-
-
 def _write_paths(workspace_root: Path, runtime_root: Path) -> list[str]:
     """Persistent paths the controller can write to."""
     workspace = str(workspace_root.expanduser().resolve())
@@ -162,7 +131,7 @@ def generate_seatbelt_profile(
     control_path = (
         control_root.expanduser().resolve()
         if control_root is not None
-        else Path(_protected_read_paths()[0])
+        else user_control_dir("").resolve()
     )
     runtime_path = (
         runtime_root.expanduser().resolve()
@@ -186,7 +155,8 @@ def generate_seatbelt_profile(
     protected_write_paths = [
         str(control_path / name) for name in ("sessions", "receipts", "records", "recovery")
     ]
-    core_paths = _core_read_paths()
+    # Installed Syke code is inspectable but never writable.
+    core_paths = [str(Path(__file__).resolve().parents[1])]
     all_scoped_paths = (
         [workspace, *temp_paths]
         + model_read_paths
