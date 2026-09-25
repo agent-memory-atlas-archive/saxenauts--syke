@@ -91,20 +91,17 @@ def status(ctx: click.Context, use_json: bool) -> None:
         session_history = cast(dict[str, object], runtime_signals.get("session_history") or {})
         daemon_ipc = cast(dict[str, object], runtime_signals.get("daemon_ipc") or {})
 
-        signals: list[tuple[str, bool, str]] = []
+        signals: list[tuple[str, str]] = []
         if session_history and not session_history.get("ok", True):
-            signals.append(
-                ("native session history", False, str(session_history.get("detail", "")))
-            )
+            signals.append(("native session history", str(session_history.get("detail", ""))))
         if daemon_ipc and not daemon_ipc.get("ok", True):
-            signals.append(("daemon IPC", False, str(daemon_ipc.get("detail", ""))))
+            signals.append(("daemon IPC", str(daemon_ipc.get("detail", ""))))
 
         if signals:
             render_section("Runtime")
-            for name, ok, detail in signals:
-                icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
+            for name, detail in signals:
                 suffix = f"  [dim]{detail}[/dim]" if detail else ""
-                console.print(f"  {icon} {name}{suffix}")
+                console.print(f"  [red]✗[/red] {name}{suffix}")
 
         render_section("Sources")
         selected_sources = info.get("selected_sources")
@@ -122,12 +119,11 @@ def status(ctx: click.Context, use_json: bool) -> None:
             detail = f"~{est} minutes" if isinstance(est, int) else None
             render_setup_line("onboarding", status_text, detail=detail)
 
+        render_section("Data")
         if not info["initialized"]:
-            render_section("Data")
             render_setup_line("data", "none yet", detail="run syke setup")
             return
 
-        render_section("Data")
         console.print(f"  {info['cycle_count']} cycles")
 
         render_section("Memex")
@@ -144,15 +140,8 @@ def status(ctx: click.Context, use_json: bool) -> None:
 
 @click.command(short_help="Print the current MEMEX.md projection.")
 @click.option("--json", "use_json", is_flag=True, help="Output as JSON")
-@click.option(
-    "--format",
-    "fmt",
-    type=click.Choice(["json", "markdown"]),
-    default="markdown",
-    help="Output format",
-)
 @click.pass_context
-def memex(ctx: click.Context, use_json: bool, fmt: str) -> None:
+def memex(ctx: click.Context, use_json: bool) -> None:
     from syke.memory.memex import get_memex_for_injection
 
     user_id = ctx.obj["user"]
@@ -160,12 +149,12 @@ def memex(ctx: click.Context, use_json: bool, fmt: str) -> None:
     try:
         content = get_memex_for_injection(db, user_id)
         if not content:
-            if use_json or fmt == "json":
+            if use_json:
                 click.echo(json.dumps({"memex": None, "user": user_id}))
             else:
                 console.print("[dim]No memex yet. Run: syke setup[/dim]")
             return
-        if use_json or fmt == "json":
+        if use_json:
             click.echo(json.dumps({"memex": content, "user": user_id}))
         else:
             click.echo(content)

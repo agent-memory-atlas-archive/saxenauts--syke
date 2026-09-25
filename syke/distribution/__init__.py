@@ -32,7 +32,7 @@ def refresh_distribution(
             result.warnings.append(f"memex export failed: {exc}")
 
     try:
-        result.skill_paths = install_skill(user_id)
+        result.skill_paths = install_skill()
     except Exception as exc:
         result.warnings.append(f"skill install failed: {exc}")
 

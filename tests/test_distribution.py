@@ -102,7 +102,7 @@ def test_install_skill_installs_only_to_detected_platforms(tmp_path: Path) -> No
         ),
     ):
         declared_paths = capability_target_paths()
-        installed_paths = install_skill("test_user")
+        installed_paths = install_skill()
 
     assert (
         set(installed_paths)
@@ -151,7 +151,7 @@ def test_refresh_distribution_orchestrates_exports(
         result = refresh_distribution(db, user_id)
 
     distribute.assert_called_once_with(db, user_id)
-    install_skills.assert_called_once_with(user_id)
+    install_skills.assert_called_once_with()
     assert result.memex_path == memex_path
     assert result.skill_paths == [skill_path]
     assert result.warnings == []

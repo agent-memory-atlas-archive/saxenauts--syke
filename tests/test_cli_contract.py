@@ -483,24 +483,23 @@ def test_status_json_reports_persisted_operator_state(cli_runner) -> None:
     assert payload["memex"]["present"] is False
 
 
-def test_memex_json_forms_return_the_same_machine_payload(cli_runner) -> None:
-    for output_args in (["--json"], ["--format", "json"]):
-        fake_db = MagicMock()
-        with (
-            patch("syke.cli_commands.status.get_db", return_value=fake_db),
-            patch(
-                "syke.memory.memex.get_memex_for_injection",
-                return_value="# Memex\n- current focus",
-            ),
-        ):
-            result = cli_runner.invoke(cli, ["--user", "test", "memex", *output_args])
+def test_memex_json_returns_the_machine_payload(cli_runner) -> None:
+    fake_db = MagicMock()
+    with (
+        patch("syke.cli_commands.status.get_db", return_value=fake_db),
+        patch(
+            "syke.memory.memex.get_memex_for_injection",
+            return_value="# Memex\n- current focus",
+        ),
+    ):
+        result = cli_runner.invoke(cli, ["--user", "test", "memex", "--json"])
 
-        assert result.exit_code == 0
-        assert json.loads(result.output) == {
-            "memex": "# Memex\n- current focus",
-            "user": "test",
-        }
-        fake_db.close.assert_called_once()
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {
+        "memex": "# Memex\n- current focus",
+        "user": "test",
+    }
+    fake_db.close.assert_called_once()
 
 
 def test_ask_json_returns_structured_result(cli_runner) -> None:

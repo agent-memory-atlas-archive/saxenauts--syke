@@ -196,11 +196,7 @@ def admit_record(
     )
 
 
-def list_records(
-    control_dir: str | Path,
-    *,
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
+def list_records(control_dir: str | Path) -> list[dict[str, Any]]:
     root = records_dir(control_dir)
     if not root.is_dir():
         return []
@@ -213,7 +209,7 @@ def list_records(
         if isinstance(value, dict):
             rows.append(value)
     rows.sort(key=lambda row: (str(row.get("received_at") or ""), str(row.get("id") or "")))
-    return rows[:limit] if limit is not None else rows
+    return rows
 
 
 def acknowledged_record_ids(receipt: dict[str, Any]) -> list[str]:

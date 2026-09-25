@@ -6,12 +6,10 @@ import json
 import sys
 
 import click
-from rich.console import Console
 
+from syke.cli_support.render import console
 from syke.config import user_control_dir
 from syke.control import admit_record
-
-console = Console()
 
 
 @click.command(short_help="Send a note or observation to Syke.")

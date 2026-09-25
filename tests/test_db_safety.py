@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import sys
@@ -67,13 +66,11 @@ def test_graph_recovery_does_not_rewind_protected_host_receipt(tmp_path, user_id
                 "state_change": None,
             },
         )
-        baseline = capture_baseline(db, user_id)
         point = create_recovery_point(
             db,
             user_id,
             run_id="run-recovery",
             cycle_id=cycle_id,
-            baseline=baseline,
         )
         assert point.method in {"copy_on_write_clone", "sqlite_backup_fallback"}
         assert point.size_bytes == Path(point.backup_path).stat().st_size
@@ -98,7 +95,6 @@ def test_recovery_point_rebuilds_malformed_search_index_before_copy(
     with SykeDB(db_path, user_id=user_id) as db:
         update_memex(db, user_id, "canonical memex")
         _seed_memory(db, user_id, "mem-a", "searchable quantum memory")
-        baseline = capture_baseline(db, user_id)
         _corrupt_search_index(db)
 
         point = create_recovery_point(
@@ -106,7 +102,6 @@ def test_recovery_point_rebuilds_malformed_search_index_before_copy(
             user_id,
             run_id="run-rebuild-search-before-copy",
             cycle_id=None,
-            baseline=baseline,
         )
 
         live_check = db.conn.execute("PRAGMA integrity_check").fetchone()[0]
@@ -256,14 +251,11 @@ def test_rotate_recovery_points_keeps_only_newest_automatic_bundle(
     recovery_dir.mkdir(parents=True, exist_ok=True)
     automatic_ids = ("automatic-old", "automatic-middle", "automatic-new")
 
-    for modified_at, recovery_id in enumerate(automatic_ids, start=1):
-        manifest = recovery_dir / f"{recovery_id}.json"
-        manifest.write_text("{}", encoding="utf-8")
+    for recovery_id in automatic_ids:
+        (recovery_dir / f"{recovery_id}.json").write_text("{}", encoding="utf-8")
         (recovery_dir / f"{recovery_id}.sqlite").write_bytes(b"database")
         (recovery_dir / f"{recovery_id}.sqlite-wal").write_bytes(b"wal")
         (recovery_dir / f"{recovery_id}.sqlite-shm").write_bytes(b"shm")
-        os.utime(manifest, (modified_at, modified_at))
-    os.utime(recovery_dir / "automatic-old.json", (99, 99))
 
     pinned = recovery_dir / "manual-pre-migration.sqlite"
     pinned.write_bytes(b"pinned database")
@@ -304,13 +296,11 @@ def test_recovery_manifest_contains_only_operational_recovery_facts(
     with SykeDB(db_path, user_id=user_id) as db:
         update_memex(db, user_id, "canonical memex")
         _seed_memory(db, user_id, "mem-a", "sensitive original memory")
-        baseline = capture_baseline(db, user_id)
         point = create_recovery_point(
             db,
             user_id,
             run_id="run-redacted-manifest",
             cycle_id=None,
-            baseline=baseline,
         )
 
     manifest = json.loads(Path(point.manifest_path).read_text(encoding="utf-8"))
@@ -321,10 +311,8 @@ def test_recovery_manifest_contains_only_operational_recovery_facts(
         "source_checks",
     }
     encoded = json.dumps(manifest, sort_keys=True)
-    assert "baseline" not in manifest
     assert "sensitive original memory" not in encoded
     assert "mem-a" not in encoded
-    assert "rebuild_rows" not in encoded
 
 
 def test_in_progress_marker_is_written_only_for_a_verified_recovery_pair(
@@ -339,7 +327,6 @@ def test_in_progress_marker_is_written_only_for_a_verified_recovery_pair(
             user_id,
             run_id="run-marker",
             cycle_id="cycle-marker",
-            baseline=capture_baseline(db, user_id),
         )
     rotate_recovery_points(user_id, keep_id=point.id)
 
@@ -391,7 +378,6 @@ def test_interrupted_reconciliation_restores_db_and_only_the_memex_projection(
             user_id,
             run_id="run-interrupted",
             cycle_id="cycle-interrupted",
-            baseline=capture_baseline(db, user_id),
         )
         rotate_recovery_points(user_id, keep_id=point.id)
         db_safety.mark_recovery_in_progress(
@@ -457,7 +443,6 @@ def test_interrupted_reconciliation_reuses_caller_owned_exclusive_lease(
             user_id,
             run_id="run-leased-reconciliation",
             cycle_id="cycle-leased-reconciliation",
-            baseline=capture_baseline(db, user_id),
         )
         rotate_recovery_points(user_id, keep_id=point.id)
         db_safety.mark_recovery_in_progress(
@@ -520,7 +505,6 @@ def test_interrupted_reconciliation_preserves_only_valid_learned_memory(
             user_id,
             run_id=f"run-{cycle_id}",
             cycle_id=cycle_id,
-            baseline=capture_baseline(db, user_id),
         )
         rotate_recovery_points(user_id, keep_id=point.id)
         db_safety.mark_recovery_in_progress(
@@ -573,7 +557,6 @@ def test_reconciliation_does_not_restore_while_synthesis_lock_is_active(
             user_id,
             run_id="run-active",
             cycle_id="cycle-active",
-            baseline=capture_baseline(db, user_id),
         )
         rotate_recovery_points(user_id, keep_id=point.id)
         db_safety.mark_recovery_in_progress(
@@ -616,7 +599,6 @@ def test_reconciliation_refuses_to_open_unrestored_state_behind_an_unlocked_read
             user_id,
             run_id="run-busy-reader",
             cycle_id="cycle-busy-reader",
-            baseline=capture_baseline(db, user_id),
         )
         rotate_recovery_points(user_id, keep_id=point.id)
         db_safety.mark_recovery_in_progress(
@@ -654,7 +636,6 @@ def test_reconciliation_never_restores_over_any_final_receipt(
             user_id,
             run_id="run-final",
             cycle_id="cycle-final",
-            baseline=capture_baseline(db, user_id),
         )
         rotate_recovery_points(user_id, keep_id=point.id)
         db_safety.mark_recovery_in_progress(
@@ -707,7 +688,6 @@ def test_reconciliation_refuses_to_restore_over_an_unreadable_receipt(
             user_id,
             run_id="run-unreadable",
             cycle_id="cycle-unreadable",
-            baseline=capture_baseline(db, user_id),
         )
         db_safety.mark_recovery_in_progress(
             point,
@@ -750,7 +730,6 @@ def test_reconciliation_without_a_marker_does_not_restore_a_recovery_copy(
             user_id,
             run_id="run-unmarked",
             cycle_id="cycle-unmarked",
-            baseline=capture_baseline(db, user_id),
         )
         rotate_recovery_points(user_id, keep_id=point.id)
         db.conn.execute("UPDATE memories SET content = 'current memory' WHERE id = 'mem-a'")
@@ -779,13 +758,11 @@ def test_restore_refuses_damaged_recovery_point_without_replacing_db(
         update_memex(db, user_id, "canonical memex")
         _seed_memory(db, user_id, "mem-a", "original memory")
         cycle_id = "cycle-damaged-recovery"
-        baseline = capture_baseline(db, user_id)
         point = create_recovery_point(
             db,
             user_id,
             run_id="run-damaged-recovery",
             cycle_id=cycle_id,
-            baseline=baseline,
         )
         db.conn.execute("UPDATE memories SET content = 'current live state' WHERE id = 'mem-a'")
         db.conn.commit()
@@ -813,7 +790,6 @@ def test_restore_refuses_while_a_normal_database_user_is_open(
             user_id,
             run_id="run-contended-restore",
             cycle_id="cycle-contended-restore",
-            baseline=capture_baseline(db, user_id),
         )
         db.conn.execute("UPDATE memories SET content = 'live memory' WHERE id = 'mem-a'")
         db.conn.commit()
@@ -842,7 +818,6 @@ def test_restore_keeps_later_cross_process_writes_visible(
             user_id,
             run_id="run-cross-process-restore",
             cycle_id="cycle-cross-process-restore",
-            baseline=capture_baseline(db, user_id),
         )
         update_learned_memory(db, user_id, "preserved operating language")
         learned_snapshot = dict(
@@ -901,14 +876,11 @@ def test_recovery_point_refuses_large_full_copy_fallback(
         update_memex(db, user_id, "canonical memex")
         _seed_memory(db, user_id, "mem-a", "original memory")
         cycle_id = "cycle-refuse-copy"
-        baseline = capture_baseline(db, user_id)
-
         with pytest.raises(RuntimeError, match="refusing full-copy fallback"):
             create_recovery_point(
                 db,
                 user_id,
                 run_id="run-refuse-copy",
                 cycle_id=cycle_id,
-                baseline=baseline,
                 max_full_copy_fallback_bytes=1,
             )
