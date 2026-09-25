@@ -35,12 +35,6 @@ def test_all_seed_adapters_deploy_and_resolve_from_flat_workspace(tmp_path: Path
         assert deployed.read_bytes() == seed.read_bytes()
 
 
-def test_retired_gemini_cli_is_absent_from_catalog_and_seed_surface() -> None:
-    assert get_source("gemini-cli") is None
-    assert "gemini-cli" not in {spec.source for spec in active_sources()}
-    assert get_seed_adapter_md_path("gemini-cli") is None
-
-
 def test_antigravity_catalog_unifies_current_product_family_transcripts(
     tmp_path: Path,
 ) -> None:

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from syke.config import user_control_dir, user_data_dir
 from syke.control import receipt_rollup
-from syke.metrics import MetricsTracker, setup_logging
+from syke.metrics import setup_logging
 from syke.runtime import workspace as workspace_module
 from syke.runtime.pi_sessions import session_history_status
 
-__all__ = ["MetricsTracker", "run_health_check", "setup_logging"]
+__all__ = ["run_health_check", "setup_logging"]
 
 
 def run_health_check(user_id: str) -> dict:

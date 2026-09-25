@@ -8,14 +8,11 @@ import signal as _signal
 import sys as _sys
 
 import click
-from rich.console import Console
 
 from syke.cli_support.ask_output import JsonlAskEventCoalescer, build_ask_result_payload
 from syke.cli_support.context import get_db
 from syke.cli_support.exit_codes import provider_resolution_exit_code
 from syke.llm.backends import AskEvent
-
-console = Console()
 
 
 @click.command(short_help="Ask a grounded question over your local memory.")
@@ -35,6 +32,7 @@ def ask(ctx: click.Context, question: str, use_json: bool, use_jsonl: bool) -> N
 
     user_id = ctx.obj["user"]
     db = get_db(user_id)
+    prev_handler = None
     try:
         if use_json and use_jsonl:
             raise click.UsageError("--json and --jsonl are mutually exclusive.")
@@ -73,11 +71,7 @@ def ask(ctx: click.Context, question: str, use_json: bool, use_jsonl: bool) -> N
             _sys.stderr.flush()
             raise SystemExit(exit_code) from exc
 
-        _sigterm_fired = False
-
         def _on_sigterm(signum, frame):
-            nonlocal _sigterm_fired
-            _sigterm_fired = True
             raise SystemExit(143)
 
         prev_handler = _signal.signal(_signal.SIGTERM, _on_sigterm)
@@ -154,13 +148,8 @@ def ask(ctx: click.Context, question: str, use_json: bool, use_jsonl: bool) -> N
         except BrokenPipeError:
             raise SystemExit(0) from None
         except Exception as e:
-            if has_thinking and not (use_json or use_jsonl):
-                _sys.stderr.write("\033[0m\n")
-                _sys.stderr.flush()
             if jsonl_coalescer is not None:
                 jsonl_coalescer.flush()
-            for h, lvl in saved_levels.items():
-                h.setLevel(lvl)
             if use_json or use_jsonl:
                 payload = build_ask_result_payload(
                     question=question,
@@ -270,7 +259,6 @@ def ask(ctx: click.Context, question: str, use_json: bool, use_jsonl: bool) -> N
                 footer += f" · {tool_calls} tools"
             _sys.stderr.write(f"{footer}\033[0m\n")
     finally:
-        prev_handler = locals().get("prev_handler")
         if prev_handler is not None:
             _signal.signal(_signal.SIGTERM, prev_handler)
         db.close()

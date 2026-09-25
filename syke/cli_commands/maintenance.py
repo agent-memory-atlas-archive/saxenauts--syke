@@ -6,14 +6,12 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import click
-from rich.console import Console
 from rich.table import Table
 
 from syke.cli_support.context import get_db
 from syke.cli_support.installers import run_managed_checkout_install
+from syke.cli_support.render import console
 from syke.config import _is_source_install
-
-console = Console()
 
 
 @click.command()
@@ -47,8 +45,7 @@ def cost(ctx: click.Context, days: int | None, use_json: bool) -> None:
     total_cost = sum(float(run.get("cost_usd", 0) or 0) for run in runs)
     total_input = sum(int(run.get("input_tokens", 0) or 0) for run in runs)
     total_output = sum(int(run.get("output_tokens", 0) or 0) for run in runs)
-    total_thinking = 0
-    total_tokens = total_input + total_output + total_thinking
+    total_tokens = total_input + total_output
 
     by_operation: dict[str, dict[str, int | float]] = {}
     for run in runs:
@@ -72,7 +69,7 @@ def cost(ctx: click.Context, days: int | None, use_json: bool) -> None:
                     "total_tokens": total_tokens,
                     "input_tokens": total_input,
                     "output_tokens": total_output,
-                    "thinking_tokens": total_thinking,
+                    "thinking_tokens": 0,
                     "by_operation": by_operation,
                 },
                 indent=2,
@@ -85,11 +82,6 @@ def cost(ctx: click.Context, days: int | None, use_json: bool) -> None:
     console.print(
         f"  Total:  [bold]${total_cost:.4f}[/bold]  ·  {total_tokens:,} tokens  ·  {len(runs)} runs"
     )
-    if total_thinking:
-        console.print(
-            "  Breakdown:  "
-            f"{total_input:,} in  ·  {total_output:,} out  ·  {total_thinking:,} thinking"
-        )
     console.print()
 
     op_table = Table(title="By Operation")
@@ -153,14 +145,7 @@ def sync(
     start_daemon_after: bool,
     use_json: bool,
 ) -> None:
-    """Run one synthesis cycle.
-
-    When --start-daemon-after is set (setup flow), starts the daemon
-    and lets it handle synthesis. No separate pi_synthesize call —
-    the daemon's first cycle IS synthesis.
-
-    When called manually (syke sync), runs synthesis directly.
-    """
+    """Run one synthesis cycle, or start the daemon and let its first cycle run it."""
     from syke.observe.catalog import get_source
     from syke.source_selection import get_selected_sources, set_selected_sources
 

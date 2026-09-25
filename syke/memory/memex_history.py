@@ -18,8 +18,6 @@ MEMEX_HISTORY_DIRECTORY = "memex-history"
 
 def memex_content_sha256(content: str) -> str:
     """Hash the canonical headerless MEMEX body."""
-    if not isinstance(content, str):
-        raise TypeError("MEMEX content must be a string")
     return hashlib.sha256(memex_body(content).encode("utf-8")).hexdigest()
 
 
@@ -46,17 +44,6 @@ def _version_relative_path(cycle_id: str) -> str:
     return f"{MEMEX_HISTORY_DIRECTORY}/{identifier}.json"
 
 
-def _confined_path(control_dir: str | Path, relative_path: str) -> Path:
-    root = Path(control_dir).expanduser().resolve()
-    candidate = root / relative_path
-    resolved = candidate.resolve()
-    if not resolved.is_relative_to(root):
-        raise ValueError(f"MEMEX history path escapes the control directory: {relative_path!r}")
-    if candidate.parent.is_symlink() or candidate.is_symlink():
-        raise ValueError(f"MEMEX history path cannot use symlinks: {relative_path!r}")
-    return candidate
-
-
 def write_memex_version(
     control_dir: str | Path,
     *,
@@ -70,10 +57,6 @@ def write_memex_version(
     identifier = _safe_id(cycle_id, label="cycle")
     session = _session_id(session_id)
     _parse_time(completed_at)
-    if not isinstance(content, str):
-        raise TypeError("MEMEX content must be a string")
-    if previous_content is not None and not isinstance(previous_content, str):
-        raise TypeError("Previous MEMEX content must be a string or None")
 
     body = memex_body(content)
     if previous_content is not None and body == memex_body(previous_content):
@@ -89,7 +72,7 @@ def write_memex_version(
         "content_sha256": digest,
         "content": body,
     }
-    _write_json_once(_confined_path(control_dir, relative_path), payload)
+    _write_json_once(Path(control_dir).expanduser().resolve() / relative_path, payload)
     return {"path": relative_path, "sha256": digest}
 
 
@@ -131,11 +114,7 @@ def _load_receipt_version(
     ):
         return None
 
-    try:
-        path = _confined_path(control_dir, relative_path)
-    except (TypeError, ValueError):
-        return None
-    payload = _load_json(path)
+    payload = _load_json(Path(control_dir).expanduser().resolve() / relative_path)
     if payload is None:
         return None
 
@@ -161,16 +140,11 @@ def load_accepted_memex_versions(
 ) -> list[dict[str, Any]]:
     """Load only full versions linked by matching completed receipts, oldest first."""
     accepted: list[tuple[datetime, str, dict[str, Any]]] = []
-    seen_cycles: set[str] = set()
     for receipt in receipts:
         loaded = _load_receipt_version(control_dir, receipt)
         if loaded is None:
             continue
         completed_time, payload = loaded
-        cycle_id = str(payload["cycle_id"])
-        if cycle_id in seen_cycles:
-            continue
-        seen_cycles.add(cycle_id)
-        accepted.append((completed_time, cycle_id, payload))
+        accepted.append((completed_time, str(payload["cycle_id"]), payload))
     accepted.sort(key=lambda item: (item[0], item[1]))
     return [payload for _, _, payload in accepted]

@@ -54,11 +54,6 @@ try:
 except ImportError:  # pragma: no cover - non-Windows platforms
     msvcrt = None
 
-REQUIRED_TABLES = {
-    *GRAPH_IDENTITY_TABLES,
-    "memories_fts",
-    "syke_identity",
-}
 MAX_FULL_COPY_FALLBACK_BYTES = 64 * 1024 * 1024
 RECOVERY_IN_PROGRESS_FILENAME = "synthesis-in-progress.json"
 RECOVERY_ARTIFACT_SUFFIXES = (
@@ -67,10 +62,6 @@ RECOVERY_ARTIFACT_SUFFIXES = (
     ".sqlite-wal",
     ".sqlite-shm",
     ".sqlite.tmp",
-    ".db",
-    ".db-wal",
-    ".db-shm",
-    ".db.tmp",
 )
 
 
@@ -137,11 +128,7 @@ def synthesis_lock_path(user_id: str) -> Path:
     return user_data_dir(user_id) / "synthesis.lock"
 
 
-def acquire_synthesis_lock(
-    user_id: str,
-    *,
-    blocking: bool = False,
-) -> tuple[TextIO, Path]:
+def acquire_synthesis_lock(user_id: str) -> tuple[TextIO, Path]:
     """Acquire the per-user synthesis lock shared by recovery and execution."""
     lock_path = synthesis_lock_path(user_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,8 +136,7 @@ def acquire_synthesis_lock(
     try:
         if fcntl is not None:
             try:
-                flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
-                fcntl.flock(handle.fileno(), flags)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise SynthesisLockUnavailable(str(lock_path)) from exc
         elif msvcrt is not None:  # pragma: no cover - Windows fallback
@@ -160,8 +146,7 @@ def acquire_synthesis_lock(
                     handle.write("0")
                     handle.flush()
                 handle.seek(0)
-                mode = windows_lock.LK_LOCK if blocking else windows_lock.LK_NBLCK
-                windows_lock.locking(handle.fileno(), mode, 1)
+                windows_lock.locking(handle.fileno(), windows_lock.LK_NBLCK, 1)
             except OSError as exc:
                 raise SynthesisLockUnavailable(str(lock_path)) from exc
         else:  # pragma: no cover - unsupported platform
@@ -461,7 +446,6 @@ def create_recovery_point(
     *,
     run_id: str,
     cycle_id: str | None,
-    baseline: StateBaseline | None = None,
     max_full_copy_fallback_bytes: int = MAX_FULL_COPY_FALLBACK_BYTES,
 ) -> RecoveryPoint:
     """Create a cheap local recovery copy for the current cycle."""
@@ -474,9 +458,6 @@ def create_recovery_point(
     if not db_path.exists():
         raise FileNotFoundError(str(db_path))
 
-    # The semantic baseline stays in memory. The recovery manifest records only
-    # the operational facts required to verify and restore the copy.
-    del baseline
     _validate_current_schema(db.conn)
     source_checks, search_index_rebuilt, _ = _repair_search_index_if_needed(db)
     _require_checks_ok(source_checks, "Source database")
@@ -978,23 +959,6 @@ def validate_state_after_cycle(
         "baseline_links": len(baseline.links),
         "baseline_memex_count": int(baseline.current_memex is not None),
     }
-
-    try:
-        table_rows = db.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        tables = {str(row["name"]) for row in table_rows}
-    except sqlite3.Error as exc:
-        return {
-            "valid": False,
-            "issues": [f"database validation error: {exc}"],
-            "stats": stats,
-        }
-
-    missing_tables = sorted(REQUIRED_TABLES - tables)
-    stats["tables"] = sorted(tables)
-    stats["missing_tables"] = missing_tables
-    if missing_tables:
-        issues.append(f"missing required tables: {', '.join(missing_tables)}")
-        return {"valid": False, "issues": issues, "stats": stats}
 
     try:
         _validate_current_schema(db.conn)

@@ -13,10 +13,8 @@ from syke.daemon.web import web_server_status
 
 @click.command("web")
 @click.option("--open", "open_browser", is_flag=True, help="Open the URL in your default browser.")
-@click.pass_context
-def web(ctx: click.Context, open_browser: bool) -> None:
+def web(open_browser: bool) -> None:
     """Print the URL of the local Syke timeline UI (served by the daemon)."""
-    _ = ctx
     if not WEB_ENABLED:
         console.print("[yellow]Web UI disabled[/yellow] (SYKE_WEB_ENABLED=0). Re-enable to use.")
         return

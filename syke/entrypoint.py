@@ -46,17 +46,6 @@ ADVANCED_COMMANDS = (
 class SykeGroup(click.Group):
     """Top-level CLI group with product-oriented help sections."""
 
-    def list_commands(self, ctx: click.Context) -> list[str]:
-        available = list(super().list_commands(ctx))
-        ordered: list[str] = []
-        for name in (*PRIMARY_COMMANDS, *ADVANCED_COMMANDS):
-            if name in available and name not in ordered:
-                ordered.append(name)
-        for name in available:
-            if name not in ordered:
-                ordered.append(name)
-        return ordered
-
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         commands: dict[str, click.Command] = {}
         for subcommand in self.list_commands(ctx):
@@ -79,16 +68,9 @@ class SykeGroup(click.Group):
 
         primary_rows = _rows(PRIMARY_COMMANDS)
         advanced_rows = _rows(ADVANCED_COMMANDS)
-        other_rows = [
-            (name, cmd.get_short_help_str(formatter.width) or "")
-            for name, cmd in commands.items()
-            if name not in PRIMARY_COMMANDS and name not in ADVANCED_COMMANDS
-        ]
-
         for title, rows in (
             ("Primary Commands", primary_rows),
             ("Advanced Commands", advanced_rows),
-            ("Other Commands", other_rows),
         ):
             if not rows:
                 continue
@@ -115,7 +97,6 @@ def cli(ctx: click.Context, user: str, verbose: bool, provider: str | None) -> N
     """Syke — Local memory for your AI tools."""
     ctx.ensure_object(dict)
     ctx.obj["user"] = user
-    ctx.obj["verbose"] = verbose
     ctx.obj["provider"] = provider
 
     if provider:

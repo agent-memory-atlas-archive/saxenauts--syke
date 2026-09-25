@@ -403,17 +403,6 @@ class SykeDB:
         if not isinstance(db_path, (str, os.PathLike)):
             raise TypeError(f"SykeDB(db_path) expects a path-like value, got {type(db_path)!r}")
         path_str = os.fspath(db_path)
-        if (
-            path_str != ":memory:"
-            and "/" not in path_str
-            and "\\" not in path_str
-            and not path_str.endswith(".db")
-        ):
-            raise ValueError(
-                f"SykeDB(db_path) looks like a username, not a file path: {path_str!r}. "
-                "Use user_syke_db_path(user_id) to get the correct path."
-            )
-
         self.db_path = path_str
         self._lease: DatabaseLease | None = None
         self._conn: sqlite3.Connection | None = None
@@ -534,11 +523,6 @@ class SykeDB:
             return
 
         with self.transaction():
-            for table in GRAPH_IDENTITY_TABLES:
-                conn.execute(
-                    f"UPDATE {table} SET user_id = ? WHERE user_id != ?",
-                    (canonical_user_id, canonical_user_id),
-                )
             conn.execute(
                 "INSERT INTO syke_identity (singleton, user_id, created_at) VALUES (1, ?, ?)",
                 (canonical_user_id, datetime.now(UTC).isoformat()),
@@ -599,7 +583,6 @@ class SykeDB:
             ],
             "unlinked": unlinked_count,
             "unlinked_rate": round(unlinked_count / memory_count, 2) if memory_count else 0,
-            "links_outside_graph": 0,
         }
 
     def count_memories(self, user_id: str) -> int:

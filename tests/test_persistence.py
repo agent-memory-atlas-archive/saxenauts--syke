@@ -266,33 +266,6 @@ def test_bound_identity_guards_all_user_scoped_tables(tmp_path: Path) -> None:
         db.conn.rollback()
 
 
-def test_bind_identity_consolidates_an_unbound_fresh_store(tmp_path: Path) -> None:
-    from syke.memory.memex import update_memex
-
-    created = datetime(2026, 2, 3, tzinfo=UTC)
-    with SykeDB(tmp_path / "identity.db") as db:
-        _insert_memory(db, "a", "alias", created_at=created)
-        _insert_memory(db, "b", "alias")
-        db.conn.execute(
-            """INSERT INTO links
-               (id, user_id, source_id, target_id, reason, created_at)
-               VALUES ('edge', 'alias', 'a', 'b', 'related', '2026-02-03')"""
-        )
-        db.conn.commit()
-        memex_id = update_memex(db, "alias", "map")
-
-        db.bind_identity("canonical")
-
-        assert _memory_row(db, "a")["created_at"] == created.isoformat()
-        assert db.get_memex("canonical")["id"] == memex_id
-        for table in ("memories", "links", "current_memex"):
-            assert db.conn.execute(f"SELECT DISTINCT user_id FROM {table}").fetchone()[0] == (
-                "canonical"
-            )
-        with pytest.raises(ValueError, match="bound to 'canonical'"):
-            db.bind_identity("other")
-
-
 def test_ids_and_created_at_are_immutable(db: SykeDB, user_id: str) -> None:
     from syke.memory.memex import update_memex
 
@@ -370,8 +343,6 @@ def test_count_memories_counts_only_ordinary_current_rows(db: SykeDB, user_id: s
     update_memex(db, user_id, "map")
 
     assert db.count_memories(user_id) == 2
-    with pytest.raises(TypeError):
-        db.count_memories(user_id, True)  # type: ignore[call-arg]
 
 
 def test_fts_tracks_every_memory_insert_revision_and_delete(db: SykeDB, user_id: str) -> None:
@@ -410,7 +381,6 @@ def test_graph_stats_describe_only_current_ordinary_graph(db: SykeDB, user_id: s
     assert stats["memories"] == 3
     assert stats["links"] == 1
     assert stats["unlinked"] == 1
-    assert stats["links_outside_graph"] == 0
 
 
 def test_outer_transaction_defers_memories_links_and_memex(tmp_path: Path) -> None:

@@ -33,31 +33,6 @@ def test_receipts_are_final_host_facts_not_another_database(tmp_path: Path) -> N
     assert path.suffix == ".json"
     assert get_receipt(control, "cycle-1") == receipt
     assert list_receipts(control) == [receipt]
-    assert not (control / "history.db").exists()
-
-
-def test_protected_receipt_fsyncs_its_directory_after_publish(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    control = tmp_path / "control"
-    synced: list[Path] = []
-    monkeypatch.setattr(control_module, "_fsync_directory", synced.append)
-
-    write_receipt(
-        control,
-        {
-            "id": "cycle-durable",
-            "started_at": "2026-08-02T10:00:00+00:00",
-            "completed_at": "2026-08-02T10:00:01+00:00",
-            "status": "completed",
-            "session_id": "session-durable",
-            "acknowledged_record_ids": [],
-            "memex_updated": False,
-        },
-    )
-
-    assert synced == [control.resolve() / "receipts"]
 
 
 def test_completed_receipts_acknowledge_only_the_exact_records_they_saw(

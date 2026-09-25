@@ -64,10 +64,6 @@ def _get_skill_content() -> str:
         raise
 
 
-def _render_skill_content(user_id: str) -> str:
-    return _get_skill_content().replace("{user}", user_id)
-
-
 def _write_text_file(target: Path, content: str) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(".tmp")
@@ -76,7 +72,7 @@ def _write_text_file(target: Path, content: str) -> Path:
     return target
 
 
-def _build_cursor_command_content(user_id: str) -> str:
+def _build_cursor_command_content() -> str:
     return (
         "# Syke\n\n"
         "Use Syke as your local memory layer. Start from `~/.syke/workspace/MEMEX.md`, "
@@ -89,8 +85,8 @@ def _build_cursor_command_content(user_id: str) -> str:
     )
 
 
-def _build_copilot_agent_content(user_id: str) -> str:
-    skill_body = _render_skill_content(user_id)
+def _build_copilot_agent_content() -> str:
+    skill_body = _get_skill_content()
     return (
         "---\n"
         "name: Syke\n"
@@ -100,7 +96,7 @@ def _build_copilot_agent_content(user_id: str) -> str:
     )
 
 
-def _build_antigravity_workflow_content(user_id: str) -> str:
+def _build_antigravity_workflow_content() -> str:
     return (
         "# Syke Workflow\n\n"
         "Use Syke as the stable local memory system for this workflow.\n\n"
@@ -135,7 +131,7 @@ def capability_target_paths() -> list[Path]:
     return [*_skill_target_paths(), *_wrapper_target_paths()]
 
 
-def install_skill(user_id: str) -> list[Path]:
+def install_skill() -> list[Path]:
     """Install Syke capability files to detected downstream agent surfaces.
 
     Installs the canonical `SKILL.md` package to configured skill directories and
@@ -144,7 +140,7 @@ def install_skill(user_id: str) -> list[Path]:
 
     Returns list of paths where Syke capability files were installed.
     """
-    content = _render_skill_content(user_id)
+    content = _get_skill_content()
     installed: list[Path] = []
 
     for target in _skill_target_paths():
@@ -155,9 +151,9 @@ def install_skill(user_id: str) -> list[Path]:
             log.warning("Failed to install skill to %s: %s", target, exc)
 
     wrapper_content = {
-        CURSOR_COMMANDS_DIR / "syke.md": _build_cursor_command_content(user_id),
-        COPILOT_AGENTS_DIR / "syke.agent.md": _build_copilot_agent_content(user_id),
-        ANTIGRAVITY_WORKFLOWS_DIR / "syke.md": _build_antigravity_workflow_content(user_id),
+        CURSOR_COMMANDS_DIR / "syke.md": _build_cursor_command_content(),
+        COPILOT_AGENTS_DIR / "syke.agent.md": _build_copilot_agent_content(),
+        ANTIGRAVITY_WORKFLOWS_DIR / "syke.md": _build_antigravity_workflow_content(),
     }
     for target in _wrapper_target_paths():
         try:
