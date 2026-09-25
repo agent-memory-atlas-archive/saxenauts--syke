@@ -286,8 +286,8 @@ def build_doctor_payload(
             len(blocked) == 0,
             "all harness roots readable" if not blocked else f"blocked: {', '.join(blocked)}",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _add_check("harness_access", "Harness access", False, f"check failed: {exc}")
 
     if has_db:
         db = get_db(user_id)

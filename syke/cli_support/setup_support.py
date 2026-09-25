@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import cast
 
@@ -165,7 +166,7 @@ def setup_runtime_payload() -> dict[str, object]:
         payload["version"] = get_pi_version(install=False)
         payload["ready"] = True
         payload["detail"] = "Pi runtime available"
-    except (RuntimeError, FileNotFoundError) as exc:
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         payload["detail"] = str(exc)
 
     return payload

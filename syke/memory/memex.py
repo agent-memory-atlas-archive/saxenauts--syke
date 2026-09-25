@@ -68,7 +68,7 @@ def get_memex_for_injection(
         # The placeholder is an ask-path UX affordance — in synthesis it
         # leaks into the prompt and the agent literally echoes it instead
         # of doing its work. Callers pass context="synthesis" to opt out.
-        if context == "synthesis":
+        if context != "ask":
             return ""
         mem_count = db.count_memories(user_id)
         if mem_count > 0:

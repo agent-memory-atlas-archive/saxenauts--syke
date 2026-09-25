@@ -19,7 +19,7 @@ from syke.cli_support.auth_flow import (
 from syke.cli_support.auth_flow import (
     verify_provider_activation as verify_setup_provider_connection,
 )
-from syke.cli_support.exit_codes import SykeAuthException
+from syke.cli_support.exit_codes import EXIT_RUNTIME, SykeAuthException
 from syke.cli_support.installers import run_managed_checkout_install
 from syke.cli_support.providers import provider_payload
 from syke.cli_support.render import render_section
@@ -192,7 +192,7 @@ def _run_agent_setup(
                 "Install Node.js 22.19 or newer",
                 rerun_command,
             ],
-            "exit_code": 1,
+            "exit_code": EXIT_RUNTIME,
         }
     except Exception as exc:
         return {
@@ -282,7 +282,7 @@ def _run_agent_setup(
                 "syke auth status --json",
                 rerun_command,
             ],
-            "exit_code": 1,
+            "exit_code": EXIT_RUNTIME,
         }
 
     # Handle managed install (macOS source checkout)

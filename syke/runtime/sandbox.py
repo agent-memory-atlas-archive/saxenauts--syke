@@ -64,6 +64,27 @@ def sandbox_read_paths() -> tuple[str, ...]:
     return (str(Path.home().expanduser().resolve()),)
 
 
+def _credential_deny_paths() -> list[str]:
+    """Paths under the readable home that model tools must never read.
+
+    Home is readable so Syke can observe the computer, but credentials are not
+    evidence. The Pi host process reads its own auth outside the sandbox.
+    """
+    from syke.pi_state import get_pi_agent_dir
+
+    home = Path.home().expanduser().resolve()
+    candidates = [
+        get_pi_agent_dir(),
+        home / ".syke" / "pi-agent",
+        home / ".ssh",
+        home / ".aws",
+        home / ".gnupg",
+        home / ".netrc",
+        home / ".config" / "gh",
+    ]
+    return list(dict.fromkeys(str(Path(c).expanduser().resolve()) for c in candidates))
+
+
 def _parent_listing_paths(paths: list[str]) -> list[str]:
     """Generate literal (directory-listing-only) rules for parent directories.
 
@@ -245,6 +266,13 @@ def generate_seatbelt_profile(
             for alias in _path_aliases(p):
                 lines.append(f'(allow file-read* (subpath "{alias}"))')
         lines.append("")
+
+    # Later Seatbelt rules win, so these denies override the home read above.
+    lines.append("; Credentials — never readable by model tools")
+    for p in _credential_deny_paths():
+        for alias in _path_aliases(p):
+            lines.append(f'(deny file-read* (subpath "{alias}"))')
+    lines.append("")
 
     lines.append("; Syke control state — inspectable; writes scoped below")
     for p in protected_paths:

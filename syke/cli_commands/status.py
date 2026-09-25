@@ -160,7 +160,10 @@ def memex(ctx: click.Context, use_json: bool, fmt: str) -> None:
     try:
         content = get_memex_for_injection(db, user_id)
         if not content:
-            console.print("[dim]No memex yet. Run: syke setup[/dim]")
+            if use_json or fmt == "json":
+                click.echo(json.dumps({"memex": None, "user": user_id}))
+            else:
+                console.print("[dim]No memex yet. Run: syke setup[/dim]")
             return
         if use_json or fmt == "json":
             click.echo(json.dumps({"memex": content, "user": user_id}))

@@ -136,9 +136,7 @@ def test_profile_enforces_home_read_only_and_syke_write_boundary(
                     "/bin/cat",
                     str(source_file),
                     str(dot_file),
-                    str(ssh_config),
                     str(codex_config),
-                    str(pi_auth),
                 ],
                 profile_path,
             ),
@@ -146,6 +144,15 @@ def test_profile_enforces_home_read_only_and_syke_write_boundary(
             capture_output=True,
             text=True,
         )
+        credential_results = [
+            subprocess.run(
+                _sandboxed(["/bin/cat", str(secret)], profile_path),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            for secret in (pi_auth, ssh_config)
+        ]
         workspace_result = subprocess.run(
             _sandboxed(["/usr/bin/touch", str(workspace / "allowed")], profile_path),
             check=False,
@@ -204,10 +211,11 @@ def test_profile_enforces_home_read_only_and_syke_write_boundary(
         profile_path.unlink(missing_ok=True)
 
     assert read_result.returncode == 0
-    assert read_result.stdout == (
-        "remember this\nalso readable\nordinary config\nmodel = 'configured'\n"
-        "placeholder credential\n"
-    )
+    assert read_result.stdout == "remember this\nalso readable\nmodel = 'configured'\n"
+    for credential_result in credential_results:
+        assert credential_result.returncode != 0
+        assert "placeholder credential" not in credential_result.stdout
+        assert "ordinary config" not in credential_result.stdout
     assert workspace_result.returncode == 0
     assert (workspace / "allowed").exists()
     assert runtime_result.returncode == 0
