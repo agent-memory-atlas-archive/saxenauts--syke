@@ -22,8 +22,6 @@ from syke.memory.memex_budget import MEMEX_TOKEN_LIMIT, measure_memex
 
 logger = logging.getLogger(__name__)
 
-SYKE_SELF_PATH = Path(__file__).with_name("syke_self.md")
-
 
 def _build_learned_block(db, user_id: str) -> str:
     """Render the exact current learned memory when it fits its prompt budget."""
@@ -140,7 +138,6 @@ def _build_self_view_block(
             as_of=as_of,
             home=home,
             selected_sources=selected_sources,
-            system_prompt_path=SYKE_SELF_PATH,
         )
     except Exception:
         logger.warning("Unable to build Syke self-observation", exc_info=True)
@@ -163,7 +160,6 @@ def _build_operation_block(
     answer_obligation: str | None,
     first_run_guidance: str,
     additional_guidance: str,
-    time_directive: bool,
 ) -> str:
     """Render the exact trigger, presented evidence, and current obligation."""
     if context == "ask":
@@ -190,12 +186,6 @@ def _build_operation_block(
 
     records = incoming_records.strip() or "none"
     direct_answer = answer_obligation.strip() if answer_obligation else "none"
-    reference_rule = (
-        "\nResolve relative time against this reference time. Do not use the host clock or "
-        "file mtimes as a replacement reference."
-        if time_directive
-        else ""
-    )
     bootstrap = (
         f"\n\n# First-run bootstrap\n\n{first_run_guidance.strip()}"
         if first_run_guidance.strip()
@@ -215,7 +205,8 @@ def _build_operation_block(
 - Operation ID: {operation_id or "unavailable"}
 - Authoritative reference time: {now}
 - Current condition: {condition}
-{reference_rule}
+
+Resolve relative time against this reference time. Do not use the host clock or file mtimes as a replacement reference.
 
 ## Evidence presented now
 
@@ -260,7 +251,6 @@ def build_prompt(
     cycle_runtime: Path | None = None,
     include_memex: bool = True,
     include_self_view: bool = True,
-    time_directive: bool = True,
     operation_id: str | None = None,
     condition: str = "ordinary",
     incoming_records: str = "",
@@ -316,7 +306,6 @@ supplied to this prompt construction.
             answer_obligation=answer_obligation,
             first_run_guidance=first_run_guidance,
             additional_guidance=guidance,
-            time_directive=time_directive,
         )
     )
 

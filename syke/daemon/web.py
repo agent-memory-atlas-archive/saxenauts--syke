@@ -30,6 +30,7 @@ from typing import Any
 
 from syke.config import user_control_dir, user_syke_db_path
 from syke.control import get_receipt, list_receipts
+from syke.daemon.daemon import LOG_PATH
 from syke.db import DatabaseMaintenanceError
 from syke.db_access import acquire_database_lease, maintenance_marker_path
 from syke.memory.memex_history import load_accepted_memex_versions
@@ -45,8 +46,6 @@ ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
 # Keep this high enough for multi-month historical timelines.
 TIMELINE_MAX = 5000
 LOG_LINES_MAX = 500
-DAEMON_LOG_PATH = Path(os.path.expanduser("~/.config/syke/daemon.log"))
-RESIDENT_SERVICE_MANAGERS = {"launchd", "systemd"}
 
 
 @contextmanager
@@ -74,14 +73,8 @@ def _open_ro(db_path: str) -> Iterator[sqlite3.Connection]:
 def _iso_to_dt(s: str | None) -> datetime | None:
     if not s:
         return None
-    # Query strings can come through as `2026-05-12T22:00:00 00:00` when
-    # callers forgot to URL-escape the `+` in timezone offsets. Normalizing
-    # this form preserves compatibility with existing callers.
-    s = s.strip()
-    if " " in s:
-        s = re.sub(r"\s(\d{2}:\d{2})$", r"+\1", s)
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
     except ValueError:
         return None
 
@@ -109,7 +102,6 @@ def _operation_summary(receipt: dict[str, Any]) -> dict[str, Any]:
             "completed_at",
             "status",
             "session_id",
-            "acknowledged_record_ids",
             "error",
             "reason",
         )
@@ -121,22 +113,6 @@ def _operation_summary(receipt: dict[str, Any]) -> dict[str, Any]:
             key: memex_version.get(key) for key in ("path", "sha256") if key in memex_version
         }
     summary["memex_updated"] = bool(receipt.get("memex_updated") or memex_version)
-
-    recovery = receipt.get("recovery")
-    if isinstance(recovery, dict):
-        summary["recovery"] = {
-            key: recovery.get(key)
-            for key in ("restored", "recovery_point", "status", "id")
-            if key in recovery
-        }
-    elif recovery is not None:
-        summary["recovery"] = recovery
-    else:
-        # Old receipts remain readable for their final rollback verdict, but
-        # their graph deltas never cross the API boundary.
-        state_change = receipt.get("state_change")
-        if isinstance(state_change, dict) and state_change.get("graph_outcome") == "restored":
-            summary["recovery"] = {"restored": True}
     return summary
 
 
@@ -153,11 +129,9 @@ def _session_trace(session: dict[str, Any], *, include_content: bool) -> dict[st
     ]
     return {
         "session_id": session.get("id"),
-        "session_path": session.get("path"),
         "transcript": transcript,
         "thinking": thinking,
         "tool_calls": session.get("tool_calls", []) if include_content else [],
-        "tool_name_counts": session.get("tool_name_counts") or {},
         "tool_calls_count": int(session.get("tool_calls_count") or 0),
         "num_turns": int(session.get("num_turns") or 0),
         "output_text": session.get("output_text", "") if include_content else "",
@@ -171,13 +145,6 @@ def _session_trace(session: dict[str, Any], *, include_content: bool) -> dict[st
         "model": session.get("model"),
         "status": session.get("status"),
     }
-
-
-def _accepted_memex_states(
-    control_dir: Path, receipts: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Return validated accepted MEMEX states oldest first."""
-    return load_accepted_memex_versions(control_dir, receipts)
 
 
 def _latest_memex_state(
@@ -250,24 +217,21 @@ def query_current_graph(db_path: str, user_id: str) -> dict[str, Any]:
     return result
 
 
-def query_timeline(db_path: str, user_id: str, end_iso: str, *, minutes: int) -> dict[str, Any]:
-    """Return cycles + asks within (end - minutes, end], newest first.
+def query_timeline(user_id: str, end_iso: str, *, days: float) -> dict[str, Any]:
+    """Return cycles + asks within (end - days, end], newest first.
 
-    Lightweight rows only — detail is fetched per-event on click. The window
-    is expressed in minutes so the scrubber can zoom from 1 hour through
-    multi-week ranges with one parameter.
+    Lightweight rows only; detail is fetched per-event on click.
     """
     end_dt = _iso_to_dt(end_iso) or datetime.now(UTC)
     end_dt_utc = end_dt.astimezone(UTC) if end_dt.tzinfo is not None else end_dt.replace(tzinfo=UTC)
-    start_dt = end_dt_utc - timedelta(minutes=minutes)
+    start_dt = end_dt_utc - timedelta(days=days)
     start_iso = start_dt.isoformat()
     end_iso_norm = end_dt_utc.isoformat()
 
-    _ = db_path
     events: list[dict[str, Any]] = []
     control_dir = user_control_dir(user_id)
     receipts = list_receipts(control_dir)
-    memex_states = _accepted_memex_states(control_dir, receipts)
+    memex_states = load_accepted_memex_versions(control_dir, receipts)
     versions_by_cycle = {
         str(state["cycle_id"]): state for state in memex_states if state.get("cycle_id") is not None
     }
@@ -315,7 +279,6 @@ def query_timeline(db_path: str, user_id: str, end_iso: str, *, minutes: int) ->
                 "completed_at": row.get("completed_at"),
                 "display_at": row["display_at"],
                 "status": row.get("status"),
-                "memex_id": memex_state.get("cycle_id") if memex_state else None,
                 "memex_created_at": (
                     memex_state.get("completed_at") or memex_state.get("captured_at")
                     if memex_state
@@ -323,14 +286,12 @@ def query_timeline(db_path: str, user_id: str, end_iso: str, *, minutes: int) ->
                 ),
                 "memex_updated": bool(exact_version),
                 "memex_moved": bool(exact_version),
-                "memex_content_moved": bool(exact_version),
                 "duration_ms": int(session.get("duration_ms") or 0) if session else 0,
                 "cost_usd": float(session.get("cost_usd") or 0) if session else 0,
                 "model": session.get("model") if session else None,
                 "num_turns": int(session.get("num_turns") or 0) if session else 0,
                 "tool_calls_count": int(session.get("tool_calls_count") or 0) if session else 0,
                 "session_id": session.get("id") if session else None,
-                "session_path": session.get("path") if session else None,
             }
         )
 
@@ -346,7 +307,6 @@ def query_timeline(db_path: str, user_id: str, end_iso: str, *, minutes: int) ->
                 "kind": "ask",
                 "id": session.get("operation_id"),
                 "session_id": session.get("id"),
-                "session_path": session.get("path"),
                 "started_at": session.get("started_at"),
                 "completed_at": session.get("completed_at"),
                 "display_at": session.get("completed_at") or session.get("started_at"),
@@ -360,38 +320,22 @@ def query_timeline(db_path: str, user_id: str, end_iso: str, *, minutes: int) ->
             }
         )
 
-    def _event_sort_dt(event: dict[str, Any]) -> datetime:
-        for key in ("display_at", "completed_at", "started_at"):
-            value = event.get(key)
-            if isinstance(value, str):
-                parsed = _iso_to_utc_dt(value)
-                if parsed is not None:
-                    return parsed
-        return datetime.min.replace(tzinfo=UTC)
-
-    events.sort(key=_event_sort_dt, reverse=True)
+    # Every event's display_at was parsed successfully during selection above.
+    events.sort(key=lambda event: _iso_to_utc_dt(event["display_at"]), reverse=True)
     return {
         "user_id": user_id,
-        "window": {
-            "start": start_iso,
-            "end": end_iso_norm,
-            "minutes": minutes,
-            "days": round(minutes / 1440, 4),
-        },
-        "count": len(events),
+        "window": {"start": start_iso, "end": end_iso_norm},
         "events": events,
     }
 
 
 def query_cycle(
-    db_path: str,
     user_id: str,
     cycle_id: str,
     *,
-    summary: bool | str = False,
+    summary: bool = False,
 ) -> dict[str, Any] | None:
     """Return one host receipt with accepted MEMEX history and its native session."""
-    _ = db_path
     summary_mode = "memex" if summary else "full"
     control_dir = user_control_dir(user_id)
     cycle = get_receipt(control_dir, cycle_id)
@@ -427,7 +371,7 @@ def query_cycle(
                 "model": session.get("model"),
             }
         )
-    memex_states = _accepted_memex_states(control_dir, receipts)
+    memex_states = load_accepted_memex_versions(control_dir, receipts)
     current_index, current_state = _latest_memex_state(memex_states, completed_at)
     exact_version = next(
         (state for state in memex_states if state.get("cycle_id") == cycle_id),
@@ -443,14 +387,12 @@ def query_cycle(
     memex_content = str(current_state.get("content") or "") if current_state else ""
     memex_created_at = current_state.get("completed_at") if current_state else None
     previous_memex_content = str(previous_state.get("content") or "") if previous_state else ""
-    cycle_info["memex_id"] = current_state.get("cycle_id") if current_state else None
     cycle_info["memex_created_at"] = memex_created_at
     cycle_info["memex_moved"] = memex_moved
-    cycle_info["memex_content_moved"] = memex_moved
     trace = _session_trace(session, include_content=summary_mode == "full") if session else None
     return {
         "kind": "cycle",
-        "summary": bool(summary),
+        "summary": summary,
         "cycle": cycle_info,
         "memex": {"content": memex_content, "created_at": memex_created_at},
         "prev_memex": {"content": previous_memex_content},
@@ -459,18 +401,16 @@ def query_cycle(
 
 
 def query_ask(
-    db_path: str,
     user_id: str,
     ask_id: str,
     *,
-    summary: bool | str = False,
+    summary: bool = False,
 ) -> dict[str, Any] | None:
     """Return full detail for a single native ask session.
 
     Ordinary graph state is intentionally absent; the graph has its own
     boundary-free current-state endpoint.
     """
-    _ = db_path
     summary_mode = "memex" if summary else "full"
     sessions = _session_dir(user_id)
     ask = find_session_by_name(
@@ -493,11 +433,10 @@ def query_ask(
     trace = _session_trace(ask, include_content=summary_mode == "full")
     return {
         "kind": "ask",
-        "summary": bool(summary),
+        "summary": summary,
         "ask": {
             "id": ask.get("operation_id"),
             "session_id": ask.get("id"),
-            "session_path": ask.get("path"),
             "started_at": ask.get("started_at"),
             "completed_at": ask.get("completed_at"),
             "status": ask.get("status"),
@@ -519,20 +458,16 @@ def query_ask(
 def query_log_tail(lines: int) -> dict[str, Any]:
     """Tail the daemon log. Bounded, no full-file load."""
     n = min(max(lines, 1), LOG_LINES_MAX)
-    if not DAEMON_LOG_PATH.exists():
-        return {"path": str(DAEMON_LOG_PATH), "lines": [], "exists": False}
+    if not LOG_PATH.exists():
+        return {"lines": []}
     try:
-        with DAEMON_LOG_PATH.open("rb") as fh:
+        with LOG_PATH.open("rb") as fh:
             buf: deque[bytes] = deque(maxlen=n)
             for raw in fh:
                 buf.append(raw.rstrip(b"\n"))
-        return {
-            "path": str(DAEMON_LOG_PATH),
-            "lines": [b.decode("utf-8", errors="replace") for b in buf],
-            "exists": True,
-        }
+        return {"lines": [b.decode("utf-8", errors="replace") for b in buf]}
     except OSError as exc:
-        return {"path": str(DAEMON_LOG_PATH), "lines": [], "exists": True, "error": str(exc)}
+        return {"lines": [], "error": str(exc)}
 
 
 def _provider_setup_blocker() -> dict[str, Any] | None:
@@ -571,65 +506,18 @@ def _provider_setup_blocker() -> dict[str, Any] | None:
     }
 
 
-def _onboarding_with_current_persistence(user_id: str) -> dict[str, Any] | None:
+def query_health(db_path: str, user_id: str) -> dict[str, Any]:
     from syke.onboarding import read_onboarding_state
 
-    onboarding = read_onboarding_state(user_id)
-    if not onboarding:
-        return onboarding
-
-    stored_persistence = onboarding.get("persistence")
-    if not isinstance(stored_persistence, dict):
-        stored_persistence = {}
-    stored_manager = str(stored_persistence.get("manager") or "")
-    stored_is_resident = (
-        stored_manager in RESIDENT_SERVICE_MANAGERS
-        and stored_persistence.get("keeps_daemon_alive") is True
-        and stored_persistence.get("serves_timeline_while_idle") is not False
-    )
-    if stored_is_resident:
-        return onboarding
-
-    try:
-        from syke.cli_support.daemon_state import daemon_payload
-
-        daemon = daemon_payload()
-    except Exception:
-        return onboarding
-
-    service = daemon.get("service")
-    if not isinstance(service, dict):
-        return onboarding
-    live_persistence = daemon.get("persistence")
-    if not isinstance(live_persistence, dict):
-        return onboarding
-    live_manager = str(service.get("manager") or live_persistence.get("manager") or "")
-    live_is_resident = (
-        live_manager in RESIDENT_SERVICE_MANAGERS
-        and not service.get("scheduled_only")
-        and (service.get("registered") or service.get("running") or daemon.get("running"))
-    )
-    if not live_is_resident or live_persistence == stored_persistence:
-        return onboarding
-
-    updated = dict(onboarding)
-    updated["stored_persistence"] = dict(stored_persistence)
-    updated["persistence"] = dict(live_persistence)
-    updated["persistence_source"] = "daemon_status"
-    return updated
-
-
-def query_health(db_path: str, user_id: str) -> dict[str, Any]:
     info: dict[str, Any] = {
         "user_id": user_id,
         "db_path": db_path,
         "db_present": Path(db_path).exists(),
-        "log_path": str(DAEMON_LOG_PATH),
         "now": datetime.now(UTC).isoformat(),
         "last_cycle": None,
         "last_completed_cycle": None,
         "memex_updated_at": None,
-        "onboarding": _onboarding_with_current_persistence(user_id),
+        "onboarding": read_onboarding_state(user_id),
         "setup_blocker": _provider_setup_blocker(),
     }
     receipts = list_receipts(user_control_dir(user_id))
@@ -769,32 +657,20 @@ def make_handler(user_id: str, html_path: Path) -> type[BaseHTTPRequestHandler]:
 
             if path == "/api/timeline":
                 end_iso = (qs.get("end") or [datetime.now(UTC).isoformat()])[0]
-                # `minutes` is the canonical window parameter; `days` stays as a
-                # convenience alias so old links keep working.
-                minutes_param = qs.get("minutes")
-                if minutes_param:
-                    try:
-                        minutes = int(minutes_param[0])
-                    except ValueError:
-                        minutes = 60 * 24 * 7
-                else:
-                    try:
-                        minutes = int(float((qs.get("days") or ["7"])[0]) * 1440)
-                    except ValueError:
-                        minutes = 60 * 24 * 7
+                try:
+                    days = float((qs.get("days") or ["7"])[0])
+                except ValueError:
+                    days = 7.0
                 # Clamp: 5 minutes up to 2 years for long-horizon timelines.
-                minutes = max(5, min(60 * 24 * 730, minutes))
-                self._send_json(
-                    200,
-                    query_timeline(db_path_factory(), user_id, end_iso, minutes=minutes),
-                )
+                days = max(5 / 1440, min(730.0, days))
+                self._send_json(200, query_timeline(user_id, end_iso, days=days))
                 return
 
             m = re.match(r"^/api/cycle/([A-Za-z0-9_.:-]+)$", path)
             if m:
                 summary_param = ((qs.get("summary") or ["0"])[0]).lower()
                 summary = summary_param in {"1", "true", "yes", "memory"}
-                detail = query_cycle(db_path_factory(), user_id, m.group(1), summary=summary)
+                detail = query_cycle(user_id, m.group(1), summary=summary)
                 if detail is None:
                     self._send_json(404, {"error": "cycle not found"})
                 else:
@@ -805,7 +681,7 @@ def make_handler(user_id: str, html_path: Path) -> type[BaseHTTPRequestHandler]:
             if m:
                 summary_param = ((qs.get("summary") or ["0"])[0]).lower()
                 summary = summary_param in {"1", "true", "yes", "memory"}
-                detail = query_ask(db_path_factory(), user_id, m.group(1), summary=summary)
+                detail = query_ask(user_id, m.group(1), summary=summary)
                 if detail is None:
                     self._send_json(404, {"error": "ask not found"})
                 else:

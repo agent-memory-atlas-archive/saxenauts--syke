@@ -138,7 +138,6 @@ def _write_cycle_receipt(
     memex_updated: bool = False,
     memex_content: str | None = None,
     previous_memex_content: str | None = None,
-    state_change: dict[str, object] | None = None,
     session_id: str | None = None,
 ) -> None:
     from syke.runtime import workspace
@@ -166,8 +165,6 @@ def _write_cycle_receipt(
     }
     if version_ref is not None:
         payload["memex_version"] = version_ref
-    if state_change is not None:
-        payload["state_change"] = state_change
     write_receipt(
         workspace.CONTROL_ROOT,
         payload,
@@ -298,44 +295,6 @@ def test_query_health_updates_provider_blocker_without_model_resolution(tmp_path
     assert configured["setup_blocker"] is None
 
 
-def test_query_health_replaces_legacy_onboarding_persistence_with_live_service(
-    tmp_path, monkeypatch
-):
-    from syke.cli_support import daemon_state
-    from syke.onboarding import write_onboarding_state
-
-    write_onboarding_state(
-        "test_user",
-        selected_sources=("codex",),
-        total_files=1,
-        estimated_minutes=1,
-        estimate_method="test",
-        mode="daemon",
-        persistence={"manager": "cron", "keeps_daemon_alive": False},
-    )
-    live_persistence = {
-        "manager": "systemd",
-        "keeps_daemon_alive": True,
-        "serves_timeline_while_idle": True,
-    }
-    monkeypatch.setattr(
-        daemon_state,
-        "daemon_payload",
-        lambda: {
-            "running": True,
-            "registered": True,
-            "persistence": live_persistence,
-            "service": {"manager": "systemd", "running": True, "scheduled_only": False},
-        },
-    )
-
-    health = query_health(str(tmp_path / "missing.db"), "test_user")
-
-    assert health["onboarding"]["persistence"] == live_persistence
-    assert health["onboarding"]["stored_persistence"]["manager"] == "cron"
-    assert health["onboarding"]["persistence_source"] == "daemon_status"
-
-
 def test_query_current_graph_reads_current_rows_without_a_timeline_boundary(tmp_path):
     db_path = tmp_path / "syke-current.db"
     with sqlite3.connect(db_path) as conn:
@@ -386,12 +345,12 @@ def test_query_current_graph_reads_current_rows_without_a_timeline_boundary(tmp_
 def test_cycle_and_ask_details_do_not_return_ordinary_graph_playback(tmp_path):
     db_path, user_id = _seed_db(tmp_path)
     end_iso = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
-    timeline = query_timeline(str(db_path), user_id, end_iso, minutes=7 * 24 * 60)
+    timeline = query_timeline(user_id, end_iso, days=7)
     cycle_event = next(event for event in timeline["events"] if event["kind"] == "cycle")
     ask_event = next(event for event in timeline["events"] if event["kind"] == "ask")
 
-    cycle = query_cycle(str(db_path), user_id, cycle_event["id"])
-    ask = query_ask(str(db_path), user_id, ask_event["id"])
+    cycle = query_cycle(user_id, cycle_event["id"])
+    ask = query_ask(user_id, ask_event["id"])
 
     assert cycle is not None
     assert ask is not None
@@ -432,17 +391,11 @@ def test_query_timeline_ignores_orphan_memex_version_files(tmp_path):
             completed_at=cycle_at.isoformat(),
         )
 
-    t = query_timeline(
-        str(db_path),
-        user_id,
-        (cycle_at + timedelta(minutes=10)).isoformat(),
-        minutes=60,
-    )
+    t = query_timeline(user_id, (cycle_at + timedelta(minutes=10)).isoformat(), days=1 / 24)
     cycle = next(e for e in t["events"] if e["kind"] == "cycle")
 
     assert cycle["id"] == cycle_id
     assert cycle["memex_created_at"] == baseline.isoformat()
-    assert cycle["memex_id"] == accepted_cycle
     assert cycle["memex_moved"] is False
 
 
@@ -498,10 +451,10 @@ def test_operation_summaries_bound_heavy_payloads_and_keep_routing_context(tmp_p
             output_text=ask_output,
         )
 
-    summary = query_cycle(str(db_path), user_id, cycle_id, summary=True)
-    full = query_cycle(str(db_path), user_id, cycle_id)
-    ask_summary = query_ask(str(db_path), user_id, ask_id, summary=True)
-    ask_full = query_ask(str(db_path), user_id, ask_id)
+    summary = query_cycle(user_id, cycle_id, summary=True)
+    full = query_cycle(user_id, cycle_id)
+    ask_summary = query_ask(user_id, ask_id, summary=True)
+    ask_full = query_ask(user_id, ask_id)
 
     assert summary is not None
     assert full is not None
@@ -540,7 +493,7 @@ def test_query_timeline_sorts_mixed_offsets_by_instant(tmp_path):
         )
         db.conn.commit()
 
-    t = query_timeline(str(db_path), user_id, "2026-05-12T11:00:00+00:00", minutes=180)
+    t = query_timeline(user_id, "2026-05-12T11:00:00+00:00", days=3 / 24)
     events = [e for e in t["events"] if e["kind"] == "cycle"]
     assert len(events) >= 2
     assert events[0]["id"] == later
@@ -590,11 +543,11 @@ def test_cycle_detail_uses_exact_native_session_name_for_same_second_cycles(tmp_
         )
 
     end_iso = (datetime.fromisoformat(now_iso) + timedelta(minutes=1)).isoformat()
-    t = query_timeline(str(db_path), user_id, end_iso, minutes=60)
+    t = query_timeline(user_id, end_iso, days=1 / 24)
     cycle_events = [e for e in t["events"] if e["kind"] == "cycle"]
     assert {e["model"] for e in cycle_events} == {"model-A", "model-B"}
     for event in cycle_events:
-        detail = query_cycle(str(db_path), user_id, event["id"])
+        detail = query_cycle(user_id, event["id"])
         assert detail is not None
         assert detail["trace"] is not None
         assert detail["trace"]["model"] == event["model"]
@@ -628,14 +581,13 @@ def test_cycle_detail_distinguishes_moved_and_held_memex(tmp_path):
             completed_at=(cycle_end + timedelta(minutes=5)).isoformat(),
         )
 
-    moved = query_cycle(str(db_path), user_id, moved_cycle_id)
-    held = query_cycle(str(db_path), user_id, held_cycle_id)
+    moved = query_cycle(user_id, moved_cycle_id)
+    held = query_cycle(user_id, held_cycle_id)
     assert moved is not None
     assert held is not None
     assert moved["cycle"]["memex_moved"] is True
     assert "new route" in moved["memex"]["content"]
     assert "new route" not in moved["prev_memex"]["content"]
-    assert held["cycle"]["memex_content_moved"] is False
     assert held["cycle"]["memex_moved"] is False
     assert held["prev_memex"]["content"] == held["memex"]["content"]
     assert "new route" in held["memex"]["content"]
@@ -663,7 +615,7 @@ def test_query_cycle_includes_failed_trace_error(tmp_path):
         session_id=session_id,
     )
 
-    detail = query_cycle(str(db_path), user_id, cycle_id)
+    detail = query_cycle(user_id, cycle_id)
     assert detail is not None
     assert detail["trace"] is not None
     assert detail["trace"]["status"] == "failed"

@@ -127,16 +127,3 @@ def test_synthesis_prompt_fails_closed_when_memex_cannot_be_read(
         pytest.raises(RuntimeError, match="private database failure"),
     ):
         build_prompt(tmp_path, db=db, user_id=user_id, now=NOW, context="synthesis")
-
-
-def test_reference_time_rule_can_be_disabled_without_removing_the_reference(
-    tmp_path: Path,
-) -> None:
-    with_directive = build_prompt(tmp_path, now=NOW)
-    without_directive = build_prompt(tmp_path, now=NOW, time_directive=False)
-    directive = "Resolve relative time against this reference time. Do not use the host clock"
-
-    assert NOW in with_directive
-    assert NOW in without_directive
-    assert directive in with_directive
-    assert directive not in without_directive

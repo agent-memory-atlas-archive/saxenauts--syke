@@ -8,7 +8,6 @@ and agents.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path
 
 from syke.config import user_control_dir
 from syke.control import list_receipts, receipt_rollup
@@ -23,7 +22,7 @@ def _hours_ago(iso_timestamp: str | None) -> float | None:
             then = then.replace(tzinfo=UTC)
         now = datetime.now(UTC)
         return round((now - then).total_seconds() / 3600, 1)
-    except (ValueError, TypeError):
+    except ValueError:
         return None
 
 
@@ -112,23 +111,16 @@ def _cycle_rollup(user_id: str) -> dict[str, float | int]:
 
 
 def _receipt_memex_moved(receipt: dict) -> bool:
-    """Read current version evidence while tolerating old MEMEX update flags."""
-    if receipt.get("status") != "completed":
-        return False
-    return isinstance(receipt.get("memex_version"), dict) or bool(receipt.get("memex_updated"))
+    return receipt.get("status") == "completed" and isinstance(receipt.get("memex_version"), dict)
 
 
 def _receipt_recovered(receipt: dict) -> bool:
     recovery = receipt.get("recovery")
-    if isinstance(recovery, dict):
-        return recovery.get("restored") is True
-    # Legacy compatibility is limited to the operational rollback verdict.
-    state_change = receipt.get("state_change")
-    return isinstance(state_change, dict) and state_change.get("graph_outcome") == "restored"
+    return isinstance(recovery, dict) and recovery.get("restored") is True
 
 
-def synthesis_health(db, user_id: str, metrics_dir: Path | None = None) -> dict:
-    _ = db, metrics_dir
+def synthesis_health(db, user_id: str) -> dict:
+    _ = db
     cycles = _recent_receipts(user_id, limit=5)
     cycle_rollup = _cycle_rollup(user_id)
     native_by_cycle = {
@@ -320,12 +312,11 @@ def _load_session_entries() -> list[dict]:
         return []
 
 
-def runtime_health(db, user_id: str, metrics_dir: Path | None = None) -> dict:
+def runtime_health(db, user_id: str) -> dict:
     from syke.daemon.daemon import is_running
     from syke.daemon.ipc import daemon_ipc_status
     from syke.metrics import runtime_metrics_status
 
-    _ = metrics_dir
     runtime_entries = _load_session_entries()
     ask_entries = [entry for entry in runtime_entries if entry.get("kind") == "ask"]
     synthesis_entries = [entry for entry in runtime_entries if entry.get("kind") == "synthesis"]
@@ -348,7 +339,7 @@ def runtime_health(db, user_id: str, metrics_dir: Path | None = None) -> dict:
 
         for tool_call in entry.get("tool_calls") or []:
             if isinstance(tool_call, dict):
-                name = tool_call.get("name") or tool_call.get("tool") or "tool"
+                name = tool_call.get("name") or "tool"
                 if isinstance(name, str):
                     tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
 

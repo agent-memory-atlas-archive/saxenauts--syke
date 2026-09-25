@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
+from syke import __version__
 from syke.control import write_receipt
 from syke.db import SykeDB
 from syke.memory.memex import update_memex
@@ -114,11 +113,7 @@ def _write_session(
     return path
 
 
-def test_self_view_exposes_authority_without_mutating_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("SYKE_DISABLE_SANDBOX", "1")
+def test_self_view_exposes_authority_without_mutating_state(tmp_path: Path) -> None:
     db, workspace, sessions = _open_state(tmp_path)
     memex_id = _add_memex(db)
     warm_memex_tokenizer()
@@ -130,12 +125,11 @@ def test_self_view_exposes_authority_without_mutating_state(
         USER_ID,
         workspace_root=workspace,
         session_dir=sessions,
-        core_version="9.9.9",
     )
 
     assert view.startswith("# Self-observation")
     for value in (
-        "Syke 9.9.9",
+        f"Syke {__version__}",
         str(workspace / "syke.db"),
         str(workspace),
         str(sessions.parent / "receipts"),

@@ -547,7 +547,7 @@ async function loadHealth() {
     const h = await api("/api/health");
     S.health = h;
     const hasHistory = !!(h.last_cycle || h.last_completed_cycle || h.memex_updated_at);
-    const blocker = h.setup_blocker || (h.onboarding && h.onboarding.blocker) || null;
+    const blocker = h.setup_blocker || null;
     if (blocker && !hasHistory) {
       $("#meta-status").textContent = "setup blocked";
       $("#meta-status").className = "pill fail";
@@ -1105,7 +1105,7 @@ function renderFirstRunMemexState() {
     : "a few minutes";
   const mode = onboarding.mode || "";
   const status = onboarding.status || "";
-  const blocker = h.setup_blocker || onboarding.blocker || null;
+  const blocker = h.setup_blocker || null;
   const blocked = !!blocker;
   const blockerReason = blocker && blocker.reason
     ? blocker.reason
