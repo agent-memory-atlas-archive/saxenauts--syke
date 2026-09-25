@@ -18,8 +18,8 @@ from syke.cli_support.auth_flow import (
     verify_provider_activation,
 )
 from syke.cli_support.exit_codes import SykeAuthException, SykeRuntimeException
-from syke.cli_support.providers import describe_provider, provider_payload, render_provider_summary
-from syke.cli_support.render import render_section, render_setup_line
+from syke.cli_support.providers import describe_provider, provider_payload
+from syke.cli_support.render import render_provider_summary, render_section, render_setup_line
 from syke.cli_support.setup_support import run_setup_stage
 from syke.llm.env import evaluate_provider_readiness
 

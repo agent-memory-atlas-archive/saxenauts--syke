@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 
-from syke.cli_support.render import render_provider_summary as _render_provider_summary
 from syke.llm.env import evaluate_provider_readiness, provider_endpoint_configured
 
 
@@ -19,10 +18,8 @@ def provider_payload(cli_provider: str | None = None) -> dict[str, object]:
             "configured": False,
             "id": None,
             "source": None,
-            "base_url": None,
             "runtime_provider": None,
             "auth_source": None,
-            "auth_configured": False,
             "model": None,
             "model_source": None,
             "endpoint": None,
@@ -52,10 +49,8 @@ def describe_provider(
             "configured": False,
             "id": provider_id,
             "source": selection_source,
-            "base_url": None,
             "runtime_provider": None,
             "auth_source": None,
-            "auth_configured": False,
             "model": None,
             "model_source": None,
             "endpoint": None,
@@ -78,21 +73,16 @@ def describe_provider(
 
     if credential is not None:
         auth_source = str(get_pi_auth_path())
-        auth_configured = True
         if credential.get("type") == "oauth":
             auth_source = f"{auth_source} (oauth)"
     elif override_has_request_auth:
         auth_source = f"{get_pi_models_path()} (request config)"
-        auth_configured = True
     elif available_models:
         auth_source = "catalog only (not daemon-safe)"
-        auth_configured = False
     elif entry.oauth:
         auth_source = "Pi native login"
-        auth_configured = False
     else:
         auth_source = "missing"
-        auth_configured = False
 
     if default_provider == provider_id and default_model:
         model = default_model
@@ -125,20 +115,14 @@ def describe_provider(
         "configured": readiness.ready,
         "id": provider_id,
         "source": selection_source,
-        "base_url": endpoint,
         "runtime_provider": provider_id,
         "auth_source": auth_source,
-        "auth_configured": auth_configured,
         "model": model,
         "model_source": model_source,
         "endpoint": endpoint,
         "endpoint_source": endpoint_source,
         "error": None if readiness.ready else readiness.detail,
     }
-
-
-def render_provider_summary(provider_info: dict[str, object], *, indent: str = "") -> None:
-    _render_provider_summary(provider_info, indent=indent)
 
 
 def resolve_source(cli_provider: str | None) -> str:

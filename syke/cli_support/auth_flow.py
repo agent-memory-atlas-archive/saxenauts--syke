@@ -22,20 +22,7 @@ class FlowChoice:
 
 
 def term_menu_select(entries: list[str], title: str, default_index: int = 0) -> int | None:
-    """Arrow-key selection menu with non-TTY fallback."""
-    if not sys.stdin.isatty():
-        for i, entry in enumerate(entries, 1):
-            click.echo(f"  [{i}] {entry}")
-        try:
-            pick = click.prompt(
-                "  Select",
-                type=click.IntRange(1, len(entries)),
-                default=default_index + 1,
-            )
-            return pick - 1
-        except (click.Abort, EOFError):
-            return None
-
+    """Arrow-key selection menu; callers are TTY-gated."""
     try:
         from simple_term_menu import TerminalMenu
 
@@ -160,26 +147,10 @@ def term_menu_select_many(
         return sorted(set(picks))
 
 
-def choose_provider_interactive(
-    choices: list[dict[str, object]] | None = None,
-) -> FlowChoice:
-    from syke.cli_support.setup_support import setup_provider_choices
+def choose_provider_interactive(choices: list[dict[str, object]]) -> FlowChoice:
     from syke.pi_state import get_default_provider
 
     current_active = get_default_provider()
-    choices = choices or setup_provider_choices()
-
-    if not sys.stdin.isatty():
-        console.print("\n  Detected providers:")
-        for item in choices:
-            tag = "[green]ready[/green]" if item["ready"] else "[yellow]not ready[/yellow]"
-            active = " (active)" if item["id"] == current_active and item["ready"] else ""
-            console.print(f"    [{tag}]  {item['id']}  — {item['label']}{active}")
-        console.print(
-            "\n  [dim]No provider selected."
-            " Use --provider <id> to choose, or run interactively.[/dim]"
-        )
-        return FlowChoice("cancelled")
 
     entries: list[str] = []
     for item in choices:
@@ -347,11 +318,11 @@ def resolve_provider_auth_interactive(provider_id: str) -> FlowChoice:
             return FlowChoice("back")
 
 
-def ensure_setup_pi_runtime() -> tuple[str, str]:
+def ensure_setup_pi_runtime() -> None:
     try:
         from syke.llm.pi_client import ensure_pi_binary, get_pi_version
 
-        pi_path = ensure_pi_binary()
+        ensure_pi_binary()
         ver = get_pi_version(install=False)
     except (OSError, RuntimeError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
         console.print(f"  [red]✗[/red]  Pi runtime: {exc}")
@@ -361,7 +332,6 @@ def ensure_setup_pi_runtime() -> tuple[str, str]:
         ) from exc
 
     console.print(f"  [green]✓[/green] Pi v{ver}")
-    return str(pi_path), str(ver)
 
 
 def resolve_activation_model(provider_id: str, *, explicit_model: str | None = None) -> str:
@@ -444,16 +414,13 @@ def verify_provider_activation(provider_id: str, model_id: str) -> str:
     return detail
 
 
-def run_interactive_provider_flow(
-    *,
-    initial_provider_id: str | None = None,
-) -> FlowChoice:
+def run_interactive_provider_flow() -> FlowChoice:
     from syke.cli_support.setup_support import run_setup_stage, setup_provider_choices
     from syke.pi_state import set_default_provider_and_model
 
     choices = run_setup_stage("Loading providers...", setup_provider_choices)
-    provider_id = initial_provider_id
-    stage = "provider" if provider_id is None else "auth"
+    provider_id: str | None = None
+    stage = "provider"
 
     while True:
         if stage == "provider":

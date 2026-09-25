@@ -50,7 +50,6 @@ def test_setup_json_is_inspect_only(tmp_path: Path) -> None:
     parsed = json.loads(result.stdout)
     assert parsed["mode"] == "inspect"
     assert parsed["user"] == "test"
-    assert all(point["id"] != "daemon" for point in parsed["consent_points"])
     assert not (home / ".syke").exists()
 
 
@@ -58,7 +57,6 @@ def test_setup_noninteractive_without_provider_returns_auth_exit(cli_runner) -> 
     payload = {
         "provider": {"configured": False},
         "sources": [],
-        "trust": {"sources": [], "targets": []},
         "setup_targets": [],
         "daemon": {"platform": "Darwin", "installable": False, "running": False},
     }
@@ -67,7 +65,7 @@ def test_setup_noninteractive_without_provider_returns_auth_exit(cli_runner) -> 
         patch("syke.cli_commands.setup.build_setup_inspect_payload", return_value=payload),
         patch("syke.cli_commands.setup.render_setup_inspect_summary"),
         patch("syke.cli_commands.setup.run_setup_stage", side_effect=lambda _label, fn: fn()),
-        patch("syke.cli_commands.setup.ensure_setup_pi_runtime", return_value=("pi", "1.0.0")),
+        patch("syke.cli_commands.setup.ensure_setup_pi_runtime"),
         patch("syke.cli_commands.setup.sys.stdin.isatty", return_value=False),
         patch("syke.cli_commands.setup.run_interactive_provider_flow") as provider_flow,
     ):
@@ -86,7 +84,6 @@ def test_setup_runtime_failure_uses_runtime_exit_code(cli_runner) -> None:
         "sources": [
             {"source": "codex", "roots": [], "files_found": 1, "detected": True},
         ],
-        "trust": {"sources": [], "targets": []},
         "setup_targets": [],
         "daemon": {"platform": "Darwin", "installable": False, "running": False},
     }
@@ -416,13 +413,6 @@ def test_setup_agent_source_flag_limits_ingestion(cli_runner) -> None:
     assert parsed["total_files"] == 5
     assert parsed["onboarding"]["selected_sources"] == ["codex"]
     launch_onboarding.assert_called_once_with(user_id="test", selected_sources=["codex"])
-
-
-def test_setup_rejects_removed_skip_daemon_option(cli_runner) -> None:
-    result = cli_runner.invoke(cli, ["setup", "--agent", "--skip-daemon"])
-
-    assert result.exit_code == 2
-    assert "No such option: --skip-daemon" in result.output
 
 
 def test_setup_agent_source_flag_rejects_undetected_source(cli_runner) -> None:

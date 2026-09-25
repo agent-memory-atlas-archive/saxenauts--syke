@@ -20,57 +20,7 @@ def run_setup_stage(label: str, fn):
         return fn()
 
 
-def trust_payload(user_id: str) -> dict[str, list[dict[str, str]]]:
-    import platform
-
-    from syke.daemon.daemon import LOG_PATH, PLIST_PATH, SYSTEMD_UNIT_PATH
-    from syke.distribution.context_files import capability_target_paths
-    from syke.pi_state import (
-        get_pi_agent_dir,
-        get_pi_auth_path,
-        get_pi_models_path,
-        get_pi_settings_path,
-    )
-    from syke.runtime import workspace as workspace_module
-    from syke.runtime.locator import SYKE_BIN
-
-    sources: list[dict[str, str]] = []
-    for desc in active_sources():
-        if desc.discover is None:
-            continue
-        for root in desc.discover.roots:
-            sources.append({"source": desc.source, "path": str(Path(root.path).expanduser())})
-
-    targets: list[dict[str, str]] = [
-        {"kind": "user_data", "path": str(workspace_module.SYKE_ROOT)},
-        {"kind": "workspace", "path": str(workspace_module.WORKSPACE_ROOT)},
-        {"kind": "control", "path": str(workspace_module.CONTROL_ROOT)},
-        {"kind": "native_sessions", "path": str(workspace_module.SESSIONS_DIR)},
-        {"kind": "host_receipts", "path": str(workspace_module.RECEIPTS_DIR)},
-        {"kind": "incoming_records", "path": str(workspace_module.RECORDS_DIR)},
-        {"kind": "pi_agent_dir", "path": str(get_pi_agent_dir())},
-        {"kind": "pi_auth", "path": str(get_pi_auth_path())},
-        {"kind": "pi_settings", "path": str(get_pi_settings_path())},
-        {"kind": "pi_models", "path": str(get_pi_models_path())},
-        {"kind": "launcher", "path": str(SYKE_BIN)},
-        {"kind": "daemon_log", "path": str(LOG_PATH)},
-        {"kind": "memex_export", "path": str(workspace_module.MEMEX_PATH)},
-    ]
-    targets.extend(
-        {"kind": "capability_file", "path": str(path)} for path in capability_target_paths()
-    )
-
-    if platform.system() == "Darwin":
-        targets.append({"kind": "launch_agent", "path": str(PLIST_PATH)})
-    elif platform.system() == "Linux":
-        targets.append({"kind": "systemd_user_service", "path": str(SYSTEMD_UNIT_PATH)})
-    else:
-        targets.append({"kind": "manual_daemon", "path": "syke daemon run"})
-
-    return {"sources": sources, "targets": targets}
-
-
-def setup_source_inventory(user_id: str) -> list[dict[str, object]]:
+def setup_source_inventory() -> list[dict[str, object]]:
     from datetime import UTC, datetime
 
     sources: list[dict[str, object]] = []
@@ -277,15 +227,6 @@ def setup_daemon_viability_payload() -> dict[str, object]:
     }
 
 
-def _build_next_steps(provider: dict[str, object]) -> list[str]:
-    """Actionable commands an agent should run to complete setup non-interactively."""
-    steps: list[str] = []
-    if not provider.get("configured"):
-        steps.append("syke auth set <provider> --api-key <KEY> --use")
-    steps.append("syke setup --yes")
-    return steps
-
-
 def build_setup_inspect_payload(*, user_id: str, cli_provider: str | None) -> dict[str, object]:
     from syke.daemon.ipc import daemon_runtime_status
     from syke.runtime.macos_filesystem_access import macos_filesystem_access_status
@@ -294,9 +235,8 @@ def build_setup_inspect_payload(*, user_id: str, cli_provider: str | None) -> di
 
     provider = provider_payload(cli_provider)
     providers = setup_provider_choices()
-    sources = setup_source_inventory(user_id)
+    sources = setup_source_inventory()
     selected_sources = get_selected_sources(user_id)
-    trust = trust_payload(user_id)
     runtime = setup_runtime_payload()
     daemon = setup_daemon_viability_payload()
     warm_runtime = daemon_runtime_status(user_id)
@@ -308,82 +248,6 @@ def build_setup_inspect_payload(*, user_id: str, cli_provider: str | None) -> di
     filesystem_read_roots = list(sandbox_read_paths()) if filesystem_sandboxed else None
     protected_folders = macos_filesystem_access_status()
 
-    detected_sources = [item["source"] for item in sources if item["detected"]]
-    proposed_actions: list[dict[str, object]] = [
-        {
-            "id": "bootstrap_source_readers",
-            "description": "Bootstrap or repair detected source readers before ingest when needed.",
-        }
-    ]
-    consent_points: list[dict[str, object]] = []
-
-    if detected_sources:
-        proposed_actions.append(
-            {
-                "id": "connect_sources",
-                "description": "Connect selected detected sources for synthesis and ask context.",
-                "sources": detected_sources,
-            }
-        )
-
-    if protected_folders.get("applicable") and not protected_folders.get("ok"):
-        proposed_actions.append(
-            {
-                "id": "verify_macos_protected_folders",
-                "description": (
-                    "Request and verify background access to Desktop, Documents, and Downloads."
-                ),
-            }
-        )
-        consent_points.append(
-            {
-                "id": "macos_protected_folders",
-                "question": (
-                    "Allow background Syke to request read access to Desktop, Documents, "
-                    "and Downloads?"
-                ),
-                "options": ["allow", "deny"],
-                "default": "allow",
-            }
-        )
-
-    proposed_actions.append(
-        {
-            "id": "initial_synthesis",
-            "description": (
-                "Run initial synthesis immediately when a provider is ready "
-                "and setup creates or changes state."
-            ),
-        }
-    )
-
-    if not provider.get("configured"):
-        consent_points.append(
-            {
-                "id": "provider",
-                "question": "Choose a provider before synthesis can run.",
-                "options": [item["id"] for item in providers],
-                "default": None,
-            }
-        )
-    if detected_sources:
-        consent_points.append(
-            {
-                "id": "sources",
-                "question": "Choose which detected sources to connect during setup.",
-                "options": detected_sources,
-                "default": detected_sources,
-            }
-        )
-    if daemon.get("installable") and not daemon.get("running"):
-        proposed_actions.append(
-            {
-                "id": "background_service",
-                "description": (
-                    "Install the background service for sync, warm ask, and timeline UI."
-                ),
-            }
-        )
     return {
         "ok": True,
         "schema_version": 1,
@@ -401,19 +265,10 @@ def build_setup_inspect_payload(*, user_id: str, cli_provider: str | None) -> di
                 ["syke_workspace", "syke_runtime"] if filesystem_sandboxed else None
             ),
         },
-        "trust": trust,
         "setup_targets": setup_targets,
         "runtime": runtime,
         "daemon": daemon,
         "daemon_runtime": warm_runtime,
-        "proposed_actions": proposed_actions,
-        "consent_points": consent_points,
-        "next_steps": _build_next_steps(provider),
-        "next_commands": [
-            "syke auth status",
-            "syke status --json",
-            "syke doctor",
-        ],
     }
 
 
@@ -508,11 +363,7 @@ def render_setup_inspect_summary(info: dict[str, object]) -> None:
         console.print("    · start background service")
 
     # Writes — collapsed to one line with count
-    setup_targets = cast(
-        list[dict[str, str]],
-        info.get("setup_targets")
-        or cast(dict[str, object], info.get("trust") or {}).get("targets", []),
-    )
+    setup_targets = cast(list[dict[str, str]], info.get("setup_targets") or [])
     console.print(f"\n  {len(setup_targets)} planned write targets")
 
 
@@ -536,7 +387,6 @@ def choose_setup_sources_interactive(sources: list[dict[str, object]]) -> list[s
     selected = term_menu_select_many(
         entries,
         title="\n  Select sources to connect (newest first):\n",
-        default_indices=list(range(len(entries))),
     )
     if selected is None:
         raise click.Abort()
