@@ -212,23 +212,17 @@ def observe(ctx: click.Context, use_json: bool, watch: bool, days: int) -> None:
 
 
 @click.command(short_help="Verify auth, runtime, DB, daemon, and memex health.")
-@click.option(
-    "--network",
-    is_flag=True,
-    help="Inspect provider network env readiness; does not make a live API request",
-)
 @click.option("--json", "use_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def doctor(ctx: click.Context, network: bool, use_json: bool) -> None:
+def doctor(ctx: click.Context, use_json: bool) -> None:
     payload = build_doctor_payload(
         ctx,
-        network=network,
         verify_filesystem=not use_json and sys.stdin.isatty(),
     )
     if use_json:
         click.echo(json.dumps(payload, indent=2))
     else:
-        render_doctor_payload(payload, network=network)
+        render_doctor_payload(payload)
     if not payload.get("ok", False):
         ctx.exit(1)
 

@@ -170,15 +170,6 @@ def _run_agent_setup(
 
     rerun_command = _agent_setup_command(selected_sources_cli=selected_sources_cli)
 
-    # Check Pi runtime (suppress console output)
-    import logging as _logging
-
-    syke_logger = _logging.getLogger("syke")
-    muted_handlers: list[tuple[_logging.Handler, int]] = []
-    for h in syke_logger.handlers:
-        if isinstance(h, _logging.StreamHandler) and not isinstance(h, _logging.FileHandler):
-            muted_handlers.append((h, h.level))
-            h.setLevel(_logging.CRITICAL)
     try:
         from syke.llm.pi_client import ensure_pi_binary, get_pi_version
 
@@ -200,9 +191,6 @@ def _run_agent_setup(
             "error": f"Unexpected runtime preparation failure: {exc}",
             "exit_code": 1,
         }
-    finally:
-        for handler, level in muted_handlers:
-            handler.setLevel(level)
 
     try:
         inspect_info = build_setup_inspect_payload(user_id=user_id, cli_provider=cli_provider)
