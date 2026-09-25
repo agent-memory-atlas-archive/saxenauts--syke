@@ -57,10 +57,15 @@ def config_show(ctx: click.Context, raw: bool) -> None:
         return
 
     console.print("[bold]syke config[/bold]")
-    console.print(
-        f"  [dim]File:[/dim] {CONFIG_PATH}"
-        + (" [green](loaded)[/green]" if CONFIG_PATH.exists() else " [dim](defaults)[/dim]")
-    )
+    from syke import config_file
+
+    if config_file.LOAD_ERROR:
+        state = f" [red](invalid, using defaults: {config_file.LOAD_ERROR})[/red]"
+    elif CONFIG_PATH.exists():
+        state = " [green](loaded)[/green]"
+    else:
+        state = " [dim](defaults)[/dim]"
+    console.print(f"  [dim]File:[/dim] {CONFIG_PATH}{state}")
     console.print()
 
     provider_id, provider_source, provider_details = _resolve_provider_display()

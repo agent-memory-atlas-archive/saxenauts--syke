@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 
 def test_network_probe_reports_not_ready_without_live_probe(monkeypatch) -> None:
     from syke.cli_support import doctor
@@ -27,3 +29,21 @@ def test_network_probe_reports_not_ready_without_live_probe(monkeypatch) -> None
     assert payload["ok"] is False
     assert payload["live_probe"] is False
     assert "missing OPENAI_API_KEY" in str(payload["detail"])
+
+
+@pytest.mark.parametrize(
+    ("assessment", "healthy"),
+    [
+        ("active", True),
+        ("recent", True),
+        ("idle", True),
+        ("stale", False),
+        ("degraded", False),
+        ("never_run", False),
+        ("unknown", False),
+    ],
+)
+def test_doctor_treats_overnight_idle_synthesis_as_healthy(assessment: str, healthy: bool) -> None:
+    from syke.cli_support.doctor import synthesis_assessment_is_healthy
+
+    assert synthesis_assessment_is_healthy(assessment) is healthy

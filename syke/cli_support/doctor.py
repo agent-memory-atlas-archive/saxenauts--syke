@@ -81,6 +81,16 @@ def network_probe_payload(ctx) -> dict[str, object]:
     }
 
 
+# "idle" (6-24h since the last cycle) is normal for a laptop that slept
+# overnight; the daemon catches up on wake. Only genuinely stale, degraded,
+# or never-run synthesis is a doctor failure, matching the daemon's own view.
+HEALTHY_SYNTHESIS_ASSESSMENTS = frozenset({"active", "recent", "idle"})
+
+
+def synthesis_assessment_is_healthy(assessment: object) -> bool:
+    return assessment in HEALTHY_SYNTHESIS_ASSESSMENTS
+
+
 def build_doctor_payload(
     ctx,
     *,
@@ -299,7 +309,7 @@ def build_doctor_payload(
             _add_check(
                 "synthesis",
                 "Synthesis",
-                sh["assessment"] in ("active", "recent"),
+                synthesis_assessment_is_healthy(sh["assessment"]),
                 f"{sh['last_run_ago']} ({sh['assessment']})",
                 assessment=sh["assessment"],
             )

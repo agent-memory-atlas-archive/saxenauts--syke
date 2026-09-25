@@ -27,11 +27,13 @@ def _detect_system_tz() -> tzinfo:
 
 
 def resolve_user_tz() -> tzinfo:
-    """Resolve user timezone. Precedence: SYKE_TIMEZONE env > auto-detect.
+    """Resolve user timezone. Precedence: SYKE_TIMEZONE env > config.toml > auto-detect.
 
-    Falls back to auto-detect if the env value is not a valid IANA timezone.
+    Falls back to auto-detect if the value is not a valid IANA timezone.
     """
-    raw = os.getenv(SYKE_TIMEZONE_ENV, "auto").strip()
+    from syke.config import CFG
+
+    raw = (os.getenv(SYKE_TIMEZONE_ENV) or CFG.timezone or "auto").strip()
     if raw.lower() in ("", "auto", "local", "system"):
         return _detect_system_tz()
     try:
@@ -40,6 +42,6 @@ def resolve_user_tz() -> tzinfo:
         import logging
 
         logging.getLogger(__name__).warning(
-            "Invalid SYKE_TIMEZONE '%s', falling back to auto-detect", raw
+            "Invalid timezone '%s', falling back to auto-detect", raw
         )
         return _detect_system_tz()

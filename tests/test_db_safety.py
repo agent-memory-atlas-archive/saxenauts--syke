@@ -11,7 +11,7 @@ import pytest
 
 import syke.db_safety as db_safety
 from syke.config import user_control_dir
-from syke.control import get_receipt, write_receipt
+from syke.control import get_receipt, receipt_path, write_receipt
 from syke.db import SykeDB
 from syke.db_access import DatabaseLeaseUnavailable, acquire_database_lease
 from syke.db_safety import (
@@ -692,6 +692,49 @@ def test_reconciliation_never_restores_over_any_final_receipt(
             == "accepted current"
         )
     assert db_safety.load_recovery_in_progress(user_id) is None
+
+
+def test_reconciliation_refuses_to_restore_over_an_unreadable_receipt(
+    tmp_path,
+    user_id: str,
+) -> None:
+    db_path = tmp_path / "syke.db"
+    with SykeDB(db_path, user_id=user_id) as db:
+        update_memex(db, user_id, "accepted memex")
+        _seed_memory(db, user_id, "mem-a", "accepted memory")
+        point = create_recovery_point(
+            db,
+            user_id,
+            run_id="run-unreadable",
+            cycle_id="cycle-unreadable",
+            baseline=capture_baseline(db, user_id),
+        )
+        db_safety.mark_recovery_in_progress(
+            point,
+            started_at="2026-08-10T10:00:00+00:00",
+        )
+        db.conn.execute("UPDATE memories SET content = 'accepted current' WHERE id = 'mem-a'")
+        db.conn.commit()
+
+    broken = receipt_path(user_control_dir(user_id), "cycle-unreadable")
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="unreadable"):
+        db_safety.reconcile_interrupted_synthesis(
+            user_id,
+            memex_path=tmp_path / "MEMEX.md",
+            expected_db_path=db_path,
+        )
+
+    with SykeDB(db_path, user_id=user_id) as current:
+        assert (
+            current.conn.execute("SELECT content FROM memories WHERE id = 'mem-a'").fetchone()[
+                "content"
+            ]
+            == "accepted current"
+        )
+    assert db_safety.load_recovery_in_progress(user_id) is not None
 
 
 def test_reconciliation_without_a_marker_does_not_restore_a_recovery_copy(

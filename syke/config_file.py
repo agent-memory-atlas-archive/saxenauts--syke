@@ -15,6 +15,10 @@ log = logging.getLogger(__name__)
 CONFIG_PATH = Path.home() / ".syke" / "config.toml"
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
+# Set when the config file exists but could not be used, so `syke config show`
+# can say "defaults" honestly instead of "loaded".
+LOAD_ERROR: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Typed config sections (frozen dataclasses)
@@ -202,14 +206,10 @@ def load_config(path: Path | None = None) -> SykeConfig:
                 paths=cfg.paths,
             )
         return cfg
-    except tomllib.TOMLDecodeError as e:
-        log.error("Failed to parse %s: %s — using defaults", config_path, e)
-        return SykeConfig(user=getpass.getuser())
-    except OSError as e:
-        log.warning("Cannot read %s: %s — using defaults", config_path, e)
-        return SykeConfig(user=getpass.getuser())
-    except (TypeError, ValueError) as e:
-        log.error("Invalid configuration in %s: %s — using defaults", config_path, e)
+    except (tomllib.TOMLDecodeError, OSError, TypeError, ValueError) as e:
+        global LOAD_ERROR
+        LOAD_ERROR = str(e)
+        log.error("Cannot use %s: %s — using defaults", config_path, e)
         return SykeConfig(user=getpass.getuser())
 
 

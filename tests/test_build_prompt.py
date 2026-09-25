@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from syke.db import SykeDB
 from syke.memory.memex import update_memex
 from syke.memory.memex_budget import warm_memex_tokenizer
@@ -110,6 +112,21 @@ def test_prompt_dependency_failures_degrade_without_disclosing_exceptions(
     assert "private database failure" not in memex_failure
     assert "# Operation" in self_view_failure
     assert "# Operation" in memex_failure
+
+
+def test_synthesis_prompt_fails_closed_when_memex_cannot_be_read(
+    tmp_path: Path,
+    db: SykeDB,
+    user_id: str,
+) -> None:
+    with (
+        patch(
+            "syke.memory.memex.get_memex_for_injection",
+            side_effect=RuntimeError("private database failure"),
+        ),
+        pytest.raises(RuntimeError, match="private database failure"),
+    ):
+        build_prompt(tmp_path, db=db, user_id=user_id, now=NOW, context="synthesis")
 
 
 def test_reference_time_rule_can_be_disabled_without_removing_the_reference(

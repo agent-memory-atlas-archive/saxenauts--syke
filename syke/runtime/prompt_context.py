@@ -81,6 +81,10 @@ def _build_memex_block(
         if raw and raw.strip():
             content = raw.strip()
     except Exception:
+        if context != "ask":
+            # Synthesis must not be told to reconstruct MEMEX because a read
+            # failed; that would invite rewriting accepted state. Fail closed.
+            raise
         logger.warning("Unable to render the accepted MEMEX", exc_info=True)
     measurement = measure_memex(content)
 

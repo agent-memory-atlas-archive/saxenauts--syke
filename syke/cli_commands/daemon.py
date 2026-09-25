@@ -13,6 +13,7 @@ from syke import __version__
 from syke.cli_support import daemon_state
 from syke.cli_support.installers import detect_install_method
 from syke.cli_support.render import console
+from syke.config import DAEMON_INTERVAL
 
 
 def _compact_timestamp(raw: object) -> str:
@@ -37,8 +38,9 @@ def daemon(ctx: click.Context) -> None:
 @click.option(
     "--interval",
     type=int,
-    default=900,
-    help="Sync interval in seconds (default: 900 = 15 min)",
+    default=DAEMON_INTERVAL,
+    show_default=True,
+    help="Sync interval in seconds (config daemon.interval)",
 )
 @click.pass_context
 def daemon_start(ctx: click.Context, interval: int) -> None:
@@ -314,8 +316,9 @@ def daemon_status_cmd(ctx: click.Context, use_json: bool) -> None:
 @click.option(
     "--interval",
     type=int,
-    default=900,
-    help="Cycle interval in seconds (default: 900 = 15 min)",
+    default=DAEMON_INTERVAL,
+    show_default=True,
+    help="Cycle interval in seconds (config daemon.interval)",
 )
 @click.pass_context
 def daemon_run(ctx: click.Context, interval: int) -> None:

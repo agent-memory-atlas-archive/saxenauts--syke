@@ -23,6 +23,7 @@ from syke.control import (
     _safe_id,
     _write_json_once,
     get_receipt,
+    receipt_path,
     write_receipt,
 )
 from syke.db import GRAPH_IDENTITY_TABLES, SCHEMA_VERSION, _validate_current_schema
@@ -307,6 +308,15 @@ def _make_db_file_stable(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _fsync_file(path: Path) -> None:
+    """Force a freshly copied file's bytes to disk before it is renamed into place."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _try_copy_on_write_clone(source: Path, destination: Path) -> bool:
     if sys.platform != "darwin":
         return False
@@ -485,6 +495,7 @@ def create_recovery_point(
         tmp_backup_path,
         max_full_copy_fallback_bytes=max_full_copy_fallback_bytes,
     )
+    _fsync_file(tmp_backup_path)
     os.replace(tmp_backup_path, backup_path)
     _fsync_directory(recovery_dir)
     size_bytes = backup_path.stat().st_size
@@ -591,6 +602,7 @@ def restore_recovery_point(
                 _require_sqlite_ok(tmp_path, "Recovery candidate")
             for suffix in ("-wal", "-shm"):
                 _unlink_if_exists(Path(f"{db_path}{suffix}"))
+            _fsync_file(tmp_path)
             os.replace(tmp_path, db_path)
             _fsync_directory(db_path.parent)
             restored_checks = _require_sqlite_ok(db_path, "Restored database")
@@ -814,6 +826,13 @@ def reconcile_interrupted_synthesis(
 
     control_dir = user_control_dir(user_id)
     receipt = get_receipt(control_dir, marker.cycle_id)
+    if receipt is None and receipt_path(control_dir, marker.cycle_id).exists():
+        # A receipt that exists but cannot be read is not evidence that the
+        # cycle never finished. Restoring over it could discard accepted state.
+        raise RuntimeError(
+            f"Final receipt for cycle {marker.cycle_id} exists but is unreadable; "
+            "refusing to restore the recovery point"
+        )
     if isinstance(receipt, dict) and receipt.get("status") in FINAL_RECEIPT_STATUSES:
         clear_recovery_in_progress(user_id, cycle_id=marker.cycle_id)
         return {"action": "finalized", "cycle_id": marker.cycle_id}

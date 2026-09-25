@@ -173,7 +173,7 @@ function modelToolShell() {
 const sandboxedBashCommand = [
   "exec /usr/bin/sandbox-exec",
   '-f "$SYKE_TOOL_SANDBOX_PROFILE"',
-  '"$SYKE_TOOL_SHELL" -lc "$SYKE_TOOL_COMMAND"',
+  '"$SYKE_TOOL_SHELL" -c "$SYKE_TOOL_COMMAND"',
 ].join(" ");
 
 function sandboxedBashSpawn({ command, cwd, env }) {

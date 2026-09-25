@@ -190,6 +190,11 @@ class DaemonAskWorkerSupervisor:
         except TimeoutError as exc:
             self._kill_child(child)
             raise DaemonAskWorkerError(str(exc)) from exc
+        except BaseException:
+            # A malformed or error message must not leave the child running
+            # untracked; it would keep its Pi ask alive after we stop watching.
+            self._kill_child(child)
+            raise
         finally:
             with self._lock:
                 self._children.discard(child)

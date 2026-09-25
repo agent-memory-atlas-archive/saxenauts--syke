@@ -25,10 +25,7 @@ from typing import Any
 
 from uuid_extensions import uuid7
 
-from syke.config import (
-    CFG,
-    FIRST_RUN_SYNC_TIMEOUT,
-)
+from syke.config import FIRST_RUN_SYNC_TIMEOUT, SYNC_TIMEOUT
 from syke.control import (
     get_receipt,
     list_receipts,
@@ -1028,11 +1025,9 @@ def pi_synthesize(
             )
 
         # ── 5. Send to Pi runtime ──
-        timeout = 300.0  # 5 minutes default
+        timeout = float(SYNC_TIMEOUT)
         if timeout_override is not None and timeout_override > 0:
             timeout = timeout_override
-        elif CFG and hasattr(CFG, "synthesis") and CFG.synthesis:
-            timeout = float(getattr(CFG.synthesis, "timeout", 300))
         if is_first_run:
             timeout = max(timeout, float(FIRST_RUN_SYNC_TIMEOUT))
         # Wall-clock cycle budget: monotonic clocks freeze during system

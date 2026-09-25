@@ -60,6 +60,43 @@ print(json.dumps({
     assert isinstance(metadata["worker_slot_wait_ms"], int)
 
 
+def test_daemon_ask_worker_supervisor_kills_child_after_malformed_output(tmp_path) -> None:
+    script = """
+import sys
+import time
+
+sys.stdin.read()
+print("not json", flush=True)
+time.sleep(30)
+"""
+    supervisor = DaemonAskWorkerSupervisor(
+        max_workers=1,
+        command=[sys.executable, "-c", script],
+    )
+    started: list[object] = []
+    original_start = supervisor._start_child
+
+    def _tracking_start():
+        child = original_start()
+        started.append(child)
+        return child
+
+    supervisor._start_child = _tracking_start  # type: ignore[method-assign]
+
+    with pytest.raises(DaemonAskWorkerError, match="invalid ask worker JSON"):
+        supervisor.ask(
+            user_id="test",
+            syke_db_path=str(tmp_path / "syke.db"),
+            question="what changed",
+            on_event=None,
+            transport_details={},
+        )
+
+    assert len(started) == 1
+    assert started[0].poll() is not None
+    assert not supervisor._children
+
+
 def test_daemon_ask_worker_supervisor_enforces_capacity() -> None:
     supervisor = DaemonAskWorkerSupervisor(max_workers=1, capacity_wait_s=0.0)
     assert supervisor._semaphore is not None
