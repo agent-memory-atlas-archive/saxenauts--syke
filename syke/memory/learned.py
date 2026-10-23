@@ -1,39 +1,111 @@
-"""One bounded current learned-language memory."""
+"""Syke's operating notes file, shown in every fresh operation.
+
+``workspace/OPERATING.md`` is Syke's own text, edited with its ordinary file
+tools. The host reads it into the prompt, holds a wake to its size limit,
+and, once, seeds it from the
+older ``syke-learned`` memory row. That row is now an ordinary memory.
+"""
 
 from __future__ import annotations
 
-import sqlite3
-from contextlib import closing
-from datetime import UTC, datetime
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
-from syke.memory.memex_budget import MEMEX_TOKEN_ENCODING, count_memex_tokens
+from syke.memory.memex_budget import MEMEX_TOKEN_ENCODING, _memex_encoding
 
 LEARNED_MEMORY_ID = "syke-learned"
-LEARNED_PROJECTION_TOKEN_LIMIT = 1_000
-
-
-def render_learned_projection(content: str) -> str:
-    """Render non-empty learned language as its complete prompt section."""
-    body = content.strip()
-    return f"# Learned\n\n{body}" if body else ""
+OPERATING_NOTES_FILENAME = "OPERATING.md"
+OPERATING_NOTES_TOKEN_LIMIT = 6_000
+OPERATING_NOTES_SEEDED_MARKER = "operating-notes-seeded"
 
 
 def measure_learned_projection(content: str) -> dict[str, int | str | bool]:
-    """Measure the complete learned section against its hard prompt budget."""
-    tokens = count_memex_tokens(render_learned_projection(content))
+    """Measure text against the operating-notes display bound.
+
+    Kept for compatibility: Syke's own stored procedures import this name.
+    It used to measure the ``syke-learned`` row against a hard 1,000-token
+    limit. It now measures any text, such as the contents of OPERATING.md,
+    against the 6,000-token limit. A wake that ends with OPERATING.md over it
+    is rejected and sent back to fix it, unless the file was already over at
+    the start and did not grow.
+    """
+    tokens = len(_memex_encoding().encode_ordinary(content.strip()))
     return {
         "tokens": tokens,
-        "limit": LEARNED_PROJECTION_TOKEN_LIMIT,
+        "limit": OPERATING_NOTES_TOKEN_LIMIT,
         "encoding": MEMEX_TOKEN_ENCODING,
-        "fill_pct": min(100, round(tokens / LEARNED_PROJECTION_TOKEN_LIMIT * 100)),
-        "over_budget": tokens > LEARNED_PROJECTION_TOKEN_LIMIT,
+        "fill_pct": min(100, round(tokens / OPERATING_NOTES_TOKEN_LIMIT * 100)),
+        "over_budget": tokens > OPERATING_NOTES_TOKEN_LIMIT,
     }
 
 
+def operating_notes_path(workspace_root: Path) -> Path:
+    return workspace_root.expanduser().resolve() / OPERATING_NOTES_FILENAME
+
+
+def read_operating_notes(workspace_root: Path) -> str:
+    path = operating_notes_path(workspace_root)
+    expected = path.lstat()
+    if not stat.S_ISREG(expected.st_mode):
+        raise OSError("Operating notes must be a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(path, flags), encoding="utf-8") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            raise OSError("Operating notes changed before they could be read")
+        return handle.read()
+
+
+def operating_notes_tokens(workspace_root: Path) -> int | None:
+    """Token count of OPERATING.md; 0 when absent, None when it can't be read."""
+    try:
+        body = read_operating_notes(workspace_root)
+    except FileNotFoundError:
+        return 0
+    except (OSError, UnicodeDecodeError):
+        return None
+    return int(measure_learned_projection(body)["tokens"])
+
+
+def render_operating_notes_block(workspace_root: Path) -> str:
+    """Render the operating notes prompt section without writing anything."""
+    path = operating_notes_path(workspace_root)
+    try:
+        body = read_operating_notes(workspace_root).strip()
+    except FileNotFoundError:
+        body = ""
+    except (OSError, UnicodeDecodeError):
+        return f"# Operating notes\n\n`{path}` exists but could not be read for this run."
+    if not body:
+        return (
+            "# Operating notes\n\n"
+            f"There are no operating notes yet. They live at `{path}` and are yours to write."
+        )
+
+    encoding = _memex_encoding()
+    tokens = encoding.encode_ordinary(body)
+    if len(tokens) <= OPERATING_NOTES_TOKEN_LIMIT:
+        return f"# Operating notes\n\nFrom `{path}`:\n\n{body}"
+    shown = encoding.decode(tokens[:OPERATING_NOTES_TOKEN_LIMIT])
+    last_break = shown.rfind("\n")
+    if last_break > len(shown) // 2:
+        shown = shown[:last_break]
+    shown = shown.rstrip()
+    remaining = len(tokens) - len(encoding.encode_ordinary(shown))
+    return (
+        f"# Operating notes\n\nFrom `{path}`:\n\n{shown}\n\n"
+        f"(About {remaining:,} more tokens of this file are not shown here. "
+        f"The full file is `{path}`.)"
+    )
+
+
 def get_learned_memory(db: Any, user_id: str) -> dict[str, Any] | None:
-    """Return the one memory selected for learned-language projection."""
+    """Return the older ``syke-learned`` memory row, if it still exists."""
     row = db.conn.execute(
         """SELECT id, user_id, content, created_at, updated_at
            FROM memories
@@ -43,93 +115,32 @@ def get_learned_memory(db: Any, user_id: str) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
-def get_valid_learned_memory_from_path(
-    db_path: str | Path,
-    user_id: str,
-) -> dict[str, Any] | None:
-    """Read one committed learned row that is safe to project after recovery."""
-    path = Path(db_path).expanduser().resolve()
-    uri = f"file:{path}?mode=ro"
-    with closing(sqlite3.connect(uri, uri=True)) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """SELECT id, user_id, content, created_at, updated_at
-               FROM memories
-               WHERE id = ? AND user_id = ?""",
-            (LEARNED_MEMORY_ID, user_id),
-        ).fetchone()
-    if row is None:
-        return None
-    snapshot = dict(row)
-    measurement = measure_learned_projection(str(snapshot.get("content") or ""))
-    return None if measurement["over_budget"] else snapshot
-
-
-def update_learned_memory(
+def seed_operating_notes(
     db: Any,
     user_id: str,
-    content: str,
-    *,
-    created_at: str | None = None,
-) -> str:
-    """Create or revise the learned memory while preserving its identity."""
-    now = datetime.now(UTC).isoformat()
-    existing = get_learned_memory(db, user_id)
-    with db.transaction():
-        if existing is None:
-            db.conn.execute(
-                """INSERT INTO memories (id, user_id, content, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, NULL)""",
-                (LEARNED_MEMORY_ID, user_id, content, created_at or now),
-            )
-        elif str(existing["content"]) != content:
-            db.conn.execute(
-                """UPDATE memories
-                   SET content = ?, updated_at = ?
-                   WHERE id = ? AND user_id = ?""",
-                (content, now, LEARNED_MEMORY_ID, user_id),
-            )
-    return LEARNED_MEMORY_ID
+    workspace_root: Path,
+    control_dir: Path,
+) -> Path | None:
+    """Copy the ``syke-learned`` row into OPERATING.md once, if the file is absent.
 
-
-def apply_learned_memory_snapshot_to_connection(
-    conn: sqlite3.Connection,
-    user_id: str,
-    snapshot: dict[str, Any],
-) -> None:
-    """Merge one valid learned row through an existing SQLite transaction."""
-    if str(snapshot.get("id") or "") != LEARNED_MEMORY_ID:
-        raise ValueError("learned memory snapshot has the wrong identity")
-    if str(snapshot.get("user_id") or "") != user_id:
-        raise ValueError("learned memory snapshot belongs to another Syke identity")
-    if measure_learned_projection(str(snapshot.get("content") or ""))["over_budget"]:
-        raise ValueError("learned memory snapshot is over its prompt budget")
-
-    existing = conn.execute(
-        "SELECT 1 FROM memories WHERE id = ? AND user_id = ?",
-        (LEARNED_MEMORY_ID, user_id),
-    ).fetchone()
-    if existing is None:
-        conn.execute(
-            """INSERT INTO memories (id, user_id, content, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                LEARNED_MEMORY_ID,
-                user_id,
-                str(snapshot.get("content") or ""),
-                str(snapshot.get("created_at") or datetime.now(UTC).isoformat()),
-                snapshot.get("updated_at"),
-            ),
-        )
-    else:
-        conn.execute(
-            """UPDATE memories
-               SET content = ?, updated_at = ?
-               WHERE id = ? AND user_id = ?""",
-            (
-                str(snapshot.get("content") or ""),
-                snapshot.get("updated_at"),
-                LEARNED_MEMORY_ID,
-                user_id,
-            ),
-        )
+    A host-owned marker in ``control_dir`` makes this happen at most once, so a
+    file Syke later deletes is not brought back. The row itself is left alone.
+    """
+    marker = control_dir / OPERATING_NOTES_SEEDED_MARKER
+    if marker.exists():
+        return None
+    path = operating_notes_path(workspace_root)
+    seeded: Path | None = None
+    if not path.exists():
+        row = get_learned_memory(db, user_id)
+        content = str(row.get("content") or "") if row else ""
+        lines = content.lstrip("\n").split("\n")
+        if lines and lines[0].strip() == "# Learned":
+            content = "\n".join(lines[1:]).lstrip("\n")
+        if content.strip():
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(content if content.endswith("\n") else content + "\n")
+            seeded = path
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{seeded or 'nothing to seed'}\n", encoding="utf-8")
+    return seeded
