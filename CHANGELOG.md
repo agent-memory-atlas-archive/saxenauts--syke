@@ -2,7 +2,7 @@
 
 All notable changes to Syke are documented here.
 
-## [Unreleased]
+## [0.6.2] - 2026-10-22
 
 ### Memory And Runtime
 
@@ -27,6 +27,12 @@ All notable changes to Syke are documented here.
 - Workspace measurements exclude the graph database and its sidecars at any
   directory depth. Wake acceptance rechecks budgets after the host writes the
   final MEMEX projection.
+
+### Frontend
+
+- Graph refreshes preserve the inspected memory and its scroll position.
+  Held-arrow navigation defers detail loading until the final selection and
+  coalesces timeline paints.
 
 ## [0.6.1] - 2026-09-24
 
