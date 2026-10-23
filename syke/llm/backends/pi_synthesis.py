@@ -1341,27 +1341,26 @@ def pi_synthesize(
                             repairable=True,
                         )
                     else:
+                        validation = _validate_cycle_output(measure_budgets, budget_start)
+                        result["validation"] = validation
                         if not validation.get("valid", False):
-                            validation = _validate_cycle_output(measure_budgets, budget_start)
-                            result["validation"] = validation
-                            if not validation.get("valid", False):
-                                issues = validation.get("issues")
-                                issue_text = (
-                                    "; ".join(str(issue) for issue in issues)
-                                    if isinstance(issues, list)
-                                    else "unknown"
-                                )
-                                error = (
-                                    "Cycle output validation failed after semantic repair: "
-                                    f"{issue_text}"
-                                )
-                                rejected = _rejection(
-                                    attempt=attempt_number,
-                                    stage="output_validation",
-                                    error=error,
-                                    verdict=validation,
-                                    repairable=True,
-                                )
+                            issues = validation.get("issues")
+                            issue_text = (
+                                "; ".join(str(issue) for issue in issues)
+                                if isinstance(issues, list)
+                                else "unknown"
+                            )
+                            error = (
+                                "Cycle output validation failed after MEMEX synchronization: "
+                                f"{issue_text}"
+                            )
+                            rejected = _rejection(
+                                attempt=attempt_number,
+                                stage="output_validation",
+                                error=error,
+                                verdict=validation,
+                                repairable=True,
+                            )
                         if rejected is None:
                             acceptance["accepted_attempt"] = attempt_number
                             cycle_completed_at = (

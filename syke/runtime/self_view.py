@@ -224,6 +224,8 @@ def _top_level_sizes(
                             continue
                         if not entry.is_file(follow_symlinks=False):
                             continue
+                        if os.path.abspath(entry.path) in excluded:
+                            continue
                         size = int(entry.stat(follow_symlinks=False).st_size)
                     except OSError:
                         state["errors"] += 1
@@ -312,11 +314,12 @@ def _operating_notes_line(workspace: Path) -> str:
         OPERATING_NOTES_TOKEN_LIMIT,
         measure_learned_projection,
         operating_notes_path,
+        read_operating_notes,
     )
 
     path = operating_notes_path(workspace)
     try:
-        body = path.read_text(encoding="utf-8")
+        body = read_operating_notes(workspace)
     except FileNotFoundError:
         return f"- Operating notes: {path} does not exist yet. It is yours to write."
     except (OSError, UnicodeDecodeError):

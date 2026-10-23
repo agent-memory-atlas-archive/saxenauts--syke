@@ -8,6 +8,8 @@ older ``syke-learned`` memory row. That row is now an ordinary memory.
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -43,10 +45,26 @@ def operating_notes_path(workspace_root: Path) -> Path:
     return workspace_root.expanduser().resolve() / OPERATING_NOTES_FILENAME
 
 
+def read_operating_notes(workspace_root: Path) -> str:
+    path = operating_notes_path(workspace_root)
+    expected = path.lstat()
+    if not stat.S_ISREG(expected.st_mode):
+        raise OSError("Operating notes must be a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(path, flags), encoding="utf-8") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            raise OSError("Operating notes changed before they could be read")
+        return handle.read()
+
+
 def operating_notes_tokens(workspace_root: Path) -> int | None:
     """Token count of OPERATING.md; 0 when absent, None when it can't be read."""
     try:
-        body = operating_notes_path(workspace_root).read_text(encoding="utf-8")
+        body = read_operating_notes(workspace_root)
     except FileNotFoundError:
         return 0
     except (OSError, UnicodeDecodeError):
@@ -58,7 +76,7 @@ def render_operating_notes_block(workspace_root: Path) -> str:
     """Render the operating notes prompt section without writing anything."""
     path = operating_notes_path(workspace_root)
     try:
-        body = path.read_text(encoding="utf-8").strip()
+        body = read_operating_notes(workspace_root).strip()
     except FileNotFoundError:
         body = ""
     except (OSError, UnicodeDecodeError):

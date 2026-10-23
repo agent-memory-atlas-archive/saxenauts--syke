@@ -314,8 +314,8 @@ class _SettleStream:
 
 def _prompt_with_stream(tmp_path: Path, monkeypatch, stream: _SettleStream):
     runtime = _make_runtime(tmp_path, monkeypatch)
-    runtime._process = SimpleNamespace(poll=lambda: None)
-    runtime._stream = stream
+    monkeypatch.setattr(runtime, "_process", SimpleNamespace(poll=lambda: None))
+    monkeypatch.setattr(runtime, "_stream", stream)
     sent: list[dict] = []
     monkeypatch.setattr(runtime, "_send", sent.append)
     monkeypatch.setattr(runtime, "get_session_stats", lambda timeout=10.0: {})

@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from syke.db import SykeDB
 from syke.db_safety import capture_baseline, validate_state_after_cycle
 from syke.memory.learned import (
     OPERATING_NOTES_TOKEN_LIMIT,
     measure_learned_projection,
+    operating_notes_tokens,
     seed_operating_notes,
 )
 from syke.memory.memex import update_memex
 from syke.memory.memex_budget import count_memory_tokens, warm_memex_tokenizer
 from syke.runtime import pi_settings
 from syke.runtime.prompt_context import build_prompt
+from syke.runtime.self_view import _operating_notes_line
 
 NOW = "2026-08-14 21:00 PDT (UTC-7)"
 
@@ -188,3 +193,54 @@ def test_semantic_gate_accepts_a_large_learned_row(
 
     assert verdict["valid"] is True
     assert "learned_over_budget" not in verdict["stats"]
+
+
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_operating_notes_symlink_cannot_enter_prompts(
+    tmp_path: Path,
+    db: SykeDB,
+    user_id: str,
+    target_exists: bool,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = tmp_path / "private-fixture"
+    sentinel = "Private fixture must not enter a model prompt."
+    if target_exists:
+        target.write_text(sentinel, encoding="utf-8")
+    (workspace / "OPERATING.md").symlink_to(target)
+
+    prompt = build_prompt(workspace, db=db, user_id=user_id, now=NOW)
+
+    assert sentinel not in prompt
+    assert "could not be read" in prompt
+    assert operating_notes_tokens(workspace) is None
+    assert "could not be read" in _operating_notes_line(workspace)
+
+
+@pytest.mark.parametrize("nofollow_available", [True, False])
+def test_operating_notes_reject_symlink_substitution_during_open(
+    tmp_path: Path, monkeypatch, nofollow_available: bool
+) -> None:
+    from syke.memory.learned import render_operating_notes_block
+
+    notes = tmp_path / "OPERATING.md"
+    notes.write_text("Ordinary operating notes.", encoding="utf-8")
+    target = tmp_path / "private-fixture"
+    sentinel = "Private fixture must not enter a model prompt."
+    target.write_text(sentinel, encoding="utf-8")
+    original_open = os.open
+    if not nofollow_available:
+        monkeypatch.setattr(os, "O_NOFOLLOW", 0, raising=False)
+
+    def replace_before_open(path: Path, flags: int) -> int:
+        notes.unlink()
+        notes.symlink_to(target)
+        return original_open(path, flags)
+
+    monkeypatch.setattr(os, "open", replace_before_open)
+
+    block = render_operating_notes_block(tmp_path)
+
+    assert sentinel not in block
+    assert "could not be read" in block

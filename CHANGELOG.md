@@ -2,6 +2,32 @@
 
 All notable changes to Syke are documented here.
 
+## [Unreleased]
+
+### Memory And Runtime
+
+- Added a 2,000-token budget for each memory. Wakes reject new or enlarged
+  over-budget memories; existing overages may remain or shrink.
+- Moved Syke's operating notes from the special `syke-learned` row into
+  `workspace/OPERATING.md`, seeded once from the old row. The file appears in
+  fresh prompts up to 6,000 tokens, with a pointer to any remaining content.
+- Reworded prompts around continuity, retained methods, and the different
+  obligations of asks and wakes. These changes do not establish improved
+  learning or answer reliability.
+- Enforced wake budgets for operating notes, the workspace excluding graph
+  files, and the runtime directory. Existing overages may remain or shrink;
+  unmeasurable sizes do not block acceptance. Asks do not enter these gates.
+- Added up to two same-session retries after a provider error, within the
+  original operation deadline.
+
+### Fixed
+
+- Host reads of operating notes reject symlinks, non-regular files, and file
+  substitution before reading, preserving the model-tool read boundary.
+- Workspace measurements exclude the graph database and its sidecars at any
+  directory depth. Wake acceptance rechecks budgets after the host writes the
+  final MEMEX projection.
+
 ## [0.6.1] - 2026-09-24
 
 ### Runtime
